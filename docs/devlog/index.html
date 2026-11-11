@@ -1,0 +1,20 @@
+---
+layout: default
+title: Entries
+description: Every step of building Shellborne, written up as it happens.
+---
+<main class="desk wrap">
+  <div>
+    <h1>Entries</h1>
+    <p class="lede">Every step of building Shellborne, written up as it happens. Newest first.</p>
+    {% assign total = site.posts | size %}
+    {% if total > 0 %}
+    <div class="cards">
+      {% for post in site.posts %}{% assign n = total | minus: forloop.index0 %}{% include entry-card.html post=post n=n %}{% endfor %}
+    </div>
+    {% else %}
+    <p class="nothing">The first entry is being written.</p>
+    {% endif %}
+  </div>
+  {% include side.html %}
+</main>

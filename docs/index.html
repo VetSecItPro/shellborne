@@ -1,0 +1,59 @@
+---
+layout: default
+description: A free, open-source Mac terminal for working with AI coding agents, built in public one tested step at a time.
+---
+<main class="desk wrap">
+  <div>
+    <div class="hello">
+      <img src="{{ '/assets/brand/shellborne-icon.svg' | relative_url }}" alt="The Shellborne icon: a turtle carrying a terminal prompt on its shell">
+      <div>
+        <h1>Building a Mac terminal for <em>agents</em>, one tested step at a time.</h1>
+        <p class="lede">Notes from a developer and a crew of AI coding agents making Shellborne in the open: what got decided, what broke, and what the numbers said.</p>
+      </div>
+    </div>
+
+    {% assign total = site.posts | size %}
+    {% if total > 0 %}
+    {% assign latest = site.posts.first %}
+    <section class="window latest">
+      <div class="titlebar"><span class="close"></span><span class="title">Latest entry</span></div>
+      <a class="inside" href="{{ latest.url | relative_url }}">
+        {% if latest.image %}<img src="{{ latest.image | relative_url }}" alt="">{% endif %}
+        <span>
+          <span class="meta"><span class="n">No. {{ total | prepend: '00' | slice: -3, 3 }}</span><span>{{ latest.date | date: "%b %-d, %Y" }}</span></span>
+          <span class="t">{{ latest.title }}</span>
+          <span class="s">{{ latest.description }}</span>
+          <span class="button gold">Read it</span>
+        </span>
+      </a>
+    </section>
+    {% if total > 1 %}
+    <h2><span class="label">Earlier entries</span></h2>
+    <div class="cards">
+      {% for post in site.posts offset:1 limit:5 %}{% assign n = total | minus: forloop.index %}{% include entry-card.html post=post n=n %}{% endfor %}
+    </div>
+    {% if total > 6 %}<p><a href="{{ '/devlog/' | relative_url }}">All {{ total }} entries</a></p>{% endif %}
+    {% endif %}
+    {% else %}
+    <p class="nothing">The first entry is being written.</p>
+    {% endif %}
+
+    <h2>What it promises</h2>
+    <div class="promises">
+      <div class="promise"><span class="label">Sessions survive</span><p>Your agents keep running if the app quits, crashes or updates.</p></div>
+      <div class="promise"><span class="label">Contained</span><p>One misbehaving pane cannot take the others down with it.</p></div>
+      <div class="promise"><span class="label">Exact</span><p>What you type reaches the agent exactly as you sent it.</p></div>
+      <div class="promise"><span class="label">Local</span><p>No account, no analytics. Nothing leaves your Mac unless you choose.</p></div>
+      <div class="promise"><span class="label">Honest</span><p>If it is not sure what a session is doing, it says so.</p></div>
+    </div>
+
+    <section class="window screen" style="margin-top:34px">
+      <div class="titlebar"><span class="close"></span><span class="title">How it is built</span></div>
+      <div class="inside"><span class="prompt">&gt;_</span> code: public on GitHub from the first commit
+<span class="prompt">&gt;_</span> agents: write much of it, and that is said plainly
+<span class="prompt">&gt;_</span> tests: written first, and every merge waits on them
+<span class="prompt">&gt;_</span> people: a person approves every change before it merges</div>
+    </section>
+  </div>
+  {% include side.html %}
+</main>

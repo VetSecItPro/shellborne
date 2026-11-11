@@ -1,0 +1,10 @@
+{% comment %}
+A picture or screenshot in a retro window. Use in a post:
+  {% include figure.html src="/assets/devlog/name.png" alt="What the picture shows" caption="Window title" note="Optional line under it" %}
+alt is required: it is what a screen reader says. Keep pictures under docs/assets/devlog/.
+{% endcomment %}
+<figure class="window shot{% if include.size %} {{ include.size }}{% endif %}">
+  <div class="titlebar"><span class="close"></span><span class="title">{{ include.caption | default: "Picture" }}</span></div>
+  <img src="{{ include.src | relative_url }}" alt="{{ include.alt }}" loading="lazy">
+  {% if include.note %}<figcaption>{{ include.note }}</figcaption>{% endif %}
+</figure>

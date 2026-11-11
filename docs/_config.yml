@@ -1,0 +1,15 @@
+# The shellborne.dev site. GitHub Pages builds this folder with its built-in Jekyll.
+title: Shellborne
+description: A Mac terminal for people who run AI coding agents, made in the open.
+url: https://shellborne.dev
+baseurl: ""
+lang: en-US
+author: VetSecItPro
+markdown: kramdown
+permalink: /devlog/:year/:month/:title/
+plugins:
+  - jekyll-feed
+feed:
+  path: feed.xml
+exclude:
+  - README.md
