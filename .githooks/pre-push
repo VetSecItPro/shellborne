@@ -40,7 +40,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             else
                 plan_range="$range"
             fi
-            "$private/tools/sb-plan" check --root "$private" --clone "$top" --range "$plan_range" || status=1
+            "$private/tools/sb-plan" check --root "$private" --clone "$top" --range "$plan_range" --branch "$local_ref" || status=1
         fi
     fi
 done
