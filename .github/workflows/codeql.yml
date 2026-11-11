@@ -1,0 +1,57 @@
+# CodeQL for the workflows and, once Rust code exists, for Rust. Results stay in the run: nothing is
+# uploaded, so the job needs only read access, and tools/gates/codeql-results fails the check on any finding.
+# Plan-Step: P0.21.5
+name: codeql
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, rust]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check there is source for this language
+        id: source
+        env:
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          if [ "$LANGUAGE" = rust ] && [ -z "$(git ls-files '*.rs')" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Rust source yet, so the Rust analysis is skipped."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.source.outputs.present == 'true'
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.source.outputs.present == 'true'
+        with:
+          upload: never
+          output: codeql-results
+
+      - name: Fail on any finding
+        if: steps.source.outputs.present == 'true'
+        run: tools/gates/codeql-results codeql-results
