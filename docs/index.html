@@ -5,20 +5,35 @@ description: A free, open-source Mac terminal for working with AI coding agents,
 <main class="desk wrap">
   <div>
     <div class="hello">
-      <img src="{{ '/assets/shellborne-icon.svg' | relative_url }}" alt="The Shellborne icon: a turtle carrying a terminal prompt on its shell">
+      <img src="{{ '/assets/brand/shellborne-icon.svg' | relative_url }}" alt="The Shellborne icon: a turtle carrying a terminal prompt on its shell">
       <div>
         <h1>Building a Mac terminal for <em>agents</em>, one tested step at a time.</h1>
         <p class="lede">Notes from a developer and a crew of AI coding agents making Shellborne in the open: what got decided, what broke, and what the numbers said.</p>
       </div>
     </div>
 
-    <h2><span class="label">Entries</span></h2>
-    {% if site.posts.size > 0 %}
-    <div class="entries">
-      {% for post in site.posts limit:6 %}
-      <a class="entry" href="{{ post.url | relative_url }}"><span class="n">{{ site.posts.size | minus: forloop.index0 | prepend: '00' | slice: -3, 3 }}</span><span><span class="t">{{ post.title }}</span></span><span class="d">{{ post.date | date: "%b %-d" }}</span></a>
-      {% endfor %}
+    {% assign total = site.posts | size %}
+    {% if total > 0 %}
+    {% assign latest = site.posts.first %}
+    <section class="window latest">
+      <div class="titlebar"><span class="close"></span><span class="title">Latest entry</span></div>
+      <a class="inside" href="{{ latest.url | relative_url }}">
+        {% if latest.image %}<img src="{{ latest.image | relative_url }}" alt="">{% endif %}
+        <span>
+          <span class="meta"><span class="n">No. {{ total | prepend: '00' | slice: -3, 3 }}</span><span>{{ latest.date | date: "%b %-d, %Y" }}</span></span>
+          <span class="t">{{ latest.title }}</span>
+          <span class="s">{{ latest.description }}</span>
+          <span class="button gold">Read it</span>
+        </span>
+      </a>
+    </section>
+    {% if total > 1 %}
+    <h2><span class="label">Earlier entries</span></h2>
+    <div class="cards">
+      {% for post in site.posts offset:1 limit:5 %}{% assign n = total | minus: forloop.index %}{% include entry-card.html post=post n=n %}{% endfor %}
     </div>
+    {% if total > 6 %}<p><a href="{{ '/devlog/' | relative_url }}">All {{ total }} entries</a></p>{% endif %}
+    {% endif %}
     {% else %}
     <p class="nothing">The first entry is being written.</p>
     {% endif %}

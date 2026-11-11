@@ -6,12 +6,11 @@ description: Every step of building Shellborne, written up as it happens.
 <main class="desk wrap">
   <div>
     <h1>Entries</h1>
-    <p class="lede">Every step of building Shellborne, written up as it happens.</p>
-    {% if site.posts.size > 0 %}
-    <div class="entries" style="margin-top:24px">
-      {% for post in site.posts %}
-      <a class="entry" href="{{ post.url | relative_url }}"><span class="n">{{ site.posts.size | minus: forloop.index0 | prepend: '00' | slice: -3, 3 }}</span><span><span class="t">{{ post.title }}</span></span><span class="d">{{ post.date | date: "%b %-d" }}</span></a>
-      {% endfor %}
+    <p class="lede">Every step of building Shellborne, written up as it happens. Newest first.</p>
+    {% assign total = site.posts | size %}
+    {% if total > 0 %}
+    <div class="cards">
+      {% for post in site.posts %}{% assign n = total | minus: forloop.index0 %}{% include entry-card.html post=post n=n %}{% endfor %}
     </div>
     {% else %}
     <p class="nothing">The first entry is being written.</p>

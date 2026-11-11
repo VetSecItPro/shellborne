@@ -5,18 +5,27 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% if page.title %}{{ page.title }} | {% endif %}{{ site.title }}</title>
   <meta name="description" content="{{ page.description | default: site.description }}">
-  <link rel="icon" href="{{ '/assets/shellborne-icon.svg' | relative_url }}" type="image/svg+xml">
+  <link rel="icon" href="{{ '/assets/brand/favicon.svg' | relative_url }}" type="image/svg+xml">
+  <link rel="icon" href="{{ '/assets/brand/favicon-32.png' | relative_url }}" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="{{ '/assets/brand/apple-touch-icon.png' | relative_url }}">
+  <meta name="theme-color" content="#0A1C1F">
   <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
   <link rel="alternate" type="application/atom+xml" title="Shellborne devlog" href="{{ '/feed.xml' | relative_url }}">
   <meta property="og:title" content="{{ page.title | default: site.title }}">
   <meta property="og:description" content="{{ page.description | default: site.description }}">
   <meta property="og:url" content="{{ page.url | absolute_url }}">
-  <meta property="og:image" content="{{ '/assets/shellborne-icon.svg' | absolute_url }}">
+  <meta property="og:site_name" content="{{ site.title }}">
+  <meta property="og:type" content="{% if page.layout == 'post' %}article{% else %}website{% endif %}">
+  <meta property="og:image" content="{{ '/assets/brand/shellborne-card.png' | absolute_url }}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="The Shellborne turtle with a terminal prompt on its shell, beside the words Shellborne devlog">
+  <meta name="twitter:card" content="summary_large_image">
 </head>
 <body>
   <header class="top">
     <div class="row wrap">
-      <a class="mark" href="{{ '/' | relative_url }}"><img src="{{ '/assets/shellborne-icon.svg' | relative_url }}" alt=""><strong>Shellborne</strong><span class="label">devlog</span></a>
+      <a class="mark" href="{{ '/' | relative_url }}"><img src="{{ '/assets/brand/shellborne-icon.svg' | relative_url }}" alt=""><strong>Shellborne</strong><span class="label">devlog</span></a>
       <nav class="links" aria-label="Site">
         <a href="{{ '/devlog/' | relative_url }}">Entries</a>
         <a href="{{ '/about/' | relative_url }}">About</a>
