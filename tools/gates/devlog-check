@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Devlog check: every post is fit to publish.
+
+Usage: devlog-check <repo>
+
+For each post in docs/_posts/: it needs a title and a description; it may not carry an internal plan id;
+and a meaningful number (two or more digits, a percentage, or a time) must sit in a paragraph that also
+links to its evidence. Code blocks are skipped. The leak guards cover every post too.
+Exit 0 clean, 1 refused, 2 broken.
+Plan-Step: P0.23.3
+"""
+import pathlib
+import re
+import sys
+
+PLAN_ID = re.compile(r"\b(?:P|PR)\d+\.\d+(?:\.\d+)?\b|\bCHANGE-\d{4}\b|\b[A-Z]{2,4}-\d{2,3}\b")
+NUMBER = re.compile(r"(?<![\w./-])\d{2,}(?:[.,]\d+)?\b|\b\d+(?:\.\d+)?\s?(?:%|ms|s|fps|MB|GB|KB|x)\b")
+LINK = re.compile(r"\]\((?:https?://|/)")
+
+
+def front_matter(text):
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text
+    fields = dict(line.split(":", 1) for line in text[4:end].splitlines() if ":" in line)
+    return {k.strip(): v.strip() for k, v in fields.items()}, text[end + 5:]
+
+
+def prose_paragraphs(body):
+    body = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+    return [p for p in re.split(r"\n\s*\n", body) if p.strip()]
+
+
+def problems(path):
+    found = []
+    meta, body = front_matter(path.read_text())
+    for key in ("title", "description"):
+        if not meta.get(key):
+            found.append(f"missing {key}")
+    for paragraph in prose_paragraphs(body):
+        if PLAN_ID.search(paragraph):
+            found.append(f"plan id: {PLAN_ID.search(paragraph).group(0)}")
+        if NUMBER.search(LINK.sub("", paragraph)) and not LINK.search(paragraph):
+            found.append(f"number without a link to its evidence: {NUMBER.search(paragraph).group(0)}")
+    return found
+
+
+def main(argv):
+    if len(argv) != 2 or not pathlib.Path(argv[1]).is_dir():
+        print("usage: devlog-check <repo>", file=sys.stderr)
+        return 2
+    refused = 0
+    for path in sorted((pathlib.Path(argv[1]) / "docs" / "_posts").glob("*.md")):
+        for line in problems(path):
+            print(f"devlog-check: {path.name}: {line}")
+            refused += 1
+    return 1 if refused else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
