@@ -65,7 +65,16 @@ knowing more and wants the next one.
 
 ## Sharing on LinkedIn
 
-- A short native post in the owner's own words: the one thing that happened and why it matters, with
-  one image or a short clip, and a link to the full entry.
+After an entry is live on shellborne.dev:
+
+1. Open the entry's page and copy its address.
+2. Write a short post in your own words: the one thing that happened and why it matters, in three to
+   five lines. Do not paste the entry; link to it.
+3. Add one picture or a short clip from the entry, then paste the link last. LinkedIn shows the
+   turtle card for the link; check it appears before posting.
+4. Post it. Reply to comments in your own words; questions about policy or security go to the
+   security policy, never answered from memory.
+
 - Clips run 30 to 60 seconds, have captions, and are recorded with the Mac's built-in screen
   recording. Small GIFs can live in the repository; full videos go on LinkedIn or YouTube.
+- One post per entry, and not every entry needs one: share the ones a reader would want to hear about.
