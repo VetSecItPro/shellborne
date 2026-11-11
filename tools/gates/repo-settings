@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Repo-settings gate: squash-only merges that carry the pull request text, and a protected main.
+
+Usage: repo-settings --repo <repo.json> --protection <protection.json>
+       repo-settings --live <owner/name>     fetch both with the gh command-line tool (needs admin access)
+
+GitHub serves branch protection only to an admin, so public CI cannot read it; the live mode runs on
+the maintainer's Mac in the local CI step. Exit 0 clean, 1 refused, 2 broken.
+Plan-Step: P0.5.11
+"""
+import json
+import subprocess
+import sys
+
+REPO_RULES = {"allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
+              "squash_merge_commit_title": "PR_TITLE", "squash_merge_commit_message": "PR_BODY",
+              "delete_branch_on_merge": True}
+# The gates workflow and both CodeQL analyses must pass before a merge (review F12).
+REQUIRED_CHECKS = ("gates", "analyze (actions)", "analyze (rust)")
+
+
+def protection_findings(p):
+    found = []
+    checks = (p.get("required_status_checks") or {}).get("checks") or []
+    contexts = [c.get("context") for c in checks]
+    found += [f"required status checks do not include {name}" for name in REQUIRED_CHECKS if name not in contexts]
+    reviews = p.get("required_pull_request_reviews") or {}
+    if reviews.get("require_code_owner_reviews") is not True:
+        found.append("code-owner review is not required")
+    if not isinstance(reviews.get("required_approving_review_count"), int) or reviews["required_approving_review_count"] < 1:
+        found.append("fewer than one approving review is required")
+    for key in ("allow_force_pushes", "allow_deletions"):
+        if (p.get(key) or {}).get("enabled") is not False:
+            found.append(f"{key} is not off")
+    return found
+
+
+def load(args):
+    if args[:1] == ["--live"] and len(args) == 2:
+        out = []
+        for path in (f"repos/{args[1]}", f"repos/{args[1]}/branches/main/protection"):
+            got = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
+            if got.returncode != 0:
+                raise ValueError(f"gh api {path} failed: {got.stderr.strip()[:200]}")
+            out.append(json.loads(got.stdout))
+        return out
+    if len(args) == 4 and args[0] == "--repo" and args[2] == "--protection":
+        with open(args[1]) as repo, open(args[3]) as protection:
+            return json.load(repo), json.load(protection)
+    raise ValueError("usage: repo-settings --repo <file> --protection <file> | --live <owner/name>")
+
+
+def main(argv):
+    try:
+        repo, protection = load(argv[1:])
+    except (OSError, ValueError) as error:
+        print(f"repo-settings: broken: {error}", file=sys.stderr)
+        return 2
+    found = [f"{key} is {repo.get(key)!r}, expected {want!r}" for key, want in REPO_RULES.items() if repo.get(key) != want]
+    found += protection_findings(protection)
+    for line in found:
+        print(f"repo-settings: {line}")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

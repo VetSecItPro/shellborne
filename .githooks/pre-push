@@ -13,6 +13,7 @@ if [ -n "$private" ] && [ ! -x "$private/tools/gates/leak-guard-private" ]; then
     echo "leak-guard: refused: shellborne.privateFolder is set but its guard is missing" >&2
     exit 1
 fi
+remote_name="$1"
 status=0
 while read -r local_ref local_sha remote_ref remote_sha; do
     if expr "$local_sha" : '0*$' >/dev/null; then
@@ -27,6 +28,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     "$top/tools/gates/secrets" commits "$top" "$range" || status=1
     if [ -n "$private" ]; then
         "$private/tools/gates/leak-guard-private" commits "$top" "$range" --private "$private" || status=1
+        # The plan check (P0.5.9): every commit not yet on the remote's main cites a step that may start now.
+        if [ ! -x "$private/tools/sb-plan" ]; then
+            echo "leak-guard: refused: shellborne.privateFolder is set but sb-plan is missing" >&2
+            status=1
+        else
+            # Measure against the main of the remote being pushed to ($1), not a fixed name.
+            base=$(git -C "$top" merge-base "$local_sha" "refs/remotes/$remote_name/main" 2>/dev/null || true)
+            if [ -n "$base" ]; then
+                plan_range="$base..$local_sha"
+            else
+                plan_range="$range"
+            fi
+            "$private/tools/sb-plan" check --root "$private" --clone "$top" --range "$plan_range" --branch "$local_ref" || status=1
+        fi
     fi
 done
 exit $status

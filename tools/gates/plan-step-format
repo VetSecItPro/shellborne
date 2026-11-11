@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Plan-Step format gate: the pull request body cites at least one step, and every citation is well formed.
+
+Usage: PR_BODY=<pull request body> plan-step-format
+
+A Plan-Step line names a sub-step id (for example P2.4.1 or PR1.2.3), a plan change (CHANGE-0006) or
+EXT for an outside contributor's pull request. This gate checks only the shape; it never reads a plan.
+It runs a known-good case and three known-bad cases first and refuses to report if any comes out wrong.
+Exit 0 clean, 1 refused, 2 broken.
+Plan-Step: P0.5.9
+"""
+import os
+import re
+import sys
+
+VALID = re.compile(r"^Plan-Step: (?:(?:P|PR)\d+\.\d+\.\d+|CHANGE-\d{4}|EXT)$")
+ANY = re.compile(r"^\s*plan[-_ ]?step\s*:", re.IGNORECASE)
+CONTROL_GOOD = "Plan-Step: PR1.2.3\n"
+CONTROLS_BAD = ("No step is cited here.\n", "Plan-Step: PR1.2\n", "Plan-Step: see the issue\n")
+
+
+def problems(body):
+    lines = [line.rstrip("\r") for line in body.splitlines()]
+    cited = [line for line in lines if ANY.match(line)]
+    found = [f"malformed Plan-Step line: {line[:60]}" for line in cited if not VALID.match(line)]
+    if not cited:
+        found.append("no Plan-Step line in the pull request body")
+    return found
+
+
+def main():
+    if problems(CONTROL_GOOD) or not all(problems(bad) for bad in CONTROLS_BAD):
+        print("plan-step-format: broken: a control came out wrong, so no result is reported", file=sys.stderr)
+        return 2
+    if "PR_BODY" not in os.environ:
+        print("plan-step-format: broken: PR_BODY is not set", file=sys.stderr)
+        return 2
+    found = problems(os.environ["PR_BODY"])
+    for line in found:
+        print(f"plan-step-format: {line}")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
