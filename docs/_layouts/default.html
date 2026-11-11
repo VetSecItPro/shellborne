@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="{{ site.lang }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if page.title %}{{ page.title }} | {% endif %}{{ site.title }}</title>
+  <meta name="description" content="{{ page.description | default: site.description }}">
+  <link rel="icon" href="{{ '/assets/shellborne-icon.svg' | relative_url }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+  <link rel="alternate" type="application/atom+xml" title="Shellborne devlog" href="{{ '/feed.xml' | relative_url }}">
+  <meta property="og:title" content="{{ page.title | default: site.title }}">
+  <meta property="og:description" content="{{ page.description | default: site.description }}">
+  <meta property="og:url" content="{{ page.url | absolute_url }}">
+  <meta property="og:image" content="{{ '/assets/shellborne-icon.svg' | absolute_url }}">
+</head>
+<body>
+  <header class="top">
+    <div class="row wrap">
+      <a class="mark" href="{{ '/' | relative_url }}"><img src="{{ '/assets/shellborne-icon.svg' | relative_url }}" alt=""><strong>Shellborne</strong><span class="label">devlog</span></a>
+      <nav class="links" aria-label="Site">
+        <a href="{{ '/devlog/' | relative_url }}">Entries</a>
+        <a href="{{ '/about/' | relative_url }}">About</a>
+        <a href="{{ '/feed.xml' | relative_url }}">RSS</a>
+        <a href="https://github.com/VetSecItPro/shellborne">GitHub</a>
+      </nav>
+    </div>
+    <div class="bands" aria-hidden="true"><i></i><i></i><i></i></div>
+  </header>
+  {{ content }}
+  <footer class="bottom wrap">
+    <p>Shellborne is free and open source under the Apache License 2.0. The name and logo are reserved: see the <a href="https://github.com/VetSecItPro/shellborne/blob/main/TRADEMARKS.md">trademark policy</a>. Security problems go through the <a href="https://github.com/VetSecItPro/shellborne/blob/main/SECURITY.md">security policy</a>.</p>
+    <p>No cookies, no analytics, nothing loaded from anyone else. The RSS feed is the newsletter.</p>
+  </footer>
+</body>
+</html>

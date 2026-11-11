@@ -26,3 +26,6 @@ xcuserdata/
 
 # Local link to the private backlog, never tracked.
 /*-backlog.md
+
+# Browser tool output from local previews.
+.playwright-mcp/
