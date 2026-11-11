@@ -18,4 +18,25 @@
       <div class="buttons"><a class="button gold" href="{{ '/feed.xml' | relative_url }}">RSS feed</a><a class="button" href="https://github.com/VetSecItPro/shellborne">GitHub</a></div>
     </div>
   </section>
+  {% if include.home %}
+  <section class="window">
+    <div class="titlebar"><span class="close"></span><span class="title">What it promises</span></div>
+    <div class="inside">
+      <ul class="promise-list">
+        <li><span class="label">Sessions survive</span><p>Your agents keep running if the app quits, crashes or updates.</p></li>
+        <li><span class="label">Contained</span><p>One misbehaving pane cannot take the others down with it.</p></li>
+        <li><span class="label">Exact</span><p>What you type reaches the agent exactly as you sent it.</p></li>
+        <li><span class="label">Local</span><p>No account, no analytics. Nothing leaves your Mac unless you choose.</p></li>
+        <li><span class="label">Honest</span><p>If it is not sure what a session is doing, it says so.</p></li>
+      </ul>
+    </div>
+  </section>
+  <section class="window screen">
+    <div class="titlebar"><span class="close"></span><span class="title">How it is built</span></div>
+    <div class="inside"><span class="prompt">&gt;_</span> code: public on GitHub from the first commit
+<span class="prompt">&gt;_</span> agents: write much of it, said plainly
+<span class="prompt">&gt;_</span> tests: written first; every merge waits on them
+<span class="prompt">&gt;_</span> people: a person approves every change</div>
+  </section>
+  {% endif %}
 </aside>
