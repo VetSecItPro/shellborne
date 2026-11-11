@@ -3,20 +3,26 @@
 
 Usage: legal-files <repo>
 
-Checks LICENSE is the Apache License 2.0, NOTICE is not empty, SECURITY.md names a human contact
-and a private reporting path, TRADEMARKS.md reserves the name and the logo, and CONTRIBUTING.md
+Checks LICENSE is byte-for-byte the canonical Apache License 2.0, NOTICE is not empty, SECURITY.md
+names a contact with a GitHub handle or email and a private reporting path, TRADEMARKS.md reserves the name and the logo, and CONTRIBUTING.md
 asks for DCO sign-off and states there is no CLA.
 Exit 0 clean, 1 refused, 2 broken. One line per finding, naming the file.
+Keyword checks cannot catch a contrary rewording of the trademark policy or contributor guide;
+those files are owned by the maintainer in CODEOWNERS, so a change to them needs that review.
 Plan-Step: P0.2.2
 """
+import hashlib
 import pathlib
 import re
 import sys
 
+# sha256 of the canonical text at https://www.apache.org/licenses/LICENSE-2.0.txt
+APACHE_2_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
 CHECKS = {
-    "LICENSE": [(r"Apache License", "is not the Apache License"), (r"Version 2\.0", "is not version 2.0")],
     "NOTICE": [(r"\S", "is empty")],
-    "SECURITY.md": [(r"(?im)^\s*(?:[-*]\s+)?\**contact\**\s*:\**\s*\S", "names no contact (a 'Contact:' line)"),
+    "SECURITY.md": [(r"(?im)^\s*(?:[-*]\s+)?\**contact\**\s*:\**[^\n]*(?:@[A-Za-z0-9][A-Za-z0-9-]*|[\w.+-]+@[\w-]+\.[\w.-]+)",
+                     "names no contact with a GitHub handle or email (a 'Contact:' line)"),
                     (r"(?i)private vulnerability report|security advisor", "gives no private reporting path")],
     "TRADEMARKS.md": [(r"(?i)\bname\b", "does not reserve the name"), (r"(?i)\blogo\b", "does not reserve the logo")],
     "CONTRIBUTING.md": [(r"Signed-off-by", "does not ask for DCO sign-off"),
@@ -33,6 +39,11 @@ def main(argv):
         print(f"legal-files: {repo} is not a folder", file=sys.stderr)
         return 2
     findings = []
+    license_path = repo / "LICENSE"
+    if not license_path.is_file():
+        findings.append("LICENSE: missing")
+    elif hashlib.sha256(license_path.read_bytes()).hexdigest() != APACHE_2_SHA256:
+        findings.append("LICENSE: is not the canonical Apache License 2.0 text")
     for name, rules in CHECKS.items():
         path = repo / name
         if not path.is_file():

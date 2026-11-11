@@ -1,0 +1,12 @@
+# The owner reviews every change to these paths. Branch protection makes that review required.
+/.github/ @VetSecItPro
+*.entitlements @VetSecItPro
+/tools/signing/ @VetSecItPro
+/LICENSE @VetSecItPro
+/NOTICE @VetSecItPro
+/SECURITY.md @VetSecItPro
+/TRADEMARKS.md @VetSecItPro
+/CONTRIBUTING.md @VetSecItPro
+/tools/gates/ @VetSecItPro
+/.githooks/ @VetSecItPro
+/tools/install-hooks @VetSecItPro

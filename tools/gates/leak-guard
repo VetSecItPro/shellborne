@@ -41,6 +41,9 @@ EMAIL = re.compile(r"(?<![\w.%+-])[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-
 ALLOWED_EMAIL_DOMAINS = re.compile(
     r"^(?:users\.noreply\.github\.com|shellborne\.dev|example\.(?:com|org|net)|[\w.-]+\.(?:invalid|test|example))$",
     re.IGNORECASE)
+# GitHub writes merge and squash commits with this exact committer address (local part, domain);
+# it names no person. Kept as a pair so this file holds no email-shaped text of its own.
+ALLOWED_ADDRESSES = {("noreply", "github.com")}
 IDENTITY_KINDS = (("internal-path", INTERNAL_PATH), ("hostname", HOSTNAME), ("private-ip", PRIVATE_IP))
 
 
@@ -180,7 +183,8 @@ def commits(repo, revision_range):
         if check_text(None, message, report, plan_step_lines_ok=True):
             report.refuse("commit-message", short)
         emails = git(repo, "log", "-1", "--format=%ae%n%ce", commit).decode(errors="replace").split()
-        if any(not ALLOWED_EMAIL_DOMAINS.match(e.rpartition("@")[2]) for e in emails):
+        if any(e.lower().rpartition("@")[::2] not in ALLOWED_ADDRESSES
+               and not ALLOWED_EMAIL_DOMAINS.match(e.rpartition("@")[2]) for e in emails):
             report.refuse("author-email", short)
         entries = parse_ls(git(repo, "ls-tree", "-r", "-z", commit), staged=False)
         check_entries(repo, entries, report, seen)
