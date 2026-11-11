@@ -8,12 +8,15 @@ Usage:
 
 Exit 0 clean, 1 refused, 2 broken (bad arguments, not a repository, git failed). Hooks treat any
 nonzero code as a refusal. Each refusal is one line, "leak-guard: refused <kind> <where>", where kind
-is path, canary, plan-id, commit-message or instruction-file and where is a file and line or a commit.
+is path, canary, plan-id, commit-message, instruction-file, a personal detail (internal-path,
+hostname, private-ip, email) or oversized-text, and where is a file (and line, for text) or a commit.
 The matched text is never printed: CI logs are public. This file holds only shapes, never real values.
 """
 import re
+import struct
 import subprocess
 import sys
+import zlib
 
 MAX_REPORTS = 200
 
@@ -121,6 +124,155 @@ def check_text(where, text, report, plan_step_lines_ok=False):
     return found
 
 
+# Binary files. Markers are checked over every byte. Plan ids
+# and personal details are checked only in text a program can read out of the file: PNG text chunks,
+# JPEG comment and APP segments, or, for any other binary file, printable runs of 16 or more characters.
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8"
+PRINTABLE_RUN = re.compile(rb"[\x20-\x7e\t]{16,}")
+APP_RUN = re.compile(rb"[\x20-\x7e\t]{3,}")  # metadata: three-character ids count
+UTF16LE_RUN = re.compile(rb"(?:[\x20-\x7e]\x00){3,}")
+UTF16BE_RUN = re.compile(rb"(?:\x00[\x20-\x7e]){3,}")
+BINARY_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8", b"%PDF-")
+MAX_INFLATED = 1 << 20  # a compressed text chunk is unpacked to at most 1 MiB
+MAX_INFLATED_FILE = 4 << 20  # and all of one file's chunks to at most 4 MiB together
+
+
+class Oversized(Exception):
+    """A compressed text field larger than the cap: refused, never scanned as compressed bytes."""
+
+
+def is_binary(data):
+    return b"\0" in data[:8000] or data.startswith(BINARY_SIGNATURES)
+
+
+def metadata_runs(body):
+    """Readable text in a metadata block: ASCII runs and UTF-16 runs in either byte order."""
+    runs = [run.decode("ascii") for run in APP_RUN.findall(body)]
+    runs += [run.decode("utf-16-le") for run in UTF16LE_RUN.findall(body)]
+    runs += [run.decode("utf-16-be") for run in UTF16BE_RUN.findall(body)]
+    return runs
+
+
+def inflate(data, budget):
+    """Unpack one complete zlib stream within the field cap and the file's remaining budget."""
+    limit = min(MAX_INFLATED, budget[0])
+    unpacker = zlib.decompressobj()
+    out = unpacker.decompress(data, limit + 1)
+    if len(out) > limit or unpacker.unconsumed_tail:
+        raise Oversized()
+    if not unpacker.eof or unpacker.unused_data:
+        raise ValueError("incomplete or padded compressed text")
+    budget[0] -= len(out)
+    return out
+
+
+def png_text(data):
+    """Text fields of a PNG, or None when it cannot be parsed."""
+    texts, pos, budget = [], len(PNG_SIGNATURE), [MAX_INFLATED_FILE]
+    try:
+        while pos < len(data):
+            if pos + 12 > len(data):
+                return None
+            length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+            body = data[pos + 8:pos + 8 + length]
+            crc = data[pos + 8 + length:pos + 12 + length]
+            if len(body) != length or len(crc) != 4:
+                return None
+            if struct.unpack(">I", crc)[0] != zlib.crc32(kind + body) & 0xFFFFFFFF:
+                return None
+            if (pos == len(PNG_SIGNATURE)) != (kind == b"IHDR"):  # IHDR first, and only first
+                return None
+            if kind == b"tEXt":
+                texts.append(body.decode("latin-1"))
+            elif kind == b"zTXt":
+                keyword, _, rest = body.partition(b"\0")
+                if rest[:1] != b"\0":
+                    return None
+                texts.append(keyword.decode("latin-1") + "\n" + inflate(rest[1:], budget).decode("latin-1"))
+            elif kind == b"iTXt":
+                keyword, _, rest = body.partition(b"\0")
+                compressed, method, rest = rest[0], rest[1], rest[2:]
+                if compressed not in (0, 1) or method != 0:
+                    return None
+                language, _, rest = rest.partition(b"\0")
+                translated, _, text = rest.partition(b"\0")
+                text = inflate(text, budget) if compressed else text
+                texts.append("\n".join(part.decode("utf-8", errors="replace")
+                                       for part in (keyword, language, translated, text)))
+            elif kind == b"eXIf":
+                texts.extend(metadata_runs(body))
+            pos += 12 + length
+            if kind == b"IEND":
+                return texts if pos == len(data) else None
+        return None
+    except (ValueError, IndexError, struct.error, zlib.error):
+        return None
+
+
+def jpeg_text(data):
+    """Comment and APP segment text of a JPEG, or None when it cannot be parsed."""
+    texts, pos, frame, scan = [], 2, False, False
+    try:
+        while pos < len(data):
+            if data[pos] != 0xFF:
+                return None
+            marker = data[pos + 1]
+            if marker == 0xD9:  # the end: there must be an image, and nothing after it
+                return texts if frame and scan and pos + 2 == len(data) else None
+            if marker == 0xFF:
+                pos += 1
+                continue
+            if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                pos += 2
+                continue
+            (length,) = struct.unpack(">H", data[pos + 2:pos + 4])
+            body = data[pos + 4:pos + 2 + length]
+            if length < 2 or len(body) != length - 2:
+                return None
+            if marker == 0xFE:
+                texts.append(body.decode("latin-1"))
+            elif 0xE0 <= marker <= 0xEF:
+                texts.extend(metadata_runs(body))
+            pos += 2 + length
+            frame = frame or (0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC))
+            scan = scan or (marker == 0xDA and frame)
+            if marker == 0xDA:  # entropy-coded scan data runs to the next real marker
+                while pos < len(data) and not (data[pos] == 0xFF and pos + 1 < len(data)
+                                               and data[pos + 1] not in (0x00, *range(0xD0, 0xD8))):
+                    pos += 1
+        return None
+    except (ValueError, IndexError, struct.error):
+        return None
+
+
+def binary_text(data):
+    """The text a program can read out of a binary file, as a list of strings."""
+    texts = None
+    if data.startswith(PNG_SIGNATURE):
+        texts = png_text(data)
+    elif data.startswith(JPEG_SIGNATURE):
+        texts = jpeg_text(data)
+    # Readable runs anywhere in the file, parsed or not, so a malformed header cannot hide text.
+    return (texts or []) + [run.decode("ascii") for run in PRINTABLE_RUN.findall(data)]
+
+
+def check_binary(path, data, report):
+    if CANARY.search(data.decode("latin-1")):
+        report.refuse("canary", path)
+    try:
+        texts = binary_text(data)
+    except Oversized:
+        report.refuse("oversized-text", path)
+        return
+    for text in texts:
+        for kind, pattern in (("canary", CANARY), ("plan-id", PLAN_ID), *IDENTITY_KINDS):
+            if pattern.search(text):
+                report.refuse(kind, path)
+        if has_email(text):
+            report.refuse("email", path)
+
+
 def read_blobs(repo, ids):
     """Read blobs through one git cat-file process. Returns {id: bytes}."""
     if not ids:
@@ -151,7 +303,10 @@ def check_entries(repo, entries, report, seen):
         if (blob_id, path) in seen:
             continue
         seen.add((blob_id, path))
-        check_text(path, data.decode("utf-8", errors="replace"), report)
+        if is_binary(data):
+            check_binary(path, data, report)
+        else:
+            check_text(path, data.decode("utf-8", errors="replace"), report)
 
 
 def parse_ls(raw, staged):
