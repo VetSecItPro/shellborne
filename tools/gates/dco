@@ -3,8 +3,9 @@
 
 Usage: dco <repo> <range>     <range> is anything git rev-list accepts: HEAD, base..head
 
-A commit passes when its message has a `Signed-off-by:` line naming the commit author's email.
-Merge commits are checked like any other.
+A commit passes when the trailers git parses from its message (git interpret-trailers) include a
+`Signed-off-by:` trailer whose own value names the commit author's email. A sign-off in the body,
+or an empty sign-off followed by another line, does not count. Merge commits are checked like any other.
 Exit 0 clean, 1 refused, 2 broken. One line per refused commit, naming its short hash.
 Plan-Step: P0.2.4
 """
@@ -12,11 +13,18 @@ import re
 import subprocess
 import sys
 
-SIGN_OFF = re.compile(r"(?im)^Signed-off-by:\s*.+<([^>]+)>\s*$")
+SIGN_OFF = re.compile(r"^Signed-off-by:[ \t]*[^<\n]*\S[^<\n]*<([^<>\s]+@[^<>\s]+)>[ \t]*$", re.IGNORECASE)
 
 
-def git(repo, *args):
-    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=120)
+def git(repo, *args, stdin=None):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=120, input=stdin)
+
+
+def trailers(repo, body):
+    parsed = git(repo, "interpret-trailers", "--parse", "--no-divider", stdin=body)
+    if parsed.returncode != 0:
+        return None
+    return parsed.stdout.splitlines()
 
 
 def main(argv):
@@ -35,7 +43,11 @@ def main(argv):
             print(f"dco: cannot read commit {sha[:12]}", file=sys.stderr)
             return 2
         email, body = shown.stdout.split("\x00", 1)
-        signers = {m.strip().lower() for m in SIGN_OFF.findall(body)}
+        lines = trailers(repo, body)
+        if lines is None:
+            print(f"dco: cannot parse the trailers of {sha[:12]}", file=sys.stderr)
+            return 2
+        signers = {m.group(1).lower() for m in map(SIGN_OFF.match, lines) if m}
         if email.strip().lower() not in signers:
             print(f"dco: {sha[:12]}: no Signed-off-by line for the commit author (use git commit -s)")
             refused += 1

@@ -3,60 +3,95 @@
 
 Usage: codeowners <repo> <owner>      <owner> as written in CODEOWNERS, for example @name
 
-Each protected path below is resolved the way GitHub does: the last matching rule wins. The gate
-refuses when that rule does not name <owner>, so a later, broader rule cannot take a protected path
-away. Exit 0 clean, 1 refused, 2 broken. One line per protected path that is not covered.
+Checks every tracked file under a protected path, plus a sample path for each protected place that
+has no file yet, and resolves each the way GitHub does: the last matching rule wins, a single `*`
+never crosses a `/`, and a rule ending in a literal name or `/` also covers everything below it.
+The gate refuses when the winning rule does not name <owner>, so neither a later broad rule nor a
+narrow rule for one file can take a protected path away. Exit 0 clean, 1 refused, 2 broken.
 Plan-Step: P0.2.5
 """
 import pathlib
 import re
+import subprocess
 import sys
 
-# A representative file for each protected path: workflows and CODEOWNERS live under .github/, and
-# the gates and hooks are protected so a change cannot weaken the check that should stop it.
-PROTECTED = {
-    ".github/": [".github/CODEOWNERS", ".github/workflows/gates.yml"],
-    "entitlements": ["App/Shellborne.entitlements", "Daemon/shellborned.entitlements"],
-    "signing scripts": ["tools/signing/sign-release"],
-    "LICENSE": ["LICENSE"],
-    "NOTICE": ["NOTICE"],
-    "SECURITY.md": ["SECURITY.md"],
-    "TRADEMARKS.md": ["TRADEMARKS.md"],
-    "CONTRIBUTING.md": ["CONTRIBUTING.md"],
-    "tools/gates/": ["tools/gates/leak-guard", "tools/gates/dco"],
-    ".githooks/": [".githooks/pre-push"],
-    "tools/install-hooks": ["tools/install-hooks"],
-}
+# Protected places. Directories end in "/"; "*.entitlements" means that suffix anywhere.
+PROTECTED = [".github/", "tools/gates/", ".githooks/", "tools/signing/", "*.entitlements", "LICENSE", "NOTICE",
+             "SECURITY.md", "TRADEMARKS.md", "CONTRIBUTING.md", "tools/install-hooks"]
+# A path checked for each protected place even before any file exists there.
+SAMPLES = [".github/CODEOWNERS", ".github/workflows/new-workflow.yml", "tools/gates/new-gate", ".githooks/pre-push",
+           "tools/signing/sign-release", "App/Shellborne.entitlements", "Daemon/shellborned.entitlements",
+           "LICENSE", "NOTICE", "SECURITY.md", "TRADEMARKS.md", "CONTRIBUTING.md", "tools/install-hooks"]
+
+
+def is_protected(path):
+    for place in PROTECTED:
+        if place.startswith("*."):
+            if path.endswith(place[1:]):
+                return True
+        elif place.endswith("/"):
+            if path.startswith(place):
+                return True
+        elif path == place:
+            return True
+    return False
+
+
+def segment_regex(segment):
+    out, i = "", 0
+    while i < len(segment):
+        if segment.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif segment[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif segment[i] == "?":
+            out, i = out + "[^/]", i + 1
+        elif segment[i] == "\\" and i + 1 < len(segment):
+            out, i = out + re.escape(segment[i + 1]), i + 2
+        else:
+            out, i = out + re.escape(segment[i]), i + 1
+    return out
 
 
 def pattern_regex(pattern):
-    """Translate one CODEOWNERS pattern (gitignore rules, as GitHub applies them) to a regex."""
-    anchored = pattern.startswith("/") or "/" in pattern.rstrip("/")
+    """One CODEOWNERS pattern as GitHub applies it."""
+    directory = pattern.endswith("/")
     body = pattern.strip("/")
-    out, i = "", 0
-    while i < len(body):
-        if body.startswith("**/", i):
-            out, i = out + "(?:.*/)?", i + 3
-        elif body.startswith("**", i):
-            out, i = out + ".*", i + 2
-        elif body[i] == "*":
-            out, i = out + "[^/]*", i + 1
-        elif body[i] == "?":
-            out, i = out + "[^/]", i + 1
+    anchored = pattern.startswith("/") or "/" in body
+    parts = body.split("/")
+    pieces = []
+    for index, part in enumerate(parts):
+        if part == "**":
+            pieces.append("(?:.*/)?" if index < len(parts) - 1 else ".*")
         else:
-            out, i = out + re.escape(body[i]), i + 1
+            pieces.append(segment_regex(part) + ("/" if index < len(parts) - 1 else ""))
+    core = "".join(pieces)
+    last = parts[-1]
+    # A literal last segment, or a trailing slash, also covers everything below it. A wildcard last
+    # segment matches only at its own level: GitHub documents that docs/* does not match docs/a/b.md.
+    below = directory or not re.search(r"[*?\[]", last)
+    tail = "(?:/.*)?" if below and not directory else ("/.*" if directory else "")
     prefix = "^" if anchored else "^(?:.*/)?"
-    return re.compile(prefix + out + "(?:/.*)?$")
+    return re.compile(prefix + core + tail + "$")
 
 
 def rules(text):
     found = []
     for line in text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            parts = line.split()
-            found.append((pattern_regex(parts[0]), [p.lower() for p in parts[1:]]))
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = re.split(r"\s+#", line, maxsplit=1)[0]
+        parts = line.split()
+        found.append((pattern_regex(parts[0]), [p.lower() for p in parts[1:]]))
     return found
+
+
+def tracked(repo):
+    listed = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, text=True, timeout=60)
+    if listed.returncode != 0:
+        return None
+    return [p for p in listed.stdout.split("\0") if p]
 
 
 def main(argv):
@@ -64,25 +99,25 @@ def main(argv):
         print("usage: codeowners <repo> <owner>", file=sys.stderr)
         return 2
     repo, owner = pathlib.Path(argv[1]), argv[2].lower()
-    if not repo.is_dir():
-        print(f"codeowners: {repo} is not a folder", file=sys.stderr)
+    files = tracked(repo) if repo.is_dir() else None
+    if files is None:
+        print(f"codeowners: {repo} is not a git repository", file=sys.stderr)
         return 2
     path = repo / ".github" / "CODEOWNERS"
     if not path.is_file():
         print("codeowners: .github/CODEOWNERS is missing")
         return 1
     table = rules(path.read_text(errors="replace"))
+    checked = sorted({p for p in files if is_protected(p)} | set(SAMPLES))
     refused = 0
-    for name, samples in PROTECTED.items():
-        for sample in samples:
-            owners = None
-            for regex, names in table:
-                if regex.match(sample):
-                    owners = names
-            if owners is None or owner not in owners:
-                print(f"codeowners: {name}: {sample} does not resolve to {argv[2]}")
-                refused += 1
-                break
+    for sample in checked:
+        owners = None
+        for regex, names in table:
+            if regex.match(sample):
+                owners = names
+        if owners is None or owner not in owners:
+            print(f"codeowners: {sample} does not resolve to {argv[2]}")
+            refused += 1
     return 1 if refused else 0
 
 
