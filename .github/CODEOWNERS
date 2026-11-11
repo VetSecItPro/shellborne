@@ -7,3 +7,6 @@
 /SECURITY.md @VetSecItPro
 /TRADEMARKS.md @VetSecItPro
 /CONTRIBUTING.md @VetSecItPro
+/tools/gates/ @VetSecItPro
+/.githooks/ @VetSecItPro
+/tools/install-hooks @VetSecItPro

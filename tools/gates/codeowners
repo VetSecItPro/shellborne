@@ -12,7 +12,8 @@ import pathlib
 import re
 import sys
 
-# A representative file for each protected path: workflows and CODEOWNERS live under .github/.
+# A representative file for each protected path: workflows and CODEOWNERS live under .github/, and
+# the gates and hooks are protected so a change cannot weaken the check that should stop it.
 PROTECTED = {
     ".github/": [".github/CODEOWNERS", ".github/workflows/gates.yml"],
     "entitlements": ["App/Shellborne.entitlements", "Daemon/shellborned.entitlements"],
@@ -22,6 +23,9 @@ PROTECTED = {
     "SECURITY.md": ["SECURITY.md"],
     "TRADEMARKS.md": ["TRADEMARKS.md"],
     "CONTRIBUTING.md": ["CONTRIBUTING.md"],
+    "tools/gates/": ["tools/gates/leak-guard", "tools/gates/dco"],
+    ".githooks/": [".githooks/pre-push"],
+    "tools/install-hooks": ["tools/install-hooks"],
 }
 
 
