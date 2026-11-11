@@ -3,6 +3,7 @@
 # legal files and code owners on every run; DCO sign-off on each pull request's own commits.
 # Plan-Step: P0.21.3
 # Plan-Step: P0.2.4
+# Plan-Step: P0.5.9
 name: gates
 
 on:
@@ -62,3 +63,9 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: tools/gates/dco . "$BASE..$HEAD_SHA"
+
+      - name: Plan-Step lines in the pull request body
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: tools/gates/plan-step-format
