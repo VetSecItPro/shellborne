@@ -1,6 +1,8 @@
 # Public cleanliness gates on every pull request and every push to main: the leak guard, the secrets
-# gate and the workflow gate, each over the whole history, with every tool pinned by checksum.
+# gate and the workflow gate, each over the whole history, with every tool pinned by checksum; the
+# legal files and code owners on every run; DCO sign-off on each pull request's own commits.
 # Plan-Step: P0.21.3
+# Plan-Step: P0.2.4
 name: gates
 
 on:
@@ -47,3 +49,16 @@ jobs:
 
       - name: Workflow rules
         run: tools/gates/workflows .
+
+      - name: Legal files
+        run: tools/gates/legal-files .
+
+      - name: Code owners
+        run: tools/gates/codeowners . @VetSecItPro
+
+      - name: DCO sign-off on the pull request's commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: tools/gates/dco . "$BASE..$HEAD_SHA"

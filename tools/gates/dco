@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""DCO gate: every commit carries a Developer Certificate of Origin sign-off by its author.
+
+Usage: dco <repo> <range>     <range> is anything git rev-list accepts: HEAD, base..head
+
+A commit passes when its message has a `Signed-off-by:` line naming the commit author's email.
+Merge commits are checked like any other.
+Exit 0 clean, 1 refused, 2 broken. One line per refused commit, naming its short hash.
+Plan-Step: P0.2.4
+"""
+import re
+import subprocess
+import sys
+
+SIGN_OFF = re.compile(r"(?im)^Signed-off-by:\s*.+<([^>]+)>\s*$")
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=120)
+
+
+def main(argv):
+    if len(argv) != 3:
+        print("usage: dco <repo> <range>", file=sys.stderr)
+        return 2
+    repo, spec = argv[1], argv[2]
+    listed = git(repo, "rev-list", spec)
+    if listed.returncode != 0:
+        print(f"dco: cannot list commits for {spec}: {listed.stderr.strip()}", file=sys.stderr)
+        return 2
+    refused = 0
+    for sha in listed.stdout.split():
+        shown = git(repo, "show", "-s", "--format=%ae%x00%B", sha)
+        if shown.returncode != 0 or "\x00" not in shown.stdout:
+            print(f"dco: cannot read commit {sha[:12]}", file=sys.stderr)
+            return 2
+        email, body = shown.stdout.split("\x00", 1)
+        signers = {m.strip().lower() for m in SIGN_OFF.findall(body)}
+        if email.strip().lower() not in signers:
+            print(f"dco: {sha[:12]}: no Signed-off-by line for the commit author (use git commit -s)")
+            refused += 1
+    return 1 if refused else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

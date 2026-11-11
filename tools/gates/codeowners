@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Code-owners gate: every protected path resolves to the owner in .github/CODEOWNERS.
+
+Usage: codeowners <repo> <owner>      <owner> as written in CODEOWNERS, for example @name
+
+Each protected path below is resolved the way GitHub does: the last matching rule wins. The gate
+refuses when that rule does not name <owner>, so a later, broader rule cannot take a protected path
+away. Exit 0 clean, 1 refused, 2 broken. One line per protected path that is not covered.
+Plan-Step: P0.2.5
+"""
+import pathlib
+import re
+import sys
+
+# A representative file for each protected path: workflows and CODEOWNERS live under .github/.
+PROTECTED = {
+    ".github/": [".github/CODEOWNERS", ".github/workflows/gates.yml"],
+    "entitlements": ["App/Shellborne.entitlements", "Daemon/shellborned.entitlements"],
+    "signing scripts": ["tools/signing/sign-release"],
+    "LICENSE": ["LICENSE"],
+    "NOTICE": ["NOTICE"],
+    "SECURITY.md": ["SECURITY.md"],
+    "TRADEMARKS.md": ["TRADEMARKS.md"],
+    "CONTRIBUTING.md": ["CONTRIBUTING.md"],
+}
+
+
+def pattern_regex(pattern):
+    """Translate one CODEOWNERS pattern (gitignore rules, as GitHub applies them) to a regex."""
+    anchored = pattern.startswith("/") or "/" in pattern.rstrip("/")
+    body = pattern.strip("/")
+    out, i = "", 0
+    while i < len(body):
+        if body.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif body.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif body[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif body[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(body[i]), i + 1
+    prefix = "^" if anchored else "^(?:.*/)?"
+    return re.compile(prefix + out + "(?:/.*)?$")
+
+
+def rules(text):
+    found = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            parts = line.split()
+            found.append((pattern_regex(parts[0]), [p.lower() for p in parts[1:]]))
+    return found
+
+
+def main(argv):
+    if len(argv) != 3:
+        print("usage: codeowners <repo> <owner>", file=sys.stderr)
+        return 2
+    repo, owner = pathlib.Path(argv[1]), argv[2].lower()
+    if not repo.is_dir():
+        print(f"codeowners: {repo} is not a folder", file=sys.stderr)
+        return 2
+    path = repo / ".github" / "CODEOWNERS"
+    if not path.is_file():
+        print("codeowners: .github/CODEOWNERS is missing")
+        return 1
+    table = rules(path.read_text(errors="replace"))
+    refused = 0
+    for name, samples in PROTECTED.items():
+        for sample in samples:
+            owners = None
+            for regex, names in table:
+                if regex.match(sample):
+                    owners = names
+            if owners is None or owner not in owners:
+                print(f"codeowners: {name}: {sample} does not resolve to {argv[2]}")
+                refused += 1
+                break
+    return 1 if refused else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
