@@ -1,0 +1,28 @@
+# Agent instruction files: local links to the private build rules, never tracked.
+CLAUDE.md
+AGENTS.md
+CLAUDE.local.md
+.claude/settings.local.json
+
+# The private planning folder and planning paths never enter this repository.
+36.shellborne-private/
+/plan/
+/source-data/
+/owner-reviews/
+design-notes/
+PRD.md
+build-plan.*
+
+# Local tool output.
+.reports/
+.DS_Store
+
+# Build output.
+/target/
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Local link to the private backlog, never tracked.
+/*-backlog.md

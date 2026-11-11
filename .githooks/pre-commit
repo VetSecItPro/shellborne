@@ -1,0 +1,13 @@
+#!/bin/sh
+# Before every commit: refuse planning material and secrets in what is staged.
+# Plan-Step: P0.20.5
+top=$(git rev-parse --show-toplevel) || exit 1
+guard="$top/tools/gates/leak-guard"
+if [ ! -x "$guard" ]; then
+    echo "leak-guard: refused: the guard is missing at tools/gates/leak-guard" >&2
+    exit 1
+fi
+status=0
+"$guard" staged "$top" || status=1
+"$top/tools/gates/secrets" staged "$top" || status=1
+exit $status

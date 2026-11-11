@@ -1,0 +1,7 @@
+# Secret-scanning rules for the secrets gate. The gate always passes this file explicitly, so a
+# .gitleaks.toml added anywhere else in the repository cannot switch rules off.
+# Plan-Step: P0.21.3
+title = "secrets gate"
+
+[extend]
+useDefault = true

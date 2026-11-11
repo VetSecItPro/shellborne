@@ -1,0 +1,31 @@
+#!/bin/sh
+# Install the leak-guard hooks for this clone.
+#   tools/install-hooks                    use .githooks unless a hooks path is already configured
+#   tools/install-hooks --private <folder> also run the private comparison from <folder> before a push
+# Plan-Step: P0.20.5
+set -e
+top=$(git rev-parse --show-toplevel)
+chmod +x "$top/.githooks/pre-commit" "$top/.githooks/commit-msg" "$top/.githooks/pre-push" "$top/tools/gates/leak-guard"
+if [ "$1" = "--private" ]; then
+    if [ -z "$2" ] || [ ! -x "$2/tools/gates/leak-guard-private" ]; then
+        echo "install-hooks: no private guard at $2/tools/gates/leak-guard-private" >&2
+        exit 1
+    fi
+    git -C "$top" config shellborne.privateFolder "$2"
+fi
+current=$(git -C "$top" config --get core.hooksPath || true)
+if [ -z "$current" ]; then
+    git -C "$top" config core.hooksPath .githooks
+    echo "install-hooks: hooks path set to .githooks"
+elif [ "$current" = ".githooks" ]; then
+    echo "install-hooks: hooks path already .githooks"
+else
+    echo "install-hooks: hooks path is $current; it must run .githooks/pre-commit, commit-msg and pre-push"
+    chain=$(echo "$current" | sed "s|^~|$HOME|")
+    case $chain in /*) ;; *) chain="$top/$chain" ;; esac
+    for layer in pre-commit commit-msg pre-push; do
+        if [ ! -x "$chain/$layer" ]; then
+            echo "install-hooks: WARNING: $chain has no $layer hook, so $layer will not run here; public CI still checks" >&2
+        fi
+    done
+fi

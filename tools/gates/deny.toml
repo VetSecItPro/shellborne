@@ -1,0 +1,17 @@
+# cargo-deny rules for the dependency gate. The gate always passes this file explicitly.
+# The license allow-list matches the build rules; OFL-1.1 is for fonts only.
+# An exception needs a written reason on the line above it.
+# Plan-Step: P0.21.4
+
+[licenses]
+allow = ["MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Apache-2.0", "Zlib", "Libpng", "FTL", "Unicode-3.0", "OFL-1.1"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

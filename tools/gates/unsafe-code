@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Unsafe-code gate: Rust and Swift patterns that can crash or corrupt memory.
+
+Usage: unsafe-code <repo>
+
+Rust (when Cargo.toml exists): Clippy with warnings, unsafe code, unwrap, expect, panic and unchecked
+indexing denied, and any source-level `allow` of those lints refused outside a reviewed path.
+Swift (when .swift files exist): compiled with warnings as errors, and raw-pointer, bit-cast and
+unmanaged APIs refused outside a reviewed path. Reviewed paths are listed, each with a "# reason",
+in tools/gates/unsafe-allowed.txt; an entry without a reason is broken.
+Exit 0 clean, 1 refused, 2 broken. A missing compiler for code that exists is broken, never a pass.
+Plan-Step: P0.21.5
+"""
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+RUST_LINTS = ["warnings", "unsafe_code", "clippy::unwrap_used", "clippy::expect_used", "clippy::panic",
+              "clippy::indexing_slicing"]
+RUST_ALLOW = re.compile(r"#!?\[\s*allow\s*\([^)]*\b(unsafe_code|unwrap_used|expect_used|panic|indexing_slicing)\b")
+SWIFT_UNSAFE = re.compile(r"\b(unsafeBitCast|unsafeDowncast|Unsafe(?:Mutable)?(?:Raw)?(?:Buffer)?Pointer|"
+                          r"withUnsafe\w*|Unmanaged)\b")
+SKIP = {".git", ".build", "target", "DerivedData", "node_modules"}
+DIAGNOSTIC = re.compile(r"^(?:\s*-->\s*)?([^\s:][^:]*\.(?:rs|swift)):(\d+):\d+:?\s*(?:error|warning)?")
+
+
+class Broken(Exception):
+    pass
+
+
+def reviewed_paths(repo):
+    listed = repo / "tools" / "gates" / "unsafe-allowed.txt"
+    allowed = set()
+    if listed.exists():
+        for number, line in enumerate(listed.read_text().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            path, _, reason = line.partition("#")
+            if not reason.strip():
+                raise Broken(f"unsafe-allowed.txt line {number} has no reason")
+            allowed.add(path.strip().rstrip("/"))
+    return allowed
+
+
+def is_reviewed(rel, allowed):
+    return any(rel == a or rel.startswith(a + "/") for a in allowed)
+
+
+def sources(repo, suffix):
+    for path in sorted(repo.rglob(f"*{suffix}")):
+        if path.is_file() and not SKIP.intersection(path.relative_to(repo).parts):
+            yield path
+
+
+def diagnostics(output, repo):
+    found = []
+    for line in output.splitlines():
+        match = DIAGNOSTIC.match(line)
+        if match:
+            path = pathlib.Path(match.group(1))
+            rel = path.relative_to(repo).as_posix() if path.is_absolute() and repo in path.parents else match.group(1)
+            found.append(f"{rel}:{match.group(2)}")
+    return sorted(set(found))
+
+
+def check_rust(repo, allowed, findings):
+    if not (repo / "Cargo.toml").exists():
+        return
+    for path in sources(repo, ".rs"):
+        rel = path.relative_to(repo).as_posix()
+        if is_reviewed(rel, allowed):
+            continue
+        for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if RUST_ALLOW.search(line):
+                findings.append(("rust", f"{rel}:{number} (allow outside a reviewed path)"))
+    cargo = shutil.which("cargo")
+    if not cargo:
+        raise Broken("cargo is not installed, and this repository has Rust code")
+    with tempfile.TemporaryDirectory() as target:
+        args = [cargo, "clippy", "--all-targets", "--quiet", "--message-format=short", "--", *sum((["-D", l] for l in RUST_LINTS), [])]
+        result = subprocess.run(args, cwd=repo, capture_output=True, text=True, env=dict(os.environ, CARGO_TARGET_DIR=target))
+    hits = diagnostics(result.stderr + result.stdout, repo)
+    findings.extend(("rust", hit) for hit in hits)
+    if result.returncode != 0 and not hits:
+        raise Broken(f"cargo clippy failed: {result.stderr.strip()[-300:]}")
+
+
+def check_swift(repo, allowed, findings):
+    files = list(sources(repo, ".swift"))
+    if not files:
+        return
+    for path in files:
+        rel = path.relative_to(repo).as_posix()
+        if is_reviewed(rel, allowed):
+            continue
+        for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if SWIFT_UNSAFE.search(line.split("//", 1)[0]):
+                findings.append(("swift", f"{rel}:{number}"))
+    if (repo / "Package.swift").exists():
+        tool = shutil.which("swift")
+        if not tool:
+            raise Broken("swift is not installed, and this repository has Swift code")
+        with tempfile.TemporaryDirectory() as build:
+            result = subprocess.run([tool, "build", "--scratch-path", build, "-Xswiftc", "-warnings-as-errors"],
+                                    cwd=repo, capture_output=True, text=True)
+    else:
+        tool = shutil.which("swiftc")
+        if not tool:
+            raise Broken("swiftc is not installed, and this repository has Swift code")
+        result = subprocess.run([tool, "-typecheck", "-warnings-as-errors", *map(str, files)],
+                                cwd=repo, capture_output=True, text=True)
+    hits = diagnostics(result.stderr + result.stdout, repo)
+    findings.extend(("swift", hit) for hit in hits)
+    if result.returncode != 0 and not hits:
+        raise Broken(f"swift build failed: {result.stderr.strip()[-300:]}")
+
+
+def main(argv):
+    if len(argv) != 1:
+        print("unsafe-code: broken: usage: unsafe-code <repo>", file=sys.stderr)
+        return 2
+    repo = pathlib.Path(argv[0]).resolve()
+    findings = []
+    try:
+        allowed = reviewed_paths(repo)
+        check_rust(repo, allowed, findings)
+        check_swift(repo, allowed, findings)
+    except Broken as error:
+        print(f"unsafe-code: broken: {error}", file=sys.stderr)
+        return 2
+    for kind, where in findings:
+        print(f"unsafe-code: refused {kind} {where}", file=sys.stderr)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

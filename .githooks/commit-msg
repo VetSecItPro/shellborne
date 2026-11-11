@@ -1,0 +1,10 @@
+#!/bin/sh
+# Leak guard on the commit message: plan ids may appear only on Plan-Step lines.
+# Plan-Step: P0.20.5
+top=$(git rev-parse --show-toplevel) || exit 1
+guard="$top/tools/gates/leak-guard"
+if [ ! -x "$guard" ]; then
+    echo "leak-guard: refused: the guard is missing at tools/gates/leak-guard" >&2
+    exit 1
+fi
+"$guard" message "$1" || exit 1

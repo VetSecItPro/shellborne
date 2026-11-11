@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Workflow gate: GitHub Actions pinned to commit SHAs, least-privilege tokens, no untrusted triggers.
+
+Usage: workflows <repo>
+
+Checks every file in .github/workflows/:
+  - unpinned-action: a `uses:` that is not a local path, a docker image by digest, or owner/repo@<40-hex SHA>;
+  - permissions: no top-level `permissions:` block, or `write-all` anywhere;
+  - untrusted-trigger: `pull_request_target` or `workflow_run`, which hand secrets or a write token
+    to code from an untrusted pull request;
+  - actionlint findings, at the pinned actionlint version.
+Exit 0 clean, 1 refused, 2 broken; a missing or different actionlint is broken, never a pass.
+Plan-Step: P0.21.5
+"""
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+ACTIONLINT = "1.7.12"
+USES = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?([^'\"\s#]+)")
+PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
+DIGEST = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
+UNTRUSTED = re.compile(r"\b(pull_request_target|workflow_run)\b")
+
+
+def broken(message):
+    print(f"workflows: broken: {message}", file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    if len(argv) != 1:
+        return broken("usage: workflows <repo>")
+    folder = pathlib.Path(argv[0]) / ".github" / "workflows"
+    files = sorted(p for p in folder.glob("*") if p.suffix in (".yml", ".yaml")) if folder.is_dir() else []
+    findings = []
+    for path in files:
+        rel = path.relative_to(argv[0]).as_posix()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if not any(re.match(r"^permissions\s*:", line) for line in lines):
+            findings.append(("permissions", f"{rel} (no top-level permissions block)"))
+        for number, line in enumerate(lines, 1):
+            code = line.split("#", 1)[0]
+            match = USES.match(code)
+            if match:
+                ref = match.group(1)
+                if not (ref.startswith("./") or PINNED.match(ref) or DIGEST.match(ref)):
+                    findings.append(("unpinned-action", f"{rel}:{number}"))
+            if re.search(r"\bwrite-all\b", code):
+                findings.append(("permissions", f"{rel}:{number}"))
+            if UNTRUSTED.search(code):
+                findings.append(("untrusted-trigger", f"{rel}:{number}"))
+    if files:
+        tool = shutil.which("actionlint")
+        if not tool:
+            return broken(f"actionlint is not installed; install actionlint {ACTIONLINT}. This gate never passes without it.")
+        version = subprocess.run([tool, "-version"], capture_output=True, text=True).stdout.split()
+        if not version or version[0] != ACTIONLINT:
+            return broken(f"actionlint {version[0] if version else 'unknown'} found, {ACTIONLINT} pinned")
+        lint = subprocess.run([tool, "-no-color", "-oneline", *map(str, files)], capture_output=True, text=True)
+        for line in lint.stdout.splitlines():
+            findings.append(("actionlint", line.split(": ", 1)[0]))
+        if lint.returncode not in (0, 1):
+            return broken(f"actionlint failed: {lint.stderr.strip()[:300]}")
+    for kind, where in findings:
+        print(f"workflows: refused {kind} {where}", file=sys.stderr)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

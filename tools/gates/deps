@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Dependency gate: known vulnerabilities, disallowed licenses and unpinned packages.
+
+Usage: deps <repo>
+
+  - vulnerable-dependency: cargo-audit on Cargo.lock. SHELLBORNE_ADVISORY_DB names a local advisory
+    database (used by tests, so they never depend on the network); otherwise the current RustSec
+    database is fetched.
+  - license / banned-source: cargo-deny with this folder's deny.toml, never a config from the tree.
+  - unpinned-package: a Package.resolved pin without an exact 40-hex revision, or pinned to a branch.
+Accepted exceptions live in deny.toml with a written reason. Exit 0 clean, 1 refused, 2 broken; a
+missing tool for a lockfile that exists is broken, never a pass.
+Plan-Step: P0.21.4
+"""
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+CONFIG = pathlib.Path(__file__).resolve().parent / "deny.toml"
+REVISION = re.compile(r"^[0-9a-f]{40}$")
+
+
+class Broken(Exception):
+    pass
+
+
+def check_rust(repo, findings):
+    lock = repo / "Cargo.lock"
+    if not lock.exists():
+        return
+    cargo = shutil.which("cargo")
+    if not cargo:
+        raise Broken("cargo is not installed, and this repository has a Cargo.lock")
+    audit = [cargo, "audit", "--json", "--file", str(lock)]
+    db = os.environ.get("SHELLBORNE_ADVISORY_DB")
+    if db:
+        audit += ["--db", db, "--no-fetch"]
+    result = subprocess.run(audit, capture_output=True, text=True, cwd=repo)
+    try:
+        report = json.loads(result.stdout)
+    except ValueError:
+        raise Broken(f"cargo audit failed: {result.stderr.strip()[-300:]}")
+    for item in report.get("vulnerabilities", {}).get("list", []):
+        package = item.get("package", {})
+        advisory = item.get("advisory", {}).get("id", "advisory")
+        findings.append(("vulnerable-dependency", f"Cargo.lock ({package.get('name')} {package.get('version')}, {advisory})"))
+    if findings:
+        return  # the lock is already refused; cargo-deny would only repeat it
+    deny = [cargo, "deny", "--manifest-path", str(repo / "Cargo.toml"), "--config", str(CONFIG), "--offline",
+            "check", "licenses", "bans", "sources"]
+    result = subprocess.run(deny, capture_output=True, text=True, cwd=repo)
+    if result.returncode != 0:
+        errors = [line for line in result.stderr.splitlines() if line.startswith("error[")]
+        if not errors:
+            raise Broken(f"cargo deny failed: {result.stderr.strip()[-300:]}")
+        for line in errors:
+            kind = "license" if "license" in line else "banned-source"
+            findings.append((kind, f"Cargo.toml ({line[:120]})"))
+
+
+def check_swift(repo, findings):
+    resolved = repo / "Package.resolved"
+    if not resolved.exists():
+        return
+    try:
+        pins = json.loads(resolved.read_text()).get("pins", [])
+    except ValueError:
+        raise Broken("Package.resolved is not valid JSON")
+    for pin in pins:
+        state = pin.get("state", {})
+        if "branch" in state or not REVISION.match(state.get("revision", "")):
+            findings.append(("unpinned-package", f"Package.resolved ({pin.get('identity', '?')})"))
+
+
+def main(argv):
+    if len(argv) != 1:
+        print("deps: broken: usage: deps <repo>", file=sys.stderr)
+        return 2
+    repo = pathlib.Path(argv[0]).resolve()
+    findings = []
+    try:
+        check_rust(repo, findings)
+        check_swift(repo, findings)
+    except Broken as error:
+        print(f"deps: broken: {error}", file=sys.stderr)
+        return 2
+    for kind, where in findings:
+        print(f"deps: refused {kind} {where}", file=sys.stderr)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

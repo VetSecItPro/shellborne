@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Legal-files gate: the files every public commit must carry.
+
+Usage: legal-files <repo>
+
+Checks LICENSE is the Apache License 2.0, NOTICE is not empty, SECURITY.md names a human contact
+and a private reporting path, TRADEMARKS.md reserves the name and the logo, and CONTRIBUTING.md
+asks for DCO sign-off and states there is no CLA.
+Exit 0 clean, 1 refused, 2 broken. One line per finding, naming the file.
+Plan-Step: P0.2.2
+"""
+import pathlib
+import re
+import sys
+
+CHECKS = {
+    "LICENSE": [(r"Apache License", "is not the Apache License"), (r"Version 2\.0", "is not version 2.0")],
+    "NOTICE": [(r"\S", "is empty")],
+    "SECURITY.md": [(r"(?im)^\s*(?:[-*]\s+)?\**contact\**\s*:\**\s*\S", "names no contact (a 'Contact:' line)"),
+                    (r"(?i)private vulnerability report|security advisor", "gives no private reporting path")],
+    "TRADEMARKS.md": [(r"(?i)\bname\b", "does not reserve the name"), (r"(?i)\blogo\b", "does not reserve the logo")],
+    "CONTRIBUTING.md": [(r"Signed-off-by", "does not ask for DCO sign-off"),
+                        (r"(?i)\bno (CLA|contributor license agreement)\b", "does not state there is no CLA")],
+}
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: legal-files <repo>", file=sys.stderr)
+        return 2
+    repo = pathlib.Path(argv[1])
+    if not repo.is_dir():
+        print(f"legal-files: {repo} is not a folder", file=sys.stderr)
+        return 2
+    findings = []
+    for name, rules in CHECKS.items():
+        path = repo / name
+        if not path.is_file():
+            findings.append(f"{name}: missing")
+            continue
+        text = path.read_text(errors="replace")
+        findings.extend(f"{name}: {why}" for pattern, why in rules if not re.search(pattern, text))
+    for line in findings:
+        print(f"legal-files: {line}")
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

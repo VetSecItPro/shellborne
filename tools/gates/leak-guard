@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Leak guard, public half: refuse planning material by shape (plan step P0.20.4).
+
+Usage:
+    leak-guard staged <repo>            check the index, before a commit (pre-commit hook)
+    leak-guard commits <repo> <range>   check every commit's whole tree and message (pre-push, CI)
+    leak-guard message <file>           check a commit message before the commit (commit-msg hook)
+
+Exit 0 clean, 1 refused, 2 broken (bad arguments, not a repository, git failed). Hooks treat any
+nonzero code as a refusal. Each refusal is one line, "leak-guard: refused <kind> <where>", where kind
+is path, canary, plan-id, commit-message or instruction-file and where is a file and line or a commit.
+The matched text is never printed: CI logs are public. This file holds only shapes, never real values.
+"""
+import re
+import subprocess
+import sys
+
+MAX_REPORTS = 200
+
+# Requirement-style ids: PREFIX-number, optionally behind OP-. Decision D-A/T/P, lesson L-B/E/P,
+# design note DN, and threat/surface ids S and T with two or three digits.
+REQUIREMENT_PREFIXES = (
+    "AC", "AGT", "AP", "ARC", "AX", "BRW", "CX", "DES", "GAP", "MH", "NFR", "OWN", "PERF", "PHN",
+    "PLT", "REL", "RLS", "RSK", "SCP", "SEC", "STY", "TRC", "USR", "UX", "VIS",
+)
+PLAN_ID = re.compile(
+    r"(?<![A-Za-z0-9-])(?:"
+    r"(?:OP-)?(?:" + "|".join(REQUIREMENT_PREFIXES) + r")-\d{1,4}"
+    r"|D-[ATP]\d{2}|L-[BEP]\d{2}|DN-\d{1,3}|[ST]\d{2,3}"
+    r")(?![A-Za-z0-9])"
+)
+CANARY = re.compile(r"sbk-[0-9a-fA-F]{16}(?![0-9a-fA-F])")
+PLAN_STEP_LINE = re.compile(r"^Plan-Step: (?:P\d+\.\d+(?:\.\d+)?|CHANGE-\d{4})\s*$")
+
+# Details about a machine or a person, checked in file content only: a contributor's own
+# Signed-off-by line legitimately carries an email address, so commit messages are not checked here.
+INTERNAL_PATH = re.compile(r"(?<![\w.-])/(?:Users|home)/(?!Shared/)[A-Za-z0-9._-]+/")
+HOSTNAME = re.compile(r"(?<![\w-])[A-Za-z0-9][A-Za-z0-9-]*\.local(?![\w.-])", re.IGNORECASE)
+PRIVATE_IP = re.compile(r"(?<![\d.])(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}(?![\d.]*\d)")
+EMAIL = re.compile(r"(?<![\w.%+-])[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})(?![\w-])")
+ALLOWED_EMAIL_DOMAINS = re.compile(
+    r"^(?:users\.noreply\.github\.com|shellborne\.dev|example\.(?:com|org|net)|[\w.-]+\.(?:invalid|test|example))$",
+    re.IGNORECASE)
+IDENTITY_KINDS = (("internal-path", INTERNAL_PATH), ("hostname", HOSTNAME), ("private-ip", PRIVATE_IP))
+
+
+def has_email(line):
+    return any(not ALLOWED_EMAIL_DOMAINS.match(m.group(1)) and not m.group(0).lower().startswith("git@")
+               for m in EMAIL.finditer(line))
+
+
+INSTRUCTION_FILES = {"claude.md", "agents.md", "claude.local.md"}
+PLANNING_FOLDERS = {"design-notes", "36.shellborne-private"}
+PLANNING_ROOT_FOLDERS = {"plan", "source-data"}
+PLANNING_NAMES = re.compile(
+    r"^(?:prd\.(?:md|json)|product-requirements\.md|build-plan\.(?:json|md)|traceability\.json"
+    r"|current-work\.md|owner-answers\.md|leak-markers\.json|.*-backlog\.md|.*lessons-learned.*\.md)$"
+)
+
+
+class Broken(Exception):
+    pass
+
+
+def git(repo, *args, data=None):
+    result = subprocess.run(["git", "-C", repo, *args], input=data, capture_output=True)
+    if result.returncode != 0:
+        raise Broken(f"git {args[0]} failed: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+class Report:
+    def __init__(self):
+        self.count = 0
+
+    def refuse(self, kind, where):
+        self.count += 1
+        if self.count <= MAX_REPORTS:
+            print(f"leak-guard: refused {kind} {where}", file=sys.stderr)
+
+    def finish(self):
+        if self.count > MAX_REPORTS:
+            print(f"leak-guard: and {self.count - MAX_REPORTS} more refusals", file=sys.stderr)
+        return 1 if self.count else 0
+
+
+def check_path(path, mode, target, report):
+    parts = path.lower().split("/")
+    name = parts[-1]
+    if name in INSTRUCTION_FILES:
+        report.refuse("instruction-file", path)
+        return
+    if (PLANNING_FOLDERS.intersection(parts[:-1]) or parts[0] in PLANNING_ROOT_FOLDERS and len(parts) > 1
+            or PLANNING_NAMES.match(name)):
+        folder = next((p for p in parts[:-1] if p in PLANNING_FOLDERS), None)
+        report.refuse("path", f"{path} (folder {folder})" if folder else path)
+    if mode == "120000" and "shellborne-private" in target:
+        report.refuse("path", f"{path} (link into the private folder)")
+
+
+def check_text(where, text, report, plan_step_lines_ok=False):
+    """Return True if the text holds a canary or a plan id. Reports each line for files."""
+    found = False
+    for number, line in enumerate(text.splitlines(), 1):
+        if plan_step_lines_ok and PLAN_STEP_LINE.match(line):
+            continue
+        for kind, pattern in (("canary", CANARY), ("plan-id", PLAN_ID)):
+            if pattern.search(line):
+                found = True
+                if where is not None:
+                    report.refuse(kind, f"{where}:{number}")
+        if where is not None:  # file content only, never commit messages
+            for kind, pattern in IDENTITY_KINDS:
+                if pattern.search(line):
+                    report.refuse(kind, f"{where}:{number}")
+            if has_email(line):
+                report.refuse("email", f"{where}:{number}")
+    return found
+
+
+def read_blobs(repo, ids):
+    """Read blobs through one git cat-file process. Returns {id: bytes}."""
+    if not ids:
+        return {}
+    out = git(repo, "cat-file", "--batch", data="".join(i + "\n" for i in ids).encode())
+    blobs, pos = {}, 0
+    for blob_id in ids:
+        end = out.index(b"\n", pos)
+        header = out[pos:end].split()
+        if len(header) != 3:
+            raise Broken(f"cat-file could not read object {blob_id}")
+        size = int(header[2])
+        blobs[blob_id] = out[end + 1:end + 1 + size]
+        pos = end + 1 + size + 1
+    return blobs
+
+
+def check_entries(repo, entries, report, seen):
+    """entries: list of (mode, blob id, path). Content is checked once per blob."""
+    blobs = read_blobs(repo, sorted({b for m, b, p in entries if m != "160000"}))
+    for mode, blob_id, path in entries:
+        if mode == "160000":  # submodule commit, no content here
+            check_path(path, mode, "", report)
+            continue
+        data = blobs[blob_id]
+        target = data.decode(errors="replace") if mode == "120000" else ""
+        check_path(path, mode, target, report)
+        if (blob_id, path) in seen:
+            continue
+        seen.add((blob_id, path))
+        check_text(path, data.decode("utf-8", errors="replace"), report)
+
+
+def parse_ls(raw, staged):
+    entries = []
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        meta, path = record.split(b"\t", 1)
+        fields = meta.decode().split()
+        mode = fields[0]
+        blob_id = fields[1] if staged else fields[2]
+        entries.append((mode, blob_id, path.decode(errors="replace")))
+    return entries
+
+
+def staged(repo):
+    report = Report()
+    entries = parse_ls(git(repo, "ls-files", "--stage", "-z"), staged=True)
+    check_entries(repo, entries, report, set())
+    return report.finish()
+
+
+def commits(repo, revision_range):
+    report = Report()
+    seen = set()
+    for commit in git(repo, "rev-list", revision_range).decode().split():
+        short = git(repo, "rev-parse", "--short", commit).decode().strip()
+        message = git(repo, "log", "-1", "--format=%B", commit).decode(errors="replace")
+        if check_text(None, message, report, plan_step_lines_ok=True):
+            report.refuse("commit-message", short)
+        emails = git(repo, "log", "-1", "--format=%ae%n%ce", commit).decode(errors="replace").split()
+        if any(not ALLOWED_EMAIL_DOMAINS.match(e.rpartition("@")[2]) for e in emails):
+            report.refuse("author-email", short)
+        entries = parse_ls(git(repo, "ls-tree", "-r", "-z", commit), staged=False)
+        check_entries(repo, entries, report, seen)
+    return report.finish()
+
+
+def message(path):
+    report = Report()
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError as error:
+        raise Broken(f"cannot read the message file: {error.strerror}")
+    if check_text(None, text, report, plan_step_lines_ok=True):
+        report.refuse("commit-message", "in the message being committed")
+    return report.finish()
+
+
+def main(argv):
+    try:
+        if len(argv) == 2 and argv[0] == "message":
+            return message(argv[1])
+        if len(argv) == 2 and argv[0] == "staged":
+            return staged(argv[1])
+        if len(argv) == 3 and argv[0] == "commits":
+            return commits(argv[1], argv[2])
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+        return 2
+    except Broken as error:
+        print(f"leak-guard: broken: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
