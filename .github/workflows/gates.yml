@@ -57,6 +57,9 @@ jobs:
       - name: Code owners
         run: tools/gates/codeowners . @VetSecItPro
 
+      - name: Devlog entries
+        run: tools/gates/devlog-check .
+
       - name: DCO sign-off on the pull request's commits
         if: github.event_name == 'pull_request'
         env:

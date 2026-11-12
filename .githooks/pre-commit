@@ -1,5 +1,5 @@
 #!/bin/sh
-# Before every commit: refuse planning material and secrets in what is staged.
+# Before every commit: refuse planning material and secrets in what is staged, and check devlog entries.
 # Plan-Step: P0.20.5
 top=$(git rev-parse --show-toplevel) || exit 1
 guard="$top/tools/gates/leak-guard"
@@ -10,4 +10,12 @@ fi
 status=0
 "$guard" staged "$top" || status=1
 "$top/tools/gates/secrets" staged "$top" || status=1
+posts=$(git diff --cached --name-only --diff-filter=ACMR -- docs/_posts)
+if [ -n "$posts" ] && [ -x "$top/tools/gates/devlog-check" ]; then
+    # Check the entries as staged, not as they are on disk.
+    staged=$(mktemp -d) || exit 1
+    echo "$posts" | git checkout-index --stdin --prefix="$staged/" || status=1
+    "$top/tools/gates/devlog-check" "$staged" || status=1
+    rm -rf "$staged"
+fi
 exit $status
