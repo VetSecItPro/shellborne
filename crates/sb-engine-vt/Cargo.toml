@@ -1,0 +1,10 @@
+[package]
+name = "sb-engine-vt"
+description = "The engine adapter: the only Rust code that touches libghostty-vt (layer 1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

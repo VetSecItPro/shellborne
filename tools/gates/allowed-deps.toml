@@ -1,0 +1,75 @@
+# The five compile-time layers and what each target may depend on. tools/gates/boundaries compares the
+# real Cargo and SwiftPM graphs, and every Swift import, against this file.
+#
+# Layers: 1 engine adapters, 2 session daemon and wire protocol, 3 core model, 4 feature modules,
+# 5 platform shell. A target may depend only on its own layer or a lower one, and a feature module may
+# never depend on another feature module. Apple UI frameworks (AppKit, Cocoa, SwiftUI, UIKit) are allowed
+# only where a target lists them: the layer 1 Swift adapters wrap an AppKit surface by nature, and the
+# platform shell is AppKit. The core and the protocol stay free of them, so an iPhone app stays possible.
+
+[rust.sb-engine-vt]
+layer = 1
+deps = []
+
+[rust.sb-wire]
+layer = 2
+deps = []
+
+[rust.sb-policy]
+layer = 2
+deps = []
+
+[rust.sb-redact]
+layer = 2
+deps = []
+
+[rust.sb-host]
+layer = 2
+deps = ["sb-wire", "sb-redact"]
+
+[rust.sb-vt-worker]
+layer = 2
+deps = ["sb-engine-vt", "sb-wire", "sb-redact"]
+
+[rust.sb-supervisor]
+layer = 2
+deps = ["sb-wire", "sb-redact"]
+
+[rust.sb-attach]
+layer = 2
+deps = ["sb-wire", "sb-policy", "sb-redact"]
+
+[rust.sb-cli]
+layer = 2
+deps = ["sb-wire", "sb-redact"]
+
+[rust.sb-core]
+layer = 3
+deps = ["sb-wire"]
+
+[swift.EngineSurface]
+layer = 1
+deps = []
+frameworks = ["AppKit"]
+
+[swift.TerminalView]
+layer = 1
+deps = ["EngineSurface"]
+frameworks = ["AppKit"]
+
+[swift.CoreClient]
+layer = 3
+deps = []
+
+[swift.DesignSystem]
+layer = 3
+deps = []
+
+[swift.FeaturePlaceholder]
+layer = 4
+deps = ["CoreClient", "DesignSystem"]
+
+[swift.PlatformShell]
+layer = 5
+deps = ["TerminalView", "CoreClient", "DesignSystem", "FeaturePlaceholder"]
+frameworks = ["AppKit"]

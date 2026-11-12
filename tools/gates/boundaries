@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Layer boundaries gate: the real Cargo and SwiftPM graphs, and every Swift import, stay inside the
+allow-list in tools/gates/allowed-deps.toml.
+
+Usage: boundaries [--base-list <allow-list from the base commit>] <repo>
+
+Checks: every target in either graph is listed and every listed target exists; each target depends only
+on what its entry allows; the list itself only allows a target's own layer or lower and never one
+feature module (layer 4) on another; and a Swift file imports Apple UI frameworks only where its target
+lists them, and imports other project modules only where its target may depend on them. With a base
+list, a target whose layer differs from the base is refused unless PR_BODY names it on a Layer-Change:
+line, so a pull request cannot quietly relabel a layer to let a dependency through.
+Exit 0 clean, 1 refused, 2 broken.
+"""
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tomllib
+
+UI_FRAMEWORKS = {"AppKit", "Cocoa", "SwiftUI", "UIKit"}
+FEATURE_LAYER = 4
+IMPORT = re.compile(r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*import\s+(?:(?:typealias|struct|class|enum|protocol|let|var|func)\s+)?"
+                    r"([A-Za-z_]\w*)", re.MULTILINE)
+
+
+class Broken(Exception):
+    pass
+
+
+def run(*command):
+    done = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    if done.returncode != 0:
+        raise Broken(f"{command[0]} failed: {done.stderr.strip()[:300]}")
+    return done.stdout
+
+
+def rust_graph(repo):
+    """{crate: set of workspace crates it depends on}, from cargo metadata without the network."""
+    manifest = repo / "Cargo.toml"
+    if not manifest.is_file():
+        return {}
+    data = json.loads(run("cargo", "metadata", "--no-deps", "--offline", "--format-version", "1",
+                          "--manifest-path", str(manifest)))
+    names = {package["name"] for package in data["packages"]}
+    return {package["name"]: {dep["name"] for dep in package["dependencies"] if dep["name"] in names}
+            for package in data["packages"]}
+
+
+def swift_graph(repo):
+    """{target: set of package targets it depends on}, from swift package dump-package."""
+    package = repo / "apple"
+    if not (package / "Package.swift").is_file():
+        return {}
+    data = json.loads(run("swift", "package", "--package-path", str(package), "dump-package"))
+    graph = {}
+    for target in data.get("targets", []):
+        deps = set()
+        for dep in target.get("dependencies", []):
+            for kind in ("byName", "target", "product"):
+                if kind in dep and dep[kind]:
+                    deps.add(dep[kind][0])
+        graph[target["name"]] = deps
+    return graph
+
+
+def swift_imports(repo, target):
+    folder = repo / "apple" / "Sources" / target
+    found = set()
+    for path in sorted(folder.rglob("*.swift")) if folder.is_dir() else []:
+        found.update(IMPORT.findall(path.read_text(errors="replace")))
+    return found
+
+
+def list_findings(kind, allowed):
+    found = []
+    for name, entry in allowed.items():
+        layer = entry.get("layer")
+        if not isinstance(layer, int) or not 1 <= layer <= 5:
+            found.append(f"{kind} {name}: the layer must be a number from 1 to 5")
+            continue
+        for dep in entry.get("deps", []):
+            other = allowed.get(dep)
+            if other is None:
+                found.append(f"{kind} {name}: allows {dep}, which is not in the list")
+            elif other.get("layer", 99) > layer:
+                found.append(f"{kind} {name}: allows {dep}, a higher layer")
+            elif layer == FEATURE_LAYER and other.get("layer") == FEATURE_LAYER:
+                found.append(f"{kind} {name}: allows the feature module {dep}")
+    return found
+
+
+def graph_findings(kind, graph, allowed):
+    found = []
+    for name in sorted(set(graph) - set(allowed)):
+        found.append(f"{kind} {name}: the target is not in the allow-list")
+    for name in sorted(set(allowed) - set(graph)):
+        found.append(f"{kind} {name}: the allow-list names a target that does not exist")
+    for name in sorted(set(graph) & set(allowed)):
+        extra = sorted(graph[name] - set(allowed[name].get("deps", [])))
+        if extra:
+            found.append(f"{kind} {name}: depends on {', '.join(extra)}, which the allow-list does not allow")
+    return found
+
+
+def import_findings(repo, graph, allowed):
+    found = []
+    for name in sorted(graph):
+        entry = allowed.get(name, {})
+        imports = swift_imports(repo, name)
+        ui = sorted(imports & UI_FRAMEWORKS - set(entry.get("frameworks", [])))
+        if ui:
+            found.append(f"swift {name}: imports {', '.join(ui)}, which this layer may not use")
+        modules = sorted((imports & set(graph)) - set(entry.get("deps", [])) - {name})
+        if modules:
+            found.append(f"swift {name}: imports {', '.join(modules)}, which the allow-list does not allow")
+    return found
+
+
+def layer_change_findings(base, current, body):
+    named = set(re.findall(r"^Layer-Change:[ \t]*(\S+)", body, re.MULTILINE))
+    found = []
+    for kind in ("rust", "swift"):
+        for name, entry in current.get(kind, {}).items():
+            before = base.get(kind, {}).get(name)
+            if before and before.get("layer") != entry.get("layer") and name not in named:
+                found.append(f"{kind} {name}: the layer changed from {before.get('layer')} to {entry.get('layer')} "
+                             "with no Layer-Change: line naming it")
+    return found
+
+
+def main(argv):
+    base_list = None
+    if len(argv) == 4 and argv[1] == "--base-list":
+        base_list, argv = pathlib.Path(argv[2]), [argv[0], argv[3]]
+    if len(argv) != 2:
+        print("boundaries: broken: usage: boundaries [--base-list <file>] <repo>", file=sys.stderr)
+        return 2
+    repo = pathlib.Path(argv[1])
+    try:
+        listing = repo / "tools" / "gates" / "allowed-deps.toml"
+        if not listing.is_file():
+            if not (repo / "Cargo.toml").is_file() and not (repo / "apple" / "Package.swift").is_file():
+                return 0  # no workspace and no list: nothing to check
+            raise Broken("tools/gates/allowed-deps.toml is missing")
+        allowed = tomllib.loads(listing.read_text())
+        rust_allowed, swift_allowed = allowed.get("rust", {}), allowed.get("swift", {})
+        rust, swift = rust_graph(repo), swift_graph(repo)
+        base = tomllib.loads(base_list.read_text()) if base_list else None
+    except (Broken, tomllib.TOMLDecodeError, OSError, ValueError, KeyError) as error:
+        print(f"boundaries: broken: {error}", file=sys.stderr)
+        return 2
+    found = list_findings("rust", rust_allowed) + list_findings("swift", swift_allowed)
+    found += graph_findings("rust", rust, rust_allowed) + graph_findings("swift", swift, swift_allowed)
+    found += import_findings(repo, swift, swift_allowed)
+    if base is not None:
+        found += layer_change_findings(base, allowed, os.environ.get("PR_BODY", ""))
+    for line in found:
+        print(f"boundaries: refused: {line}")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

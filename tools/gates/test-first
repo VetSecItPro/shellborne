@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Test-first gate: in Tier 1 and Tier 2 product code, every change follows its test, and a test is
+never edited by the commit that makes it pass (plan step P0.6.5).
+
+Usage: PR_BODY=<pull request body> test-first <repo> <base>..<head>
+
+The tier comes from the body's single Tier line; Tier 3 is exempt. Over the range, oldest first:
+  - a merge commit is refused, because it could carry code and tests together unseen;
+  - a commit that changes product code may not change any test file, and needs a tests-only commit after
+    the previous code commit, or a No-New-Test: line with the reason;
+  - once code has landed, a tests-only commit that edits an existing test needs a Test-Fix: line.
+Test files are anything under a tests/ or Tests/ folder, test_*.py and *_test.rs. Product code is
+everything else except tools/, .github/, .githooks/ and docs/, whose tests live in the private folder.
+Exit 0 clean, 1 refused, 2 broken.
+"""
+import os
+import re
+import subprocess
+import sys
+
+TIER = re.compile(r"^Tier:[ \t]*([123])[ \t]*$", re.MULTILINE)
+TEST_FIX = re.compile(r"^Test-Fix:[ \t]*\S", re.MULTILINE)
+TEST_PATH = re.compile(r"(^|/)(tests|Tests)/|(^|/)test_[^/]*\.py$|_test\.rs$")
+NOT_PRODUCT = ("tools/", ".github/", ".githooks/", "docs/")
+NO_NEW_TEST = re.compile(r"^No-New-Test:[ \t]*\S", re.MULTILINE)
+TIER_LINE = re.compile(r"^Tier:", re.MULTILINE)
+
+
+def git(repo, *args):
+    done = subprocess.run(("git", "-C", repo) + args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if done.returncode != 0:
+        raise RuntimeError(done.stderr.strip())
+    return done.stdout
+
+
+def changes(repo, sha):
+    """(status, path) for each file the commit changes against its first parent."""
+    out = git(repo, "diff-tree", "--no-commit-id", "-r", "--name-status", sha)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        rows.append((parts[0][0], parts[-1]))
+    return rows
+
+
+def judge(repo, revision_range):
+    found = []
+    code_landed = False
+    tested_since_code = False
+    late = []  # tests added after the most recent code commit
+    for sha in git(repo, "rev-list", "--reverse", revision_range).split():
+        short = sha[:12]
+        parents = git(repo, "rev-list", "--parents", "-n", "1", sha).split()[1:]
+        if len(parents) > 1:
+            found.append(f"{short} is a merge commit; rebuild the branch instead of merging into it")
+            continue
+        rows = changes(repo, sha)
+        tests = [(status, path) for status, path in rows if TEST_PATH.search(path)]
+        code = [path for status, path in rows if not TEST_PATH.search(path) and not path.startswith(NOT_PRODUCT)]
+        message = git(repo, "log", "-1", "--format=%B", sha)
+        if code and tests:
+            found.append(f"{short} changes code and the test files {', '.join(p for _, p in tests)} together")
+        elif code:
+            if not tested_since_code and not NO_NEW_TEST.search(message):
+                found.append(f"{short} changes code with no tests-only commit before it and no No-New-Test: reason")
+            code_landed, tested_since_code, late = True, False, []
+        elif tests:
+            edited = [path for status, path in tests if status != "A"]
+            added = [path for status, path in tests if status == "A"]
+            if code_landed and edited and not TEST_FIX.search(message):
+                found.append(f"{short} edits or deletes {', '.join(edited)} after the code landed with no Test-Fix: reason")
+            if code_landed and added:
+                late.append((short, added))
+            if any(status in ("A", "M") for status, _ in tests):
+                tested_since_code = True  # a deletion alone never counts as testing
+    for short, added in late:
+        found.append(f"{short} adds {', '.join(added)} after the last code commit; the test belongs before the code")
+    return found
+
+
+def main(argv):
+    if len(argv) != 3 or "PR_BODY" not in os.environ:
+        print("test-first: broken: usage: PR_BODY=... test-first <repo> <base>..<head>", file=sys.stderr)
+        return 2
+    body = os.environ["PR_BODY"].replace("\r\n", "\n")
+    tier = TIER.search(body)
+    if not tier or len(TIER_LINE.findall(body)) != 1:
+        print("test-first: broken: the body needs exactly one Tier line of 1, 2 or 3", file=sys.stderr)
+        return 2
+    if tier.group(1) == "3":
+        return 0
+    try:
+        found = judge(argv[1], argv[2])
+    except RuntimeError as error:
+        print(f"test-first: broken: {error}", file=sys.stderr)
+        return 2
+    for line in found:
+        print(f"test-first: refused: {line}")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
