@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Plan-attestation gate, version 2: a pull request goes green only when this project's private plan
+check passed on exactly this pull request: this repository, this base, this head, this tree, these
+Plan-Step lines and this body.
+
+Usage: plan-attestation --key <public key file> <repo>
+The pull request arrives in four variables: its text in PR_BODY, the proposed tip in PR_HEAD, the tip of
+the branch it targets in PR_BASE, and the owner and repository name in PR_REPO.
+
+CI runs a copy of this file and the key taken from the base commit, never from the pull request, so a
+pull request cannot replace the verifier or the key it is judged by.
+
+Exactly one line of the text may begin with the attestation tag. Its form is the tag, the version
+word v2, the 40-hex tip it was made for, and a base64 SSH signature made in the shellborne-plan
+namespace. That signature has to check out against the key over: the repository, the
+merge base of PR_BASE and PR_HEAD, PR_HEAD, the file tree at PR_HEAD, every cited step id in order,
+and a hash of the text with the attestation line taken out. No time is signed. Before any result, a built-in control
+runs this same verification path on fixed inputs: a known-good example must pass and a tampered body
+must fail, or no result is reported. Exit 0 clean, 1 refused, 2 broken.
+"""
+import base64
+import hashlib
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+LINE = re.compile(r"Plan-Attestation: v2 ([0-9a-f]{40}) ([A-Za-z0-9+/]+={0,2})")
+STEP = re.compile(r"^Plan-Step: (\S+)$", re.MULTILINE)
+NAMESPACE = "shellborne-plan"
+CONTROL = {
+    "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA3Jk4HGWUdXe+OXHDp3xsF7RyHjClIjZ8wwcKx8Qewx",
+    "repo": "example/control",
+    "base": "1" * 40,
+    "head": "2" * 40,
+    "tree": "3" * 40,
+    "body": "Plan-Step: P0.1.1\n\nA control body.\n",
+    "signature": "LS0tLS1CRUdJTiBTU0ggU0lHTkFUVVJFLS0tLS0KVTFOSVUwbEhBQUFBQVFBQUFETUFBQUFMYzNOb0xXVmtNalUxTVRrQUFBQWdEY21UZ2NaWlIxZDc0NWNjT25mR3dYdEhJZQpNS1VpTm56REJ3ckh4QjdERUFBQUFQYzJobGJHeGliM0p1WlMxd2JHRnVBQUFBQUFBQUFBWnphR0UxTVRJQUFBQlRBQUFBCkMzTnphQzFsWkRJMU5URTVBQUFBUUhXUGVibXJzZFZZRGFqU3Jhc1hPdUFDM2xZOVlueEZWWSs0SjQ2cEZpUEl5RFc1aksKQlVHcHpha1grdWRBWVJIZ3E5cFFaVlg2Z3AzaXk5N0M1clBRYz0KLS0tLS1FTkQgU1NIIFNJR05BVFVSRS0tLS0tCg==",
+}
+
+
+def body_digest(body):
+    """SHA-256 of the body exactly as written, with CRLF made LF and the Plan-Attestation line removed."""
+    kept = [line for line in body.replace("\r\n", "\n").split("\n") if not line.startswith("Plan-Attestation:")]
+    return hashlib.sha256("\n".join(kept).encode()).hexdigest()
+
+
+def step_ids(body):
+    return ",".join(sorted(set(STEP.findall(body.replace("\r\n", "\n")))))
+
+
+def signed_text(repo, base, head, tree, body):
+    """The exact bytes the maintainer's tool signs, one fact per line."""
+    return (f"shellborne-plan-attestation v2\nrepo {repo}\nbase {base}\nhead {head}\ntree {tree}\n"
+            f"steps {step_ids(body)}\nbody {body_digest(body)}\nresult pass\n")
+
+
+def verified(public_key, text, signature):
+    """True when `signature` (armored SSH signature bytes) signs `text` with `public_key`."""
+    with tempfile.TemporaryDirectory() as folder:
+        allowed = pathlib.Path(folder) / "allowed"
+        allowed.write_text(f'plan-attest namespaces="{NAMESPACE}" {public_key}\n')
+        sig = pathlib.Path(folder) / "sig"
+        sig.write_bytes(signature)
+        command = ["ssh-keygen", "-Y", "verify", "-n", NAMESPACE, "-I", "plan-attest", "-s", str(sig), "-f", str(allowed)]
+        result = subprocess.run(command, input=text.encode(), capture_output=True, timeout=30)
+        return result.returncode == 0
+
+
+def judge(body, public_key, repo, base, head, tree):
+    """Problems with one body, through the whole verification path. An empty list is a pass."""
+    lines = [line for line in body.replace("\r\n", "\n").split("\n") if line.startswith("Plan-Attestation:")]
+    if len(lines) != 1:
+        return ["the body needs exactly one Plan-Attestation line"]
+    found = LINE.fullmatch(lines[0].rstrip())
+    if not found:
+        return ["the Plan-Attestation line is not in the v2 form"]
+    signed_head, signature = found.groups()
+    if signed_head != head:
+        return ["the attestation names a different head commit than this pull request"]
+    try:
+        raw = base64.b64decode(signature, validate=True)
+    except ValueError:
+        return ["the signature is not valid base64"]
+    if not verified(public_key, signed_text(repo, base, head, tree, body), raw):
+        return ["the signature does not cover this repository, base, head, tree and body"]
+    return []
+
+
+def controls_hold():
+    c = CONTROL
+    good = c["body"] + f"Plan-Attestation: v2 {c['head']} {c['signature']}\n"
+    tampered = good.replace("A control body.", "A changed body.")
+    return (judge(good, c["key"], c["repo"], c["base"], c["head"], c["tree"]) == []
+            and judge(tampered, c["key"], c["repo"], c["base"], c["head"], c["tree"]) != [])
+
+
+def git(repo, *args):
+    done = subprocess.run(("git", "-C", str(repo)) + args, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def main(argv):
+    if not controls_hold():
+        print("plan-attestation: broken: a control came out wrong, so no result is reported", file=sys.stderr)
+        return 2
+    names = ("PR_BODY", "PR_HEAD", "PR_BASE", "PR_REPO")
+    if len(argv) != 4 or argv[1] != "--key" or any(name not in os.environ for name in names):
+        print("plan-attestation: broken: usage: PR_BODY=... PR_HEAD=... PR_BASE=... PR_REPO=... "
+              "plan-attestation --key <public key file> <repo>", file=sys.stderr)
+        return 2
+    key_file, repo = pathlib.Path(argv[2]), pathlib.Path(argv[3])
+    head = os.environ["PR_HEAD"]
+    base = git(repo, "merge-base", os.environ["PR_BASE"], head)
+    tree = git(repo, "rev-parse", head + "^{tree}")
+    if not key_file.is_file() or not base or not tree:
+        print("plan-attestation: broken: the key, the head or the merge base cannot be read", file=sys.stderr)
+        return 2
+    public_key = " ".join(key_file.read_text().split()[:2])
+    problems = judge(os.environ["PR_BODY"], public_key, os.environ["PR_REPO"], base, head, tree)
+    for problem in problems:
+        print(f"plan-attestation: refused: {problem}")
+    return 0 if not problems else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

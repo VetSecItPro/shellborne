@@ -23,6 +23,31 @@ USES = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?([^'\"\s#]+)")
 PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
 DIGEST = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
 UNTRUSTED = re.compile(r"\b(pull_request_target|workflow_run)\b")
+BASE_ONLY = "# untrusted-trigger: base-only"
+HEAD_AS_DATA = re.compile(r"^\s+[A-Z_]+:\s*\$\{\{\s*github\.event\.pull_request\.head\.sha\s*\}\}\s*$")
+
+
+def base_only(lines):
+    """True when a pull_request_target workflow opts in to the base-only exception and keeps its terms: a
+    read-only token, no secrets, no checkout of another ref or repository, the head only as an env value,
+    and never workflow_run. GitHub then runs the base branch's copy and no pull request code runs."""
+    text = "\n".join(lines)
+    if BASE_ONLY not in lines or "workflow_run" in text or "secrets." in text:
+        return False
+    top = [i for i, line in enumerate(lines) if re.match(r"^permissions\s*:", line)]
+    if len(top) != 1:
+        return False
+    block = []
+    for line in lines[top[0] + 1:]:
+        if line and not line.startswith(" "):
+            break
+        if line.strip():
+            block.append(line.strip())
+    if block != ["contents: read"] or any(re.search(r":\s*write\b", line) for line in lines):
+        return False
+    if any(re.match(r"^\s+(ref|repository)\s*:", line) for line in lines):
+        return False
+    return all(HEAD_AS_DATA.match(line) for line in lines if "pull_request.head" in line)
 
 
 def broken(message):
@@ -39,6 +64,7 @@ def main(argv):
     for path in files:
         rel = path.relative_to(argv[0]).as_posix()
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        exempt = base_only(lines)
         if not any(re.match(r"^permissions\s*:", line) for line in lines):
             findings.append(("permissions", f"{rel} (no top-level permissions block)"))
         for number, line in enumerate(lines, 1):
@@ -50,7 +76,8 @@ def main(argv):
                     findings.append(("unpinned-action", f"{rel}:{number}"))
             if re.search(r"\bwrite-all\b", code):
                 findings.append(("permissions", f"{rel}:{number}"))
-            if UNTRUSTED.search(code):
+            found = UNTRUSTED.search(code)
+            if found and not (exempt and found.group(1) == "pull_request_target"):
                 findings.append(("untrusted-trigger", f"{rel}:{number}"))
     if files:
         tool = shutil.which("actionlint")

@@ -15,8 +15,11 @@ import sys
 REPO_RULES = {"allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
               "squash_merge_commit_title": "PR_TITLE", "squash_merge_commit_message": "PR_BODY",
               "delete_branch_on_merge": True}
-# The gates workflow and both CodeQL analyses must pass before a merge (review F12).
-REQUIRED_CHECKS = ("gates", "analyze (actions)", "analyze (rust)")
+# The gates workflow, both CodeQL analyses (review F12) and the plan attestation (P0.5.14) must pass before a merge.
+REQUIRED_CHECKS = ("gates", "analyze (actions)", "analyze (rust)", "attestation")
+# Each required check must come from GitHub Actions itself, so a same-named status from another app or
+# a personal token cannot satisfy it (review F7).
+ACTIONS_APP_ID = 15368
 
 
 def protection_findings(p):
@@ -24,6 +27,12 @@ def protection_findings(p):
     checks = (p.get("required_status_checks") or {}).get("checks") or []
     contexts = [c.get("context") for c in checks]
     found += [f"required status checks do not include {name}" for name in REQUIRED_CHECKS if name not in contexts]
+    found += [f"required check {c.get('context')} is not bound to GitHub Actions" for c in checks
+              if c.get("context") in REQUIRED_CHECKS and c.get("app_id") != ACTIONS_APP_ID]
+    if (p.get("required_status_checks") or {}).get("strict") is not True:
+        found.append("branches are not required to be up to date with main before merging")
+    if (p.get("enforce_admins") or {}).get("enabled") is not True:
+        found.append("administrators can bypass the protection")
     reviews = p.get("required_pull_request_reviews") or {}
     if reviews.get("require_code_owner_reviews") is not True:
         found.append("code-owner review is not required")
