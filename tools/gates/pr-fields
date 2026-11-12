@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""PR-fields gate: a pull request body carries the four public fields (plan step P0.6.4).
+
+Usage: PR_BODY=<pull request body> pr-fields
+
+The fields are a Plan-Step line, an AI tool used line with a value, a Verified by running line with
+something under it or after it, and a Tier line of 1, 2 or 3. Exit 0 clean, 1 refused, 2 broken.
+"""
+import os
+import re
+import sys
+
+PLAN_STEP = re.compile(r"^Plan-Step: \S+$", re.MULTILINE)
+AI_TOOL = re.compile(r"^AI tool used:[ \t]*(.*)$", re.MULTILINE)
+TIER_LINE = re.compile(r"^Tier:", re.MULTILINE)
+COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+VERIFIED = re.compile(r"^Verified by running:[ \t]*(.*)$", re.MULTILINE)
+TIER = re.compile(r"^Tier:[ \t]*([123])[ \t]*$", re.MULTILINE)
+
+
+FIELD = re.compile(r"^(Plan-Step|AI tool used|Verified by running|Tier):")
+
+
+def verified_has_content(body):
+    """True when the Verified by running line, or a list item under it, says something."""
+    found = VERIFIED.search(body)
+    if not found:
+        return False
+    if meaningful(found.group(1)):
+        return True
+    for line in body[found.end():].split("\n"):
+        if FIELD.match(line):
+            return False
+        if meaningful(line.strip().lstrip("-*")):
+            return True
+    return False
+
+
+def meaningful(text):
+    """A real answer: something other than a comment, punctuation or a template placeholder."""
+    text = COMMENT.sub("", text).strip()
+    if re.search(r"<[^<>\n]*>", text) or re.search(r"\b(TBD|TODO|FIXME)\b", text, re.IGNORECASE):
+        return False
+    return bool(re.search(r"[A-Za-z0-9]", text))
+
+
+def problems(body):
+    body = COMMENT.sub("", body)
+    found = []
+    if not PLAN_STEP.search(body):
+        found.append("Plan-Step: no line names a plan step")
+    tool = AI_TOOL.search(body)
+    if not tool or not meaningful(tool.group(1)):
+        found.append("AI tool used: the line is missing or empty")
+    if not verified_has_content(body):
+        found.append("Verified by running: the line is missing or nothing was listed")
+    if len(TIER_LINE.findall(body)) != 1 or not TIER.search(body):
+        found.append("Tier: there must be exactly one Tier line, of 1, 2 or 3")
+    return found
+
+
+def main():
+    if "PR_BODY" not in os.environ:
+        print("pr-fields: broken: PR_BODY is not set", file=sys.stderr)
+        return 2
+    body = os.environ["PR_BODY"].replace("\r\n", "\n")
+    found = problems(body)
+    for line in found:
+        print(f"pr-fields: refused: {line}")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
