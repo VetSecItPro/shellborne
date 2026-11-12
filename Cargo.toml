@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sb-attach",
+    "crates/sb-cli",
+    "crates/sb-core",
+    "crates/sb-engine-vt",
+    "crates/sb-host",
+    "crates/sb-policy",
+    "crates/sb-redact",
+    "crates/sb-supervisor",
+    "crates/sb-vt-worker",
+    "crates/sb-wire",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

@@ -60,6 +60,18 @@ jobs:
       - name: Devlog entries
         run: tools/gates/devlog-check .
 
+      - name: Layer boundaries
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/allowed-deps.toml" 2>/dev/null; then
+            git show "$BASE:tools/gates/allowed-deps.toml" > "$RUNNER_TEMP/base-allowed-deps.toml"
+            tools/gates/boundaries --base-list "$RUNNER_TEMP/base-allowed-deps.toml" .
+          else
+            tools/gates/boundaries .
+          fi
+
       - name: DCO sign-off on the pull request's commits
         if: github.event_name == 'pull_request'
         env:
