@@ -17,7 +17,7 @@ description: A free, open-source Mac terminal for working with AI coding agents,
     {% assign latest = site.posts.first %}
     <section class="window latest">
       <div class="titlebar"><span class="close"></span><span class="title">Latest entry</span></div>
-      <a class="inside" href="{{ latest.url | relative_url }}">
+      <a class="inside{% unless latest.image %} text-only{% endunless %}" href="{{ latest.url | relative_url }}">
         {% if latest.image %}<img src="{{ latest.image | relative_url }}" alt="">{% endif %}
         <span>
           <span class="meta"><span class="n">No. {{ total | prepend: '00' | slice: -3, 3 }}</span><span>{{ latest.date | date: "%b %-d, %Y" }}</span></span>
