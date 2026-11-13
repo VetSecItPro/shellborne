@@ -4,7 +4,7 @@ date: 2026-11-13 09:00:00 -0600
 title: The reviewer who waited all night
 description: I left a second AI to review last night's work and went to bed. It spent the night waiting for me to finish a sentence I had already finished.
 ---
-Changes to the parts of Shellborne where a mistake would cost the most must be reviewed by an AI from a different company than the one that wrote them. The reviewer reads the code and the design, never my summary, and its only job is to find what I got wrong.
+Changes to the parts of Shellborne where a mistake would cost the most must be reviewed by an AI from a different company than the one that wrote them. The reviewer reads the code and the design, never my summary, and its only job is to find what I got wrong. Which company wrote a change and which one reviewed it is what each side reports about itself; nothing proves it independently yet.
 
 Last night I started that review in the background and went to bed. This morning its log ended on one line: "Reading additional input from stdin..."
 
