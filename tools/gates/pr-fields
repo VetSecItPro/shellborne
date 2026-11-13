@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import unicodedata
 
 LIST_NAME = "tier1-paths.txt"
 MAX_PATHS = 100000  # the changed-path list is capped (build rule 10); an environment value can only lower it
@@ -35,7 +36,9 @@ def tier1_rules(text):
     not cover itself."""
     rules = []
     for number, line in enumerate(text.split("\n"), 1):  # only a newline ends a rule; any other break is malformed
-        if not line.strip() or line.lstrip(" ").startswith("#"):  # a comment line: '#' at column zero or after spaces
+        if any(char != " " and (char.isspace() or unicodedata.category(char) in ("Cc", "Cf")) for char in line):
+            raise Broken(f"{LIST_NAME} line {number} holds a control or whitespace character other than a space")
+        if not line.strip(" ") or line.lstrip(" ").startswith("#"):  # a comment line: '#' at column zero or after spaces
             continue
         rule, comment, _ = line.partition(" #")  # a comment starts at column zero or after a space, nowhere else
         rule = rule.rstrip(" ") if comment else rule  # any other whitespace, or a '#' inside, fails the pattern
