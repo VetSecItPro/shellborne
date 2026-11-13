@@ -34,7 +34,7 @@ def tier1_rules(text):
     not cover itself."""
     rules = []
     for number, line in enumerate(text.splitlines(), 1):
-        if not line.strip() or line.startswith("#"):
+        if not line.strip() or line.lstrip(" ").startswith("#"):  # a comment line: '#' at column zero or after spaces
             continue
         rule, comment, _ = line.partition(" #")  # a comment starts at column zero or after a space, nowhere else
         rule = rule.rstrip(" ") if comment else rule  # any other whitespace, or a '#' inside, fails the pattern
