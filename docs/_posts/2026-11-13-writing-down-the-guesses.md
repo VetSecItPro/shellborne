@@ -4,14 +4,7 @@ date: 2026-11-13 09:05:00 -0600
 title: Writing down the guesses
 description: Every plan rests on things nobody has measured yet. Last night I made Shellborne's plan say which ones, and refuse to build on them until they are tested.
 ---
-Every plan rests on guesses. Shellborne's rests on a handful of big ones:
-
-- Your sessions keep running through a logout or an upgrade of the background service that holds them.
-- That background service can read a secret the app stored in the Keychain.
-- An agent can reach Shellborne in every permission mode you might launch it with.
-- The terminal engine underneath behaves the way the session design needs.
-
-All of these sound reasonable. None of them has been measured on a real Mac yet.
+Every plan rests on guesses. Shellborne's rests on a handful of big ones, about how macOS treats long-running background work and how the tools it builds on behave. All of them sound reasonable. None of them has been measured on a real Mac yet.
 
 The danger isn't in guessing. It's in forgetting you guessed. Weeks later, a dozen features are built on top, and the guess has quietly turned into a fact nobody remembers checking.
 
