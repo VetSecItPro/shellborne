@@ -85,11 +85,13 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: tools/gates/plan-step-format
 
-      - name: Required fields in the pull request body
+      - name: Required fields in the pull request body, with the tier taken from the files changed
         if: github.event_name == 'pull_request'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: tools/gates/pr-fields
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: tools/gates/pr-fields --clone . --range "$BASE..$HEAD_SHA"
 
       - name: Tests land before the code that passes them
         if: github.event_name == 'pull_request'

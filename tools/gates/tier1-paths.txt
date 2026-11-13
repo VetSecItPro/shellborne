@@ -1,0 +1,15 @@
+# Tier 1 paths: a change touching any of these is Tier 1 work, whatever its Tier line says.
+# One rule a line. A path ending in / covers everything under it; *.ext covers every file with
+# that ending; anything else names one file. This list covers itself, so editing it is Tier 1 work.
+.github/
+tools/gates/
+.githooks/
+tools/signing/
+tools/install-hooks
+crates/sb-engine-vt/
+crates/sb-wire/
+crates/sb-host/
+crates/sb-vt-worker/
+crates/sb-supervisor/
+crates/sb-attach/
+*.entitlements
