@@ -57,7 +57,7 @@ def is_tier1(path, rules):
             if path.endswith(rule[1:]):
                 return True
         elif rule.endswith("/"):
-            if path.startswith(rule):
+            if path.startswith(rule) or path == rule[:-1]:  # the bare path too: a submodule, symlink or file there
                 return True
         elif path == rule:
             return True
