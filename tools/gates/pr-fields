@@ -8,6 +8,7 @@ something under it or after it, and a Tier line of 1, 2 or 3. With the clone and
 commit in the range are read against tier1-paths.txt beside this gate: a change touching a listed path is
 Tier 1 work, so a Tier line of 2 or 3 is refused as tier-understated. Exit 0 clean, 1 refused, 2 broken.
 """
+import json
 import os
 import pathlib
 import re
@@ -33,7 +34,7 @@ def tier1_rules(text):
     *.ext, a leading /, a . or .. or empty part, a space inside a rule, no rules at all, or a list that does
     not cover itself."""
     rules = []
-    for number, line in enumerate(text.splitlines(), 1):
+    for number, line in enumerate(text.split("\n"), 1):  # only a newline ends a rule; any other break is malformed
         if not line.strip() or line.lstrip(" ").startswith("#"):  # a comment line: '#' at column zero or after spaces
             continue
         rule, comment, _ = line.partition(" #")  # a comment starts at column zero or after a space, nowhere else
@@ -175,10 +176,16 @@ def problems(body, paths=(), rules=()):
     else:
         touched = [p for p in paths if is_tier1(p, rules)]
         if touched and TIER.search(body).group(1) != "1":
-            shown = ", ".join(touched[:5]) + (f" and {len(touched) - 5} more" if len(touched) > 5 else "")
+            shown = ", ".join(escaped(p) for p in touched[:5]) + (f" and {len(touched) - 5} more" if len(touched) > 5 else "")
             found.append(f"Tier: the change touches Tier 1 paths ({shown}), so the Tier line must be 1"
                          " (tier-understated)")
     return found
+
+
+def escaped(path):
+    """A changed path as printed: control bytes, newlines and non-ASCII escaped, so a name cannot forge a log line
+    or a workflow annotation. Matching always uses the raw name."""
+    return json.dumps(path, ensure_ascii=True)[1:-1]
 
 
 def options(argv):
