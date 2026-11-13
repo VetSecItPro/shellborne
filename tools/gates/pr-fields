@@ -18,6 +18,8 @@ import threading
 LIST_NAME = "tier1-paths.txt"
 MAX_PATHS = 100000  # the changed-path list is capped (build rule 10); an environment value can only lower it
 MAX_BYTES = 64 * 1024 * 1024
+MAX_LIST_BYTES = 64 * 1024  # the Tier 1 list itself is capped too (build rule 10): bytes, then rules
+MAX_RULES = 1000
 LIST_SELF = "tools/gates/" + LIST_NAME
 RULE = re.compile(r"^(?:\*\.[A-Za-z0-9_-]+|[A-Za-z0-9._/-]+)$")
 
@@ -40,6 +42,8 @@ def tier1_rules(text):
         if not RULE.match(rule) or rule.startswith("/") or ".." in parts or "." in parts or "" in parts:
             raise Broken(f"{LIST_NAME} line {number} is not a rule: {line.strip()}")
         rules.append(rule)
+        if len(rules) > MAX_RULES:
+            raise Broken(f"{LIST_NAME} is over its cap of {MAX_RULES} rules")
     if not rules:
         raise Broken(f"{LIST_NAME} has no rules")
     if not is_tier1(LIST_SELF, rules):
@@ -60,12 +64,24 @@ def is_tier1(path, rules):
     return False
 
 
-def read_rules(folder):
-    path = folder / LIST_NAME
+def read_list(path):
+    """The rules of the Tier 1 list at path, read with a byte cap. Shared with sb-plan, so both read the list
+    the same bounded way; missing, unreadable, not UTF-8, over the cap or malformed, it is Broken."""
     try:
-        return tier1_rules(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as error:
-        raise Broken(f"cannot read {LIST_NAME} beside the gate: {error}")
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_LIST_BYTES + 1)
+    except OSError as error:
+        raise Broken(f"cannot read {LIST_NAME}: {error}")
+    if len(data) > MAX_LIST_BYTES:
+        raise Broken(f"{LIST_NAME} is over its cap of {MAX_LIST_BYTES} bytes")
+    try:
+        return tier1_rules(data.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise Broken(f"{LIST_NAME} is not UTF-8: {error}")
+
+
+def read_rules(folder):
+    return read_list(folder / LIST_NAME)
 
 
 def path_cap():
@@ -182,7 +198,7 @@ def main():
     try:
         args = options(sys.argv[1:])
         paths = range_paths(args["--clone"], args["--range"]) if args else []
-        rules = read_rules(pathlib.Path(__file__).resolve().parent) if paths else ()
+        rules = read_rules(pathlib.Path(__file__).resolve().parent) if args else ()  # an empty range still reads it
     except Broken as error:
         print(f"pr-fields: broken: {error}", file=sys.stderr)
         return 2
