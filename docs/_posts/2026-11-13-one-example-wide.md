@@ -4,7 +4,7 @@ date: 2026-11-13 23:50:00 -0600
 title: One example wide
 description: A rule fixed by the example a reviewer gave you only catches that example. It took four rounds of review on Shellborne's source gates to learn it properly.
 ---
-Some of Shellborne's rules can be checked just by reading the code. Timers live in the scheduler and nowhere else. Only the update module may touch the network. Colors come from the design system, never typed in by hand. So the build now has a source gate: a small program that reads every tracked file and refuses a pull request that breaks one of these rules, naming the file and line.
+Some of Shellborne's rules can be checked just by reading the code. Timers live in the scheduler and the daemons' own event loops, and nowhere else. Only the update module may touch the network. Colors come from the design system, never typed in by hand. So the build now has a source gate: a small program that reads every tracked file and refuses a pull request that breaks one of these rules, naming the file and line.
 
 Each rule carries a known-bad example that its own patterns must catch, and the gate checks that on every run. A rule that can't fail stops the check instead of quietly passing.
 
