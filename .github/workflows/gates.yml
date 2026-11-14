@@ -60,6 +60,9 @@ jobs:
       - name: Devlog entries
         run: tools/gates/devlog-check .
 
+      - name: Source rules
+        run: tools/gates/repo-rules .
+
       - name: Layer boundaries
         env:
           PR_BODY: ${{ github.event.pull_request.body }}

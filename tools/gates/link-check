@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Link gate: no libghostty-vt symbol where the engine must not run (plan step P0.9.4).
+
+Usage: link-check <binary folder>
+       link-check --network <binary folder>   (plan step P0.9.6)
+
+Reads the [link] table in repo-rules.toml beside this file and the symbol table (nm -P) of each named binary in
+the folder. A daemon binary (supervisor, session host, attach client, CLI) with any engine symbol, defined or
+referenced, is refused as engine-in-daemon; the GUI with an engine symbol outside the key-encoder prefixes is
+refused as engine-in-gui. A folder with none of the named binaries is not run, and a missing daemon binary is
+broken, so the gate never passes on what it did not read. With --network, every Mach-O in the folder except
+the update module's binary is refused as network-in-binary for a getaddrinfo symbol or a link to CFNetwork or the
+Network framework; a folder with no Mach-O is not run. Exit 0 clean, 1 refused, 2 broken or not run.
+"""
+import pathlib
+import subprocess
+import sys
+import tomllib
+
+TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
+
+
+class Broken(Exception):
+    pass
+
+
+def table():
+    try:
+        link = tomllib.loads(TABLE.read_text(encoding="utf-8")).get("link")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise Broken(f"cannot read {TABLE.name}: {error}")
+    needed = ("engine_prefix", "daemon_binaries", "gui_binaries", "gui_allowed_prefixes")
+    if not isinstance(link, dict) or not all(link.get(key) for key in needed):
+        raise Broken(f"{TABLE.name} has no complete [link] table")
+    return link
+
+
+MACH_O = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"}
+
+
+def is_mach_o(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(4) in MACH_O
+    except OSError:
+        return False
+
+
+def linked(path):
+    listed = subprocess.run(["otool", "-L", str(path)], capture_output=True, text=True, timeout=120)
+    if listed.returncode != 0:
+        raise Broken(f"otool cannot read {path.name}")
+    return listed.stdout
+
+
+def network(folder):
+    """P0.9.6: getaddrinfo or a network framework in any Mach-O outside the update module."""
+    try:
+        net = tomllib.loads(TABLE.read_text(encoding="utf-8")).get("network")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise Broken(f"cannot read {TABLE.name}: {error}")
+    if not isinstance(net, dict) or not all(net.get(k) for k in ("update_binaries", "forbidden_symbols", "forbidden_frameworks")):
+        raise Broken(f"{TABLE.name} has no complete [network] table")
+    found, read = [], 0
+    for path in sorted(p for p in folder.rglob("*") if p.is_file() and is_mach_o(p)):
+        read += 1
+        if path.name in net["update_binaries"]:
+            continue
+        found += [("network-in-binary", f"{path.name} {s}") for s in sorted(symbols(path)) if s in net["forbidden_symbols"]]
+        libraries = linked(path)
+        found += [("network-in-binary", f"{path.name} {f}") for f in net["forbidden_frameworks"] if f"/{f}/" in libraries]
+    if not read:
+        raise Broken(f"not run: no Mach-O in {folder}")
+    return found
+
+
+def symbols(path):
+    listed = subprocess.run(["nm", "-P", str(path)], capture_output=True, text=True, timeout=120)
+    if listed.returncode != 0:
+        raise Broken(f"nm cannot read {path.name}")
+    names = set()
+    for line in listed.stdout.splitlines():
+        name = line.split(" ", 1)[0].split(":")[-1]
+        names.add(name[1:] if name.startswith("_") else name)
+    return names
+
+
+def main(argv):
+    try:
+        if len(argv) == 3 and argv[1] == "--network":
+            found = network(pathlib.Path(argv[2]))
+            for reason, where in found:
+                print(f"link-check: refused {reason}: {where}")
+            return 1 if found else 0
+        if len(argv) != 2:
+            raise Broken("usage: link-check [--network] <binary folder>")
+        link, folder = table(), pathlib.Path(argv[1])
+        present = [n for n in link["daemon_binaries"] + link["gui_binaries"] if (folder / n).is_file()]
+        if not present:
+            raise Broken(f"not run: none of the named binaries is in {folder}")
+        missing = [n for n in link["daemon_binaries"] if not (folder / n).is_file()]
+        if missing:
+            raise Broken(f"daemon binaries missing from {folder}: {', '.join(missing)}")
+        found = []
+        for name in present:
+            engine = sorted(s for s in symbols(folder / name) if s.startswith(link["engine_prefix"]))
+            if name in link["daemon_binaries"]:
+                found += [("engine-in-daemon", f"{name} {s}") for s in engine]
+            else:
+                found += [("engine-in-gui", f"{name} {s}") for s in engine
+                          if not s.startswith(tuple(link["gui_allowed_prefixes"]))]
+    except Broken as error:
+        print(f"link-check: broken: {error}", file=sys.stderr)
+        return 2
+    for reason, where in found:
+        print(f"link-check: refused {reason}: {where}")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

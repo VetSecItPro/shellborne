@@ -1,0 +1,101 @@
+# Where each kind of code may live (plan steps P0.9.1 and P0.9.2). tools/gates/repo-rules reads this table and
+# refuses a match outside the paths a rule allows. Each rule names the build rule it enforces and carries a
+# known-bad control line that its own patterns must match, checked on every run. Paths are prefixes from the
+# repository root. Patterns are regular expressions, matched line by line in tracked files with the listed
+# suffixes; comments count too, since the gate does not parse source.
+
+[[rule]]
+id = "timer-or-watcher-outside-core"
+enforces = "timers and file watching go through the scheduler and the one event stream"
+suffixes = [".swift", ".rs"]
+patterns = ['\bTimer\.(?:scheduledTimer|publish)\b', '\bDispatchSource\.make(?:Timer|FileSystemObject)Source\b',
+            '\bFSEventStreamCreate\b', '\bnotify::(?:recommended_watcher|Watcher)\b']
+allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/",
+           "crates/sb-host/", "crates/sb-vt-worker/"]
+control = "let poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }"
+
+[[rule]]
+id = "spawn-outside-scheduler"
+enforces = "one scheduler starts every process; the daemon alone spawns session hosts and their PTY"
+suffixes = [".swift", ".rs"]
+patterns = ['\bCommand::new\b', '\bposix_spawnp?\b', '\bfork\s*\(', '\bProcess\s*\(\s*\)', '\bNSTask\b']
+allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/",
+           "crates/sb-host/"]
+control = 'let _ = std::process::Command::new("ls");'
+
+[[rule]]
+id = "network-outside-update"
+enforces = "network-capable code lives only in the update module"
+suffixes = [".swift", ".rs", ".c", ".h"]
+patterns = ['\bURLSession\b', '\bstd::net\b', '\bgetaddrinfo\b', '^\s*import\s+(?:Network|CFNetwork)\b',
+            '#\s*(?:include|import)\s*<(?:Network|CFNetwork)/']
+allowed = ["apple/Sources/Update/"]
+control = "let s = URLSession.shared"
+
+[[rule]]
+id = "engine-outside-adapter"
+enforces = "engine symbols appear only in the engine adapter"
+suffixes = [".swift", ".rs", ".c", ".h"]
+patterns = ['\bghostty_(?!surface_)\w+']
+allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/", "apple/Sources/TerminalView/"]
+control = "unsafe { ghostty_terminal_new(); }"
+
+[[rule]]
+id = "surface-outside-terminalview"
+enforces = "the surface API appears only in TerminalView"
+suffixes = [".swift", ".rs", ".c", ".h"]
+patterns = ['\bghostty_surface_\w+']
+allowed = ["apple/Sources/TerminalView/", "apple/Sources/EngineSurface/"]
+control = "ghostty_surface_new(app, cfg)"
+
+[[rule]]
+id = "x86-without-reason"
+enforces = "no x86-specific code path without a stated correctness reason"
+suffixes = [".swift", ".rs", ".c", ".h"]
+patterns = ['target_arch\s*=\s*"x86(?:_64)?"', '#if\s+arch\(\s*(?:x86_64|i386)\s*\)', '__x86_64__']
+allowed = []
+reason = "x86-only:"
+control = '#[cfg(target_arch = "x86_64")]'
+
+[[rule]]
+id = "color-outside-design-system"
+enforces = "colors are design-system tokens, defined in DesignSystem only"
+suffixes = [".swift"]
+patterns = ['"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?"', '\b(?:NS|UI)?Color\(\s*(?:red|srgbRed|calibratedRed|deviceRed|hue|white|hex)\s*:']
+allowed = ["apple/Sources/DesignSystem/"]
+control = 'let tint = Color(hex: "#3A7BD5")'
+
+[[rule]]
+id = "spacing-outside-design-system"
+enforces = "spacing values are design-system tokens, defined in DesignSystem only"
+suffixes = [".swift"]
+patterns = ['\.padding\(\s*(?:\.\w+\s*,\s*)?\d', '\bspacing:\s*\d', '\.frame\(\s*(?:width|height):\s*\d']
+allowed = ["apple/Sources/DesignSystem/"]
+control = "Text(name).padding(12)"
+
+[[rule]]
+id = "control-outside-design-system"
+enforces = "controls come from the design system, never built raw"
+suffixes = [".swift"]
+patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox)\s*\(']
+allowed = ["apple/Sources/DesignSystem/"]
+control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
+
+# The link gate (P0.9.4). libghostty-vt runs only in the per-session vt worker: the supervisor, session
+# host, attach client and CLI binaries carry no engine symbol. The GUI's one input view encodes keys with
+# libghostty-vt's key encoder, so the GUI may carry that API alone: the encoder and the key events it
+# encodes (ghostty_key_encoder_*, ghostty_key_event_*, as the libghostty-vt C headers name them).
+[link]
+enforces = "the engine runs only in the vt worker; the GUI uses only its key encoder"
+engine_prefix = "ghostty_"
+daemon_binaries = ["sb-supervisor", "sb-host", "sb-attach", "sb-cli"]
+gui_binaries = ["Shellborne"]
+gui_allowed_prefixes = ["ghostty_key_encoder_", "ghostty_key_event_"]
+
+# The network scan (P0.9.6). Every Mach-O in the build folder except the update module's binary is read for a
+# getaddrinfo symbol and for a link to CFNetwork or the Network framework.
+[network]
+enforces = "nothing outside the update module resolves names or links a network framework"
+update_binaries = ["ShellborneUpdate"]
+forbidden_symbols = ["getaddrinfo"]
+forbidden_frameworks = ["Network.framework", "CFNetwork.framework"]
