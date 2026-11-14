@@ -36,6 +36,7 @@ MAX_BINARY_BYTES = 1024 * 1024 * 1024
 MAX_OUTPUT = 256 * 1024 * 1024
 MAX_SECONDS = 1800
 MAX_FINDINGS = 1000
+MAX_TABLE_BYTES = 256 * 1024
 SYMBOL_PREFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 BINARY_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
 FRAMEWORK = re.compile(r"[A-Za-z0-9_]+\.framework")
@@ -93,7 +94,11 @@ SHAPES = {
 def table(name):
     """The [link] or [network] table, every field present with its exact type and form, and nothing else."""
     try:
-        data = tomllib.loads(TABLE.read_text(encoding="utf-8"))
+        with open(TABLE, "rb") as handle:
+            raw = handle.read(MAX_TABLE_BYTES + 1)
+        if len(raw) > MAX_TABLE_BYTES:
+            raise Broken(f"{TABLE.name} is over the {MAX_TABLE_BYTES}-byte cap for the rule table")
+        data = tomllib.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise Broken(f"cannot read {TABLE.name}: {error}")
     for section, shape in SHAPES.items():  # both tables are checked on every run, whichever mode reads one

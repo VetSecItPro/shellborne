@@ -51,12 +51,32 @@ LANGUAGE_RULE = "source-language-unread"
 SCRIPT_RULE = "script-outside-tooling"
 
 
+MAX_TABLE_BYTES = 256 * 1024
+MAX_RULES = 200
+MAX_PATTERNS = 200
+MAX_PATTERN_CHARS = 1000
+
+
 def load_table(path=None):
     path = path or TABLE
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_TABLE_BYTES + 1)
+        if len(raw) > MAX_TABLE_BYTES:
+            raise Broken(f"{path.name} is over the {MAX_TABLE_BYTES}-byte cap for the rule table")
+        data = tomllib.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise Broken(f"cannot read {path.name}: {error}")
+    rules = data.get("rule")
+    if isinstance(rules, list) and len(rules) > MAX_RULES:
+        raise Broken(f"{path.name} has over the cap of {MAX_RULES} rules")
+    for rule in rules if isinstance(rules, list) else []:
+        for field in ("patterns", "spanning", "ignore"):
+            values = rule.get(field, []) if isinstance(rule, dict) else []
+            if isinstance(values, list) and (len(values) > MAX_PATTERNS or any(
+                    isinstance(v, str) and len(v) > MAX_PATTERN_CHARS for v in values)):
+                raise Broken(f"{path.name}: a rule's {field} pass the cap of {MAX_PATTERNS} patterns of "
+                             f"{MAX_PATTERN_CHARS} characters")
     rules = load_rules(path, data)
     return rules, load_languages(path, data, rules)
 
@@ -250,6 +270,24 @@ def starts_with_shebang(repo, name):
         raise Broken(f"cannot read {shown(name)}: {error.strerror}")
 
 
+CONTINUES = ("::", ".")
+
+
+def joined_lines(lines):
+    """Lines with continuations joined: a line ending in, or a next line starting with, :: or . is joined to its
+    neighbor without the break, so a call or path split at a separator reads as one line. Yields (first line
+    index, joined text) only for groups of two or more lines."""
+    index = 0
+    while index < len(lines):
+        start, text = index, lines[index]
+        while index + 1 < len(lines) and (text.rstrip().endswith(CONTINUES) or lines[index + 1].lstrip().startswith(CONTINUES)):
+            index += 1
+            text = text.rstrip() + lines[index].strip()
+        if index > start:
+            yield start, text
+        index += 1
+
+
 def blanked(text, patterns):
     """The text with every match of the ignore patterns blanked out, newlines kept, so positions and line
     numbers stay true."""
@@ -331,6 +369,11 @@ def findings(repo, rules, languages):
                     if "reason" in rule and reason_given(lines, index, rule["reason"]):
                         continue
                     hits.add(index + 1)
+            for start, line in joined_lines(view_lines):
+                if any(p.search(line) for p in rule["compiled"]):
+                    if "reason" in rule and reason_given(lines, start, rule["reason"]):
+                        continue
+                    hits.add(start + 1)
             for pattern in rule["spanning_compiled"]:
                 hits.update(view.count("\n", 0, m.start()) + 1 for m in pattern.finditer(view))
             for line in sorted(hits):
