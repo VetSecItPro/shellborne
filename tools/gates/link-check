@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Link gate: no libghostty-vt symbol where the engine must not run (plan step P0.9.4).
+
+Usage: link-check <binary folder>
+       link-check --network <binary folder>   (plan step P0.9.6)
+
+Reads the [link] table in repo-rules.toml beside this file and the symbol table (nm -P) of each named binary in
+the folder. A daemon binary (supervisor, session host, attach client, CLI) with any engine symbol, defined or
+referenced, is refused as engine-in-daemon; the GUI with an engine symbol outside the key-encoder prefixes is
+refused as engine-in-gui. Every Mach-O a named binary loads from inside the folder, at any depth, is judged the
+same way as the binary, and a daemon binary that loads a library named for the engine is refused even with no
+engine symbol in use. A folder with none of the named binaries is not run, and a missing daemon binary is
+broken, so the gate never passes on what it did not read. With --network, every Mach-O in the folder except
+the update module's binary is refused as network-in-binary for a getaddrinfo symbol or a link to CFNetwork or the
+Network framework; a folder with no Mach-O is not run.
+
+Both tables are typed exactly: a malformed, duplicate or unknown field is broken, never read loosely. Only regular
+files are read: a named binary that is a symlink is broken, and the network scan never follows a symlink out of the
+folder. Every scan is bounded: at most MAX_FILES files, MAX_BINARY_BYTES per binary, MAX_OUTPUT bytes from one nm or
+otool run, MAX_SECONDS for the whole run, and at most MAX_FINDINGS refusals kept and listed, the rest counted; past any other cap the run is broken.
+File names are printed with control and non-ASCII characters escaped. Exit 0 clean, 1 refused, 2 broken or not run.
+"""
+import os
+import pathlib
+import re
+import selectors
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+
+TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
+MAX_FILES = 20000
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_OUTPUT = 256 * 1024 * 1024
+MAX_SECONDS = 1800
+MAX_FINDINGS = 1000
+MAX_TABLE_BYTES = 256 * 1024
+SYMBOL_PREFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+BINARY_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+FRAMEWORK = re.compile(r"[A-Za-z0-9_]+\.framework")
+START = time.monotonic()
+
+
+class Broken(Exception):
+    pass
+
+
+class Collected:
+    """The first MAX_FINDINGS refusals, kept; every refusal, counted."""
+    def __init__(self):
+        self.kept, self.total = [], 0
+
+    def add(self, item):
+        self.total += 1
+        if len(self.kept) < MAX_FINDINGS:
+            self.kept.append(item)
+
+
+def shown(name):
+    """A name safe to print: control, backslash and non-ASCII characters escaped, so a name cannot forge a line."""
+    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape", "backslashreplace").decode("ascii")
+                   for c in name)
+
+
+def remaining():
+    left = START + MAX_SECONDS - time.monotonic()
+    if left <= 0:
+        raise Broken(f"the run passed its cap of {MAX_SECONDS} seconds")
+    return left
+
+
+def strings(value, form):
+    return (isinstance(value, list) and value and all(isinstance(v, str) and form.fullmatch(v) for v in value)
+            and len(set(value)) == len(value)
+            and not any(part in (".", "..") for v in value for part in v.split("/")))
+
+
+SHAPES = {
+    "link": {"enforces": lambda v: isinstance(v, str) and v.strip(),
+             "engine_prefix": lambda v: isinstance(v, str) and SYMBOL_PREFIX.fullmatch(v),
+             "daemon_binaries": lambda v: strings(v, BINARY_PATH),
+             "gui_binaries": lambda v: strings(v, BINARY_PATH),
+             "gui_allowed_prefixes": lambda v: strings(v, SYMBOL_PREFIX),
+             "engine_libraries": lambda v: strings(v, BINARY_PATH) and not any("/" in x for x in v)},
+    "network": {"enforces": lambda v: isinstance(v, str) and v.strip(),
+                "update_binaries": lambda v: strings(v, BINARY_PATH),
+                "forbidden_symbols": lambda v: strings(v, SYMBOL_PREFIX),
+                "forbidden_frameworks": lambda v: strings(v, FRAMEWORK)},
+}
+
+
+def table(name):
+    """The [link] or [network] table, every field present with its exact type and form, and nothing else."""
+    try:
+        with open(TABLE, "rb") as handle:
+            raw = handle.read(MAX_TABLE_BYTES + 1)
+        if len(raw) > MAX_TABLE_BYTES:
+            raise Broken(f"{TABLE.name} is over the {MAX_TABLE_BYTES}-byte cap for the rule table")
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise Broken(f"cannot read {TABLE.name}: {error}")
+    for section, shape in SHAPES.items():  # both tables are checked on every run, whichever mode reads one
+        found = data.get(section)
+        if not isinstance(found, dict) or set(found) != set(shape):
+            raise Broken(f"{TABLE.name}: the [{section}] table lacks or adds fields")
+        bad = [key for key, ok in shape.items() if not ok(found[key])]
+        if bad:
+            raise Broken(f"{TABLE.name}: the [{section}] table has a malformed {', '.join(bad)}")
+    link = data["link"]
+    if set(link["daemon_binaries"]) & set(link["gui_binaries"]):
+        raise Broken(f"{TABLE.name}: a binary is named as both daemon and GUI")
+    if any(not p.startswith(link["engine_prefix"]) for p in link["gui_allowed_prefixes"]):
+        raise Broken(f"{TABLE.name}: a GUI allowed prefix is not an engine prefix")
+    return data[name]
+
+
+def regular(path):
+    """A regular file under the cap, never a symlink."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
+    if not stat.S_ISREG(info.st_mode):
+        raise Broken(f"{shown(path.name)} is not a regular file (a symlink is never followed)")
+    if info.st_size > MAX_BINARY_BYTES:
+        raise Broken(f"{shown(path.name)} is over the {MAX_BINARY_BYTES}-byte cap for a binary")
+    return path
+
+
+MACH_O = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # thin, both byte orders
+          b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}  # universal, 32 and 64-bit
+
+
+def is_mach_o(path):
+    try:
+        handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            return os.read(handle, 4) in MACH_O
+        finally:
+            os.close(handle)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(path.name)}: {error.strerror}")  # an unreadable candidate is never skipped
+
+
+def run(command):
+    """Run a tool with its output capped at MAX_OUTPUT bytes and its time capped by the run's deadline."""
+    try:
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except OSError as error:
+        raise Broken(f"{command[0]} could not run: {error.strerror}")
+    chunks, size = [], 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                if not selector.select(timeout=min(remaining(), 120)):
+                    raise Broken(f"{command[0]} did not finish in time")
+                chunk = os.read(child.stdout.fileno(), 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_OUTPUT:
+                    raise Broken(f"{command[0]} printed over the {MAX_OUTPUT}-byte cap")
+                chunks.append(chunk)
+        code = child.wait(timeout=min(remaining(), 120))
+    except subprocess.TimeoutExpired:
+        raise Broken(f"{command[0]} did not finish in time")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()
+    return code, b"".join(chunks).decode("utf-8", "replace")
+
+
+def linked(path):
+    code, out = run(["otool", "-L", str(path)])
+    if code != 0:
+        raise Broken(f"otool cannot read {shown(path.name)}")
+    return out
+
+
+def candidates(folder):
+    """Every regular file under the folder, read as a stream with no symlink followed, at most MAX_FILES entries
+    seen. A symlink that leaves the folder, or a directory that cannot be read, is broken; a symlink inside the
+    folder is skipped, since its target is reached where it lives."""
+    root = pathlib.Path(folder).resolve()
+    found, seen, stack = [], 0, [pathlib.Path(folder)]
+    while stack:
+        remaining()
+        top = stack.pop()
+        try:
+            entries = os.scandir(top)
+        except OSError as error:
+            raise Broken(f"cannot read {shown(str(top))}: {error.strerror}")
+        with entries:
+            for entry in entries:
+                seen += 1
+                if seen > MAX_FILES:
+                    raise Broken(f"{shown(str(folder))} holds over the {MAX_FILES}-file cap")
+                path = pathlib.Path(entry.path)
+                try:
+                    if entry.is_symlink():
+                        if not path.resolve().is_relative_to(root):
+                            raise Broken(f"{shown(str(path.relative_to(folder)))} is a symlink out of the build folder")
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        found.append(path)
+                except OSError as error:
+                    raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
+    return sorted(found)
+
+
+def network(folder):
+    """P0.9.6: getaddrinfo or a network framework in any Mach-O outside the update module."""
+    net = table("network")
+    found, read = Collected(), 0
+    for path in candidates(folder):
+        if not stat.S_ISREG(os.lstat(path).st_mode) or not is_mach_o(path):
+            continue
+        regular(path)
+        rel = path.relative_to(folder).as_posix()
+        if rel in net["update_binaries"]:  # the update module only at its exact path, never by a name found elsewhere
+            continue
+        read += 1  # only a binary the scan judges counts, so an update binary alone is not a clean scan
+        for s in sorted(symbols(path)):
+            if s in net["forbidden_symbols"]:
+                found.add(("network-in-binary", f"{shown(rel)} {s}"))
+        libraries = linked(path)
+        for f in net["forbidden_frameworks"]:
+            if f"/{f}/" in libraries:
+                found.add(("network-in-binary", f"{shown(rel)} {f}"))
+    if not read:
+        raise Broken(f"not run: no Mach-O outside the update module in {shown(str(folder))}")
+    return found.kept, found.total
+
+
+def load_commands(path):
+    """The libraries a Mach-O loads (otool -L, the first line is the file itself) and its run paths (otool -l)."""
+    names = [line.strip().split(" (")[0] for line in linked(path).splitlines()[1:] if line.strip()]
+    code, out = run(["otool", "-l", str(path)])
+    if code != 0:
+        raise Broken(f"otool cannot read the load commands of {shown(path.name)}")
+    rpaths, lines = [], out.splitlines()
+    for at, line in enumerate(lines):
+        if line.strip() == "cmd LC_RPATH":
+            for following in lines[at + 1:at + 4]:
+                parts = following.strip().split(" ", 1)
+                if parts[0] == "path" and len(parts) == 2:
+                    rpaths.append(parts[1].split(" (offset")[0])
+    return names, rpaths
+
+
+def resolve(name, loader, executable, run_paths, folder, names_in_folder):
+    """Where the loader would find a library, the way dyld does: an @rpath name against the run paths of the loading
+    image and then of every image above it, each @loader_path taken from the image that declared it. Returns the
+    path inside the build folder, or None for a library outside it (the system's). A library the folder holds under
+    that name but no run path reaches is broken: matching by name alone could scan a clean copy the loader skips."""
+    root = folder.resolve()
+
+    def expand(text, owner):
+        return text.replace("@executable_path", str(executable.parent)).replace("@loader_path", str(owner.parent))
+
+    if name.startswith("@rpath/"):
+        rest = name[len("@rpath/"):]
+        tries = [pathlib.Path(expand(r, owner)) / rest for r, owner in run_paths]
+    elif name.startswith(("@executable_path/", "@loader_path/")):
+        tries = [pathlib.Path(expand(name, loader))]
+    else:
+        tries = [pathlib.Path(name)]
+    for candidate in tries:
+        lexical = pathlib.Path(os.path.normpath(os.path.abspath(candidate)))
+        if lexical.is_relative_to(root) or lexical.is_relative_to(folder.absolute()):
+            base_root = root if lexical.is_relative_to(root) else folder.absolute()
+            step = base_root
+            for part in lexical.relative_to(base_root).parts:  # a link the loader would follow, judged where it is
+                step = step / part
+                if step.is_symlink():
+                    raise Broken(f"{shown(loader.name)} loads {shown(name)} through a symlink in the build folder "
+                                 f"({shown(str(step.relative_to(base_root)))}); a link is never followed")
+        try:
+            real = candidate.resolve()
+        except OSError:
+            continue
+        if real.is_file():
+            return real if real.is_relative_to(root) else None
+    base = pathlib.PurePosixPath(name).name
+    if base in names_in_folder:
+        raise Broken(f"{shown(loader.name)} loads {shown(name)}, which no run path reaches although the build folder "
+                     f"holds a {shown(base)}")
+    return None
+
+
+def process_images(binary, folder, engine_names):
+    """The binary and every Mach-O it loads from inside the build folder, at any depth, plus each load of a library
+    named for the engine. Every image meets the byte cap. Yields ("image", path) and ("engine-load", name)."""
+    names_in_folder = {path.name for path in candidates(folder) if stat.S_ISREG(os.lstat(path).st_mode)}
+    queue, seen = [(binary.resolve(), [])], set()
+    while queue:
+        image, inherited = queue.pop()
+        if image in seen:
+            continue
+        seen.add(image)
+        if len(seen) > MAX_FILES:
+            raise Broken(f"{shown(binary.name)} loads over the {MAX_FILES}-image cap")
+        regular(image)
+        yield "image", image
+        names, rpaths = load_commands(image)
+        run_paths = [(r, image) for r in rpaths] + inherited  # the image's own run paths first, then its loaders'
+        for name in names:
+            base = pathlib.PurePosixPath(name).name.lower()
+            if any(base.startswith(e) for e in engine_names):
+                yield "engine-load", name
+            found = resolve(name, image, binary, run_paths, folder, names_in_folder)
+            if found and found not in seen and is_mach_o(found):
+                queue.append((found, run_paths))
+
+
+def symbols(path):
+    code, out = run(["nm", "-P", str(path)])
+    if code != 0:
+        raise Broken(f"nm cannot read {shown(path.name)}")
+    names = set()
+    for line in out.splitlines():
+        name = line.split(" ", 1)[0].split(":")[-1]
+        names.add(name[1:] if name.startswith("_") else name)
+    return names
+
+
+def exists(path):
+    return os.path.lexists(path)
+
+
+def main(argv):
+    try:
+        remaining()
+        if len(argv) == 3 and argv[1] == "--network":
+            return report(*network(pathlib.Path(argv[2])))
+        if len(argv) != 2:
+            raise Broken("usage: link-check [--network] <binary folder>")
+        link, folder = table("link"), pathlib.Path(argv[1])
+        present = [n for n in link["daemon_binaries"] + link["gui_binaries"] if exists(folder / n)]
+        if not present:
+            raise Broken(f"not run: none of the named binaries is in {shown(str(folder))}")
+        missing = [n for n in link["daemon_binaries"] if not exists(folder / n)]
+        if missing:
+            raise Broken(f"daemon binaries missing from {shown(str(folder))}: {', '.join(missing)}")
+        found = Collected()
+        engine_names = ("lib" + link["engine_prefix"].rstrip("_").lower(), link["engine_prefix"].rstrip("_").lower())
+        for name in present:
+            root = regular(folder / name).resolve()
+            daemon = name in link["daemon_binaries"]
+            for kind, item in process_images(root, folder, engine_names):
+                if kind == "engine-load":
+                    if daemon:  # the GUI loads the engine library for its key encoder; a daemon never loads it
+                        found.add(("engine-in-daemon", f"{name} loads {shown(pathlib.PurePosixPath(item).name)}"))
+                    continue
+                if not daemon and item.name in link["engine_libraries"]:
+                    continue  # the engine library itself, by exact name; what the GUI's own images use from it is judged
+                where = name if item == root else f"{name} via {shown(item.relative_to(folder.resolve()).as_posix())}"
+                for s in sorted(s for s in symbols(item) if s.startswith(link["engine_prefix"])):
+                    if daemon:
+                        found.add(("engine-in-daemon", f"{where} {s}"))
+                    elif not s.startswith(tuple(link["gui_allowed_prefixes"])):
+                        found.add(("engine-in-gui", f"{where} {s}"))
+    except Broken as error:
+        print(f"link-check: broken: {error}", file=sys.stderr)
+        return 2
+    return report(found.kept, found.total)
+
+
+def report(kept, total):
+    for reason, where in kept:
+        print(f"link-check: refused {reason}: {where}")
+    if total > len(kept):
+        print(f"link-check: refused: {total - len(kept)} more refusals not listed")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

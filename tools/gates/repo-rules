@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Source gate: each rule that reading the source can decide fails the build (plan steps P0.9.1 and P0.9.2).
+
+Usage: repo-rules <repo>        check the tracked source of <repo>
+       repo-rules --list        list each rule, and the language rule, with the build rule each enforces
+
+Reads repo-rules.toml beside this file. A rule names the patterns it matches line by line, optional spanning
+patterns matched across lines of the whole file, the file suffixes it reads, the paths where a match is allowed (a
+folder ends in /, anything else is one exact file), the build rule it enforces and known-bad controls; every run
+first checks that each rule's patterns match its own controls, so a rule that cannot fail stops the check. A rule
+with a reason marker allows a match whose line, or the line above it, carries that marker inside a // or /*
+comment followed by a real reason, never a placeholder.
+
+Suffixes are compared without case. The [languages] table names native languages the rules cannot read; a tracked
+file in one is refused as source-language-unread outside the paths that table allows, so no rule is passed by
+changing language.
+
+Only tracked regular files are read (git ls-files), as text, at most 20000 of them and 2 MiB each, opened without
+following a symlink; a tracked symlink or special file is broken, never followed. The gate never imports, builds or
+runs repository code and never uses the network. A refusal names the rule and file:line, never the source, with
+control and non-ASCII characters in the name escaped; at most 1000 refusals are kept and listed, the rest
+counted, and git's list of names is read as a stream under a byte and an entry cap. An unreadable or
+non-UTF-8 file, a file over the cap, a malformed table or a failed git is broken. Exit 0 clean, 1 refused, 2 broken.
+"""
+import os
+import pathlib
+import re
+import selectors
+import stat
+import subprocess
+import sys
+import tomllib
+
+TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
+FIELDS = {"id", "enforces", "suffixes", "patterns", "allowed", "control"}
+OPTIONAL = {"reason", "spanning", "spanning_control", "ignore"}
+SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
+PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
+MAX_FILES = 20000
+MAX_BYTES = 2 * 1024 * 1024
+MAX_FINDINGS = 1000
+MAX_LISTING_BYTES = 16 * 1024 * 1024  # git's list of tracked names, read as a stream
+PLACEHOLDERS = {"placeholder", "todo", "tbd", "fixme", "xxx", "wip", "na"}  # a reason may not contain one
+
+
+class Broken(Exception):
+    pass
+
+
+LANGUAGE_RULE = "source-language-unread"
+SCRIPT_RULE = "script-outside-tooling"
+
+
+MAX_TABLE_BYTES = 256 * 1024
+MAX_RULES = 200
+MAX_PATTERNS = 200
+MAX_PATTERN_CHARS = 1000
+
+
+def load_table(path=None):
+    path = path or TABLE
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_TABLE_BYTES + 1)
+        if len(raw) > MAX_TABLE_BYTES:
+            raise Broken(f"{path.name} is over the {MAX_TABLE_BYTES}-byte cap for the rule table")
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise Broken(f"cannot read {path.name}: {error}")
+    rules = data.get("rule")
+    if isinstance(rules, list) and len(rules) > MAX_RULES:
+        raise Broken(f"{path.name} has over the cap of {MAX_RULES} rules")
+    for rule in rules if isinstance(rules, list) else []:
+        for field in ("patterns", "spanning", "ignore"):
+            values = rule.get(field, []) if isinstance(rule, dict) else []
+            if isinstance(values, list) and (len(values) > MAX_PATTERNS or any(
+                    isinstance(v, str) and len(v) > MAX_PATTERN_CHARS for v in values)):
+                raise Broken(f"{path.name}: a rule's {field} pass the cap of {MAX_PATTERNS} patterns of "
+                             f"{MAX_PATTERN_CHARS} characters")
+    rules = load_rules(path, data)
+    return rules, load_languages(path, data, rules)
+
+
+SHADER_RULE = "shader-outside-renderer"
+LANGUAGE_TABLES = (("languages", LANGUAGE_RULE), ("scripts", SCRIPT_RULE), ("shaders", SHADER_RULE))
+
+
+def load_languages(path, data, rules):
+    """The [languages] and [scripts] tables: suffixes the rules cannot read, each refused outside its allowed paths.
+    A suffix may appear in one table only, and never in a rule's suffixes."""
+    tables, seen = [], {s.lower() for rule in rules for s in rule["suffixes"]}
+    for section, rule_id in LANGUAGE_TABLES:
+        table = data.get(section)
+        if not isinstance(table, dict) or set(table) != {"enforces", "unread", "allowed"}:
+            raise Broken(f"{path.name}: the [{section}] table lacks or adds fields")
+        unread, allowed = table["unread"], table["allowed"]
+        ok = (isinstance(table["enforces"], str) and table["enforces"].strip()
+              and isinstance(unread, list) and unread and all(isinstance(v, str) and SUFFIX.fullmatch(v) for v in unread)
+              and isinstance(allowed, list) and all(isinstance(v, str) and PREFIX.fullmatch(v) for v in allowed)
+              and not any(".." in v.split("/") for v in allowed))
+        if not ok:
+            raise Broken(f"{path.name}: the [{section}] table is malformed")
+        lowered = [v.lower() for v in unread]
+        if len(set(lowered)) != len(lowered) or seen & set(lowered):
+            raise Broken(f"{path.name}: a [{section}] suffix repeats or is one another table or rule already reads")
+        seen |= set(lowered)
+        tables.append({"id": rule_id, "enforces": table["enforces"], "unread": tuple(lowered), "allowed": allowed})
+    return tables
+
+
+def load_rules(path, data):
+    rules = data.get("rule")
+    if not isinstance(rules, list) or not rules:
+        raise Broken(f"{path.name} has no rules")
+    out, seen = [], set()
+    for rule in rules:
+        if not isinstance(rule, dict) or not FIELDS <= set(rule) or set(rule) - FIELDS - OPTIONAL:
+            raise Broken(f"{path.name}: a rule lacks or adds fields: {rule.get('id') if isinstance(rule, dict) else rule}")
+        typed(path, rule)
+        if rule["id"] in seen:
+            raise Broken(f"{path.name}: rule id {rule['id']} appears twice")
+        seen.add(rule["id"])
+        try:
+            compiled = [re.compile(p) for p in rule["patterns"]]
+            spanning = [re.compile(p, re.MULTILINE) for p in rule.get("spanning", [])]
+            ignore = [re.compile(p) for p in rule.get("ignore", [])]
+        except (re.error, TypeError) as error:
+            raise Broken(f"{path.name}: rule {rule['id']} has a bad pattern: {error}")
+        if not compiled or not any(p.search(rule["control"]) for p in compiled):
+            raise Broken(f"{path.name}: rule {rule['id']}: its patterns do not match its own control, so it cannot fail")
+        if spanning and not all(p.search(rule["spanning_control"]) for p in spanning):
+            raise Broken(f"{path.name}: rule {rule['id']}: a spanning pattern does not match its own control, so it cannot fail")
+        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning, ignore_compiled=ignore,
+                        suffixes=[s.lower() for s in rule["suffixes"]]))
+    return out
+
+
+def typed(path, rule):
+    """Every field has its exact type and form, so a malformed table is broken, never read loosely."""
+    def strings(value, pattern=None, empty=False):
+        return (isinstance(value, list) and (empty or value) and all(isinstance(v, str) and v for v in value)
+                and all(pattern.fullmatch(v) for v in value) if pattern else isinstance(value, list) and (empty or value)
+                and all(isinstance(v, str) and v for v in value))
+    problems = [name for name, ok in (
+        ("id", isinstance(rule["id"], str) and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", rule["id"])),
+        ("enforces", isinstance(rule["enforces"], str) and rule["enforces"].strip()),
+        ("control", isinstance(rule["control"], str) and rule["control"].strip()),
+        ("suffixes", strings(rule["suffixes"], SUFFIX)),
+        ("patterns", strings(rule["patterns"])),
+        ("allowed", strings(rule["allowed"], PREFIX, empty=True) and not any(".." in v.split("/") for v in rule["allowed"])),
+        ("reason", "reason" not in rule or (isinstance(rule["reason"], str) and rule["reason"].strip())),
+        ("spanning", "spanning" not in rule or (strings(rule["spanning"]) and "reason" not in rule
+                                                and isinstance(rule.get("spanning_control"), str)
+                                                and "\n" in rule["spanning_control"])),
+        ("spanning_control", "spanning_control" not in rule or "spanning" in rule),
+        ("ignore", "ignore" not in rule or strings(rule["ignore"])),
+    ) if not ok]
+    if problems:
+        raise Broken(f"{path.name}: rule {rule.get('id')!r} has a malformed {', '.join(problems)}")
+
+
+class Collected:
+    """The first MAX_FINDINGS refusals, kept; every refusal, counted."""
+    def __init__(self):
+        self.kept, self.total = [], 0
+
+    def add(self, item):
+        self.total += 1
+        if len(self.kept) < MAX_FINDINGS:
+            self.kept.append(item)
+
+
+def tracked(repo):
+    """git's tracked names, streamed under a byte cap and an entry cap, with a time limit."""
+    try:
+        child = subprocess.Popen(["git", "-C", str(repo), "ls-files", "-z"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except OSError as error:
+        raise Broken(f"git could not list the tree: {error.strerror}")
+    chunks, size, count = [], 0, 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                if not selector.select(timeout=120):
+                    raise Broken("git did not list the tree in time")
+                chunk = os.read(child.stdout.fileno(), 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                count += chunk.count(b"\0")
+                if size > MAX_LISTING_BYTES:
+                    raise Broken(f"git's list of tracked names passed its {MAX_LISTING_BYTES}-byte cap")
+                if count > MAX_FILES:
+                    raise Broken(f"the tree lists over the cap of {MAX_FILES} files")
+                chunks.append(chunk)
+        code = child.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        raise Broken("git did not list the tree in time")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()
+    if code != 0:
+        raise Broken(f"git cannot list the tree at {shown(str(repo))}")
+    return [n.decode("utf-8", "surrogateescape") for n in b"".join(chunks).split(b"\0") if n]
+
+
+def comment_bodies(line):
+    """The text inside each // or /* comment on the line, outside any double-quoted string. A block comment's body
+    ends at its own */. A quote the scan cannot pair hides the rest of the line, so a doubtful marker never exempts
+    (fail closed)."""
+    quote, index = None, 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\":
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char == '"':
+            quote = char
+        elif line.startswith("//", index):
+            yield line[index + 2:]
+            return
+        elif line.startswith("/*", index):
+            close = line.find("*/", index + 2)
+            if close < 0:
+                yield line[index + 2:]
+                return
+            yield line[index + 2:close]
+            index = close + 2
+            continue
+        index += 1
+
+
+def reason_given(lines, index, marker):
+    """The marker sits inside a comment on the matched line or the line above, followed by a real reason: some
+    words, none of them a placeholder."""
+    for line in lines[max(0, index - 1):index + 1]:
+        for body in comment_bodies(line):
+            at = body.find(marker)
+            if at < 0:
+                continue
+            words = re.findall(r"[A-Za-z]{2,}", body[at + len(marker):])
+            if words and not any(word.lower() in PLACEHOLDERS for word in words):
+                return True
+    return False
+
+
+def kind_check(repo, name):
+    """Every tracked path must be a regular file: a symlink or special file is broken, never followed or skipped."""
+    try:
+        info = os.lstat(pathlib.Path(repo) / name)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(name)}: {error.strerror}")
+    if not stat.S_ISREG(info.st_mode):
+        raise Broken(f"{shown(name)} is not a regular file (a symlink or special file is never read)")
+
+
+def starts_with_shebang(repo, name):
+    """The first two bytes of a regular tracked file, read without following a link."""
+    try:
+        handle = os.open(pathlib.Path(repo) / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            return os.read(handle, 2) == b"#!"
+        finally:
+            os.close(handle)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(name)}: {error.strerror}")
+
+
+CONTINUES = ("::", ".", "(", ":", ",")  # a line ending in an open call, a label or a comma continues it
+INLINE_COMMENT = re.compile(r"/\*.*?\*/")
+OPENS = ("::", ".", "(")
+
+
+def joined_lines(lines):
+    """Lines with continuations joined: a line ending in ::, . or (, or a next line starting with ::, . or (, is joined
+    to its neighbor without the break, so a call or path split at a separator or before its parenthesis reads as
+    one line; a line ending in a backslash splices with the next as the C preprocessor does, so a name split by a
+    continuation reads whole. Yields (first line index, joined text) only for groups of two or more lines."""
+    index = 0
+    while index < len(lines):
+        start, text = index, lines[index]
+        while index + 1 < len(lines) and (text.rstrip().endswith(CONTINUES) or text.endswith("\\")
+                                           or lines[index + 1].lstrip().startswith(OPENS)):
+            index += 1
+            if text.endswith("\\"):
+                text = text[:-1] + lines[index]  # a preprocessor splice: no space, the name continues
+            else:
+                text = text.rstrip() + lines[index].strip()
+        text = INLINE_COMMENT.sub(" ", text)
+        if index > start:
+            yield start, text
+        index += 1
+
+
+def blanked(text, patterns):
+    """The text with every match of the ignore patterns blanked out, newlines kept, so positions and line
+    numbers stay true."""
+    for pattern in patterns:
+        text = pattern.sub(lambda m: "".join("\n" if c == "\n" else " " for c in m.group(0)), text)
+    return text
+
+
+def allowed_at(name, allowed):
+    """A folder entry (ending in /) allows everything under it; any other entry allows that one file only."""
+    return any(name.startswith(entry) if entry.endswith("/") else name == entry for entry in allowed)
+
+
+def read_source(repo, name):
+    """One tracked source as text: a regular file only, opened without following a symlink, at most MAX_BYTES."""
+    path = pathlib.Path(repo) / name
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise Broken(f"{shown(name)} is not a regular file (a symlink or special file is never read)")
+        if info.st_size > MAX_BYTES:
+            raise Broken(f"{shown(name)} is over the {MAX_BYTES}-byte cap for a source file")
+        handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(handle).st_mode):
+                raise Broken(f"{shown(name)} is not a regular file (a symlink or special file is never read)")
+            chunks, size = [], 0
+            while size <= MAX_BYTES:  # os.read may return fewer bytes than asked; read to the end or past the cap
+                chunk = os.read(handle, MAX_BYTES + 1 - size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            data = b"".join(chunks)
+        finally:
+            os.close(handle)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(name)}: {error.strerror}")
+    if len(data) > MAX_BYTES:
+        raise Broken(f"{shown(name)} is over the {MAX_BYTES}-byte cap for a source file")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Broken(f"{shown(name)} is not UTF-8")
+
+
+def shown(name):
+    """A file name safe to print: control, backslash and non-ASCII characters escaped, so a name cannot forge a line."""
+    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape", "backslashreplace").decode("ascii")
+                   for c in name)
+
+
+def findings(repo, rules, languages):
+    """The refusals for the tree: the first MAX_FINDINGS kept, and the total count."""
+    found = Collected()
+    suffixes = tuple({s for rule in rules for s in rule["suffixes"]})
+    for name in tracked(repo):
+        lowered = name.lower()
+        kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
+        table = next((t for t in languages if lowered.endswith(t["unread"])), None)
+        if not table and not lowered.endswith(suffixes) and starts_with_shebang(repo, name):
+            table = next(t for t in languages if t["id"] == SCRIPT_RULE)  # a script known by its first line
+        if table:
+            if not allowed_at(name, table["allowed"]):
+                found.add((table["id"], f"{shown(name)}:1"))
+            continue
+        if not lowered.endswith(suffixes):
+            continue
+        text = read_source(repo, name)
+        lines = text.splitlines()
+        for rule in rules:
+            if not lowered.endswith(tuple(rule["suffixes"])) or allowed_at(name, rule["allowed"]):
+                continue
+            hits = set()
+            view = blanked(text, rule["ignore_compiled"]) if rule["ignore_compiled"] else text
+            view_lines = view.splitlines() if rule["ignore_compiled"] else lines
+            for index, line in enumerate(view_lines):
+                forms = (line, INLINE_COMMENT.sub(" ", line)) if "/*" in line else (line,)
+                if any(p.search(form) for p in rule["compiled"] for form in forms):
+                    if "reason" in rule and reason_given(lines, index, rule["reason"]):
+                        continue
+                    hits.add(index + 1)
+            for start, line in joined_lines(view_lines):
+                if any(p.search(line) for p in rule["compiled"]):
+                    if "reason" in rule and reason_given(lines, start, rule["reason"]):
+                        continue
+                    hits.add(start + 1)
+            for pattern in rule["spanning_compiled"]:
+                hits.update(view.count("\n", 0, m.start()) + 1 for m in pattern.finditer(view))
+            for line in sorted(hits):
+                found.add((rule["id"], f"{shown(name)}:{line}"))
+    return found.kept, found.total
+
+
+def main(argv):
+    try:
+        rules, languages = load_table()
+        if argv[1:] == ["--list"]:
+            for rule in rules:
+                print(f"{rule['id']}  {rule['enforces']}")
+            for table in languages:
+                print(f"{table['id']}  {table['enforces']}")
+            return 0
+        if len(argv) != 2:
+            raise Broken("usage: repo-rules <repo> | repo-rules --list")
+        found, total = findings(argv[1], rules, languages)
+    except Broken as error:
+        print(f"repo-rules: broken: {error}", file=sys.stderr)
+        return 2
+    for rule, where in found:
+        print(f"repo-rules: refused {rule}: {where}")
+    if total > len(found):
+        print(f"repo-rules: refused: {total - len(found)} more refusals not listed")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
