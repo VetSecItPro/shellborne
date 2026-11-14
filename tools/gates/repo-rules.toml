@@ -1,15 +1,21 @@
 # Where each kind of code may live (plan steps P0.9.1 and P0.9.2). tools/gates/repo-rules reads this table and
 # refuses a match outside the paths a rule allows. Each rule names the build rule it enforces and carries a
-# known-bad control line that its own patterns must match, checked on every run. Paths are prefixes from the
-# repository root. Patterns are regular expressions, matched line by line in tracked files with the listed
-# suffixes; comments count too, since the gate does not parse source.
+# known-bad control line that its own patterns must match, checked on every run. Allowed paths are from the
+# repository root: one ending in / is a folder, any other is one exact file. Patterns are regular expressions,
+# matched line by line in tracked files with the listed suffixes; spanning patterns are matched across the lines
+# of the whole file and carry their own multi-line control. Comments count too, since the gate does not parse
+# source.
 
 [[rule]]
 id = "timer-or-watcher-outside-core"
 enforces = "timers and file watching go through the scheduler and the one event stream"
-suffixes = [".swift", ".rs"]
-patterns = ['\bTimer\.(?:scheduledTimer|publish)\b', '\bDispatchSource\.make(?:Timer|FileSystemObject)Source\b',
-            '\bFSEventStreamCreate\b', '\bnotify::(?:recommended_watcher|Watcher)\b']
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm"]
+patterns = ['\b(?:NS)?Timer\s*(?:\.init)?\s*\(', '\b(?:NS)?Timer\.(?:scheduledTimer|publish)\w*\b',
+            '\bNSTimer\s+(?:scheduledTimer|timer)\w*', '\bDispatchSource\.make(?:Timer|FileSystemObject)Source\b',
+            '\bDispatchSourceTimer\b', '\bdispatch_source_create\b', '\bDISPATCH_SOURCE_TYPE_(?:TIMER|VNODE)\b',
+            '\b(?:asyncAfter|dispatch_after)\s*\(', '\bafterDelay:', '\bCFRunLoopTimerCreate\w*\b',
+            '\bEVFILT_(?:TIMER|VNODE)\b', '\bFSEventStreamCreate\b', '\bNSFilePresenter\b',
+            '\bnotify::(?:recommended_watcher|Watcher)\b']
 allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/event_loop.rs",
            "crates/sb-host/src/event_loop.rs", "crates/sb-vt-worker/src/event_loop.rs"]
 control = "let poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }"
@@ -17,8 +23,9 @@ control = "let poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) {
 [[rule]]
 id = "spawn-outside-scheduler"
 enforces = "one scheduler starts every process; the daemon alone spawns session hosts and their PTY"
-suffixes = [".swift", ".rs"]
-patterns = ['\bCommand::new\b', '\bposix_spawnp?\b', '\bfork\s*\(', '\bProcess\s*\(\s*\)', '\bNSTask\b']
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm"]
+patterns = ['\bCommand::new\b', '\bposix_spawnp?\b', '\bv?fork\s*\(', '\bforkpty\s*\(', '\bexec[lv]p?e?\s*\(',
+            '\b(?:system|popen)\s*\(', '\bProcess\s*(?:\.init)?\s*\(\s*\)', '\bProcess\.run\b', '\bNSTask\b']
 allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/spawn_host.rs",
            "crates/sb-host/src/pty.rs"]
 control = 'let _ = std::process::Command::new("ls");'
@@ -30,15 +37,17 @@ suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm"]
 patterns = ['\bURLSession\b', '\bstd\s*::\s*(?:\{[^}]*\bnet\b|net\b)', '\bgetaddrinfo\b',
             '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
             '#\s*(?:include|import)\s*<(?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b']
+spanning = ['\bstd\s*::\s*\{[^;]*?\bnet\b']  # a grouped std import split over lines, up to its semicolon
 allowed = ["apple/Sources/Update/"]
 control = "let s = URLSession.shared"
+spanning_control = "use std::{\n    io::{Read, Write},\n    net::TcpStream,\n};"
 
 [[rule]]
 id = "engine-outside-adapter"
 enforces = "engine symbols appear only in the engine adapter"
 suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm"]
 patterns = ['\bghostty_(?!surface_)\w+']
-allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/", "apple/Sources/TerminalView/"]
+allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/"]
 control = "unsafe { ghostty_terminal_new(); }"
 
 [[rule]]
@@ -80,9 +89,9 @@ control = "Text(name).padding(12)"
 id = "control-outside-design-system"
 enforces = "controls come from the design system, never built raw"
 suffixes = [".swift"]
-patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox)\s*\(',
-            '\bNSButton\.(?:checkbox|radioButton)WithTitle\b',
-            '(?<![\w.])(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu)\s*\(']
+patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox|TextField|SecureTextField|SearchField|TokenField|ColorWell|DatePicker|PathControl|LevelIndicator|Matrix|TextView)\s*(?:\.init)?\s*\(',
+            '\bNSButton\.(?:checkbox|radioButton)WithTitle\b', '\bNSTextField\.(?:label|wrappingLabel)WithString\b',
+            '(?<![\w.])(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*\(']
 allowed = ["apple/Sources/DesignSystem/"]
 control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
 

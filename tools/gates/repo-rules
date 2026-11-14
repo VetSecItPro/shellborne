@@ -4,28 +4,36 @@
 Usage: repo-rules <repo>        check the tracked source of <repo>
        repo-rules --list        list each rule with the build rule it enforces
 
-Reads repo-rules.toml beside this file. A rule names the patterns it matches, the file suffixes it reads, the
-path prefixes where a match is allowed, the build rule it enforces and a known-bad control line; every run first
-checks that each rule's patterns match its own control, so a rule that cannot fail stops the check. A rule with a
-reason marker allows a match whose line, or the line above it, carries that marker followed by a reason.
+Reads repo-rules.toml beside this file. A rule names the patterns it matches line by line, optional spanning
+patterns matched across lines of the whole file, the file suffixes it reads, the paths where a match is allowed (a
+folder ends in /, anything else is one exact file), the build rule it enforces and known-bad controls; every run
+first checks that each rule's patterns match its own controls, so a rule that cannot fail stops the check. A rule
+with a reason marker allows a match whose line, or the line above it, carries that marker inside a // or /*
+comment followed by a real reason, never a placeholder.
 
-Only tracked files are read (git ls-files), as text, at most 20000 of them and 2 MiB each; the gate never imports,
-builds or runs repository code and never uses the network. A refusal names the rule and file:line, never the
-source. An unreadable or non-UTF-8 file, a file over the cap, a malformed table or a failed git is broken.
-Exit 0 clean, 1 refused, 2 broken.
+Only tracked regular files are read (git ls-files), as text, at most 20000 of them and 2 MiB each, opened without
+following a symlink; a tracked symlink or special file is broken, never followed. The gate never imports, builds or
+runs repository code and never uses the network. A refusal names the rule and file:line, never the source, with
+control and non-ASCII characters in the name escaped, and at most 1000 refusals are listed. An unreadable or
+non-UTF-8 file, a file over the cap, a malformed table or a failed git is broken. Exit 0 clean, 1 refused, 2 broken.
 """
+import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import tomllib
 
 TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
 FIELDS = {"id", "enforces", "suffixes", "patterns", "allowed", "control"}
+OPTIONAL = {"reason", "spanning", "spanning_control"}
 SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
 PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
 MAX_FILES = 20000
 MAX_BYTES = 2 * 1024 * 1024
+MAX_FINDINGS = 1000
+PLACEHOLDERS = {"placeholder", "todo", "tbd", "fixme", "xxx", "wip", "na"}  # a reason may not start with one
 
 
 class Broken(Exception):
@@ -42,7 +50,7 @@ def load_rules(path=TABLE):
         raise Broken(f"{path.name} has no rules")
     out, seen = [], set()
     for rule in rules:
-        if not isinstance(rule, dict) or not FIELDS <= set(rule) or set(rule) - FIELDS - {"reason"}:
+        if not isinstance(rule, dict) or not FIELDS <= set(rule) or set(rule) - FIELDS - OPTIONAL:
             raise Broken(f"{path.name}: a rule lacks or adds fields: {rule.get('id') if isinstance(rule, dict) else rule}")
         typed(path, rule)
         if rule["id"] in seen:
@@ -50,11 +58,14 @@ def load_rules(path=TABLE):
         seen.add(rule["id"])
         try:
             compiled = [re.compile(p) for p in rule["patterns"]]
+            spanning = [re.compile(p, re.MULTILINE) for p in rule.get("spanning", [])]
         except (re.error, TypeError) as error:
             raise Broken(f"{path.name}: rule {rule['id']} has a bad pattern: {error}")
         if not compiled or not any(p.search(rule["control"]) for p in compiled):
             raise Broken(f"{path.name}: rule {rule['id']}: its patterns do not match its own control, so it cannot fail")
-        out.append(dict(rule, compiled=compiled))
+        if spanning and not all(p.search(rule["spanning_control"]) for p in spanning):
+            raise Broken(f"{path.name}: rule {rule['id']}: a spanning pattern does not match its own control, so it cannot fail")
+        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning))
     return out
 
 
@@ -72,6 +83,10 @@ def typed(path, rule):
         ("patterns", strings(rule["patterns"])),
         ("allowed", strings(rule["allowed"], PREFIX, empty=True) and not any(".." in v.split("/") for v in rule["allowed"])),
         ("reason", "reason" not in rule or (isinstance(rule["reason"], str) and rule["reason"].strip())),
+        ("spanning", "spanning" not in rule or (strings(rule["spanning"]) and "reason" not in rule
+                                                and isinstance(rule.get("spanning_control"), str)
+                                                and "\n" in rule["spanning_control"])),
+        ("spanning_control", "spanning_control" not in rule or "spanning" in rule),
     ) if not ok]
     if problems:
         raise Broken(f"{path.name}: rule {rule.get('id')!r} has a malformed {', '.join(problems)}")
@@ -90,12 +105,74 @@ def tracked(repo):
     return names
 
 
+def comment_start(line):
+    """Where a // or /* comment starts on the line, outside any double-quoted string, or -1. A quote the scan
+    cannot pair hides the rest of the line, so a doubtful marker never exempts (fail closed)."""
+    quote, index = None, 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\":
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char == '"':
+            quote = char
+        elif line.startswith(("//", "/*"), index):
+            return index
+        index += 1
+    return -1
+
+
 def reason_given(lines, index, marker):
+    """The marker sits in a comment on the matched line or the line above, followed by a real reason."""
     for line in lines[max(0, index - 1):index + 1]:
-        at = line.find(marker)
-        if at >= 0 and line[at + len(marker):].strip():
+        start = comment_start(line)
+        at = line.find(marker, start) if start >= 0 else -1
+        if at < 0:
+            continue
+        reason = line[at + len(marker):].replace("*/", " ").strip()
+        words = re.findall(r"[A-Za-z]{2,}", reason)
+        if words and words[0].lower() not in PLACEHOLDERS:
             return True
     return False
+
+
+def allowed_at(name, allowed):
+    """A folder entry (ending in /) allows everything under it; any other entry allows that one file only."""
+    return any(name.startswith(entry) if entry.endswith("/") else name == entry for entry in allowed)
+
+
+def read_source(repo, name):
+    """One tracked source as text: a regular file only, opened without following a symlink, at most MAX_BYTES."""
+    path = pathlib.Path(repo) / name
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise Broken(f"{shown(name)} is not a regular file (a symlink or special file is never read)")
+        if info.st_size > MAX_BYTES:
+            raise Broken(f"{shown(name)} is over the {MAX_BYTES}-byte cap for a source file")
+        handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(handle).st_mode):
+                raise Broken(f"{shown(name)} is not a regular file (a symlink or special file is never read)")
+            data = os.read(handle, MAX_BYTES + 1)
+        finally:
+            os.close(handle)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(name)}: {error.strerror}")
+    if len(data) > MAX_BYTES:
+        raise Broken(f"{shown(name)} is over the {MAX_BYTES}-byte cap for a source file")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Broken(f"{shown(name)} is not UTF-8")
+
+
+def shown(name):
+    """A file name safe to print: control, backslash and non-ASCII characters escaped, so a name cannot forge a line."""
+    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape", "backslashreplace").decode("ascii")
+                   for c in name)
 
 
 def findings(repo, rules):
@@ -104,23 +181,20 @@ def findings(repo, rules):
     for name in tracked(repo):
         if not name.endswith(suffixes):
             continue
-        path = pathlib.Path(repo) / name
-        try:
-            if path.stat().st_size > MAX_BYTES:
-                raise Broken(f"{name} is over the {MAX_BYTES}-byte cap for a source file")
-            lines = path.read_bytes().decode("utf-8").splitlines()
-        except UnicodeDecodeError:
-            raise Broken(f"{name} is not UTF-8")
-        except OSError as error:
-            raise Broken(f"cannot read {name}: {error}")
+        text = read_source(repo, name)
+        lines = text.splitlines()
         for rule in rules:
-            if not name.endswith(tuple(rule["suffixes"])) or name.startswith(tuple(rule["allowed"])):
+            if not name.endswith(tuple(rule["suffixes"])) or allowed_at(name, rule["allowed"]):
                 continue
+            hits = set()
             for index, line in enumerate(lines):
                 if any(p.search(line) for p in rule["compiled"]):
                     if "reason" in rule and reason_given(lines, index, rule["reason"]):
                         continue
-                    found.append((rule["id"], f"{name}:{index + 1}"))
+                    hits.add(index + 1)
+            for pattern in rule["spanning_compiled"]:
+                hits.update(text.count("\n", 0, m.start()) + 1 for m in pattern.finditer(text))
+            found += [(rule["id"], f"{shown(name)}:{line}") for line in sorted(hits)]
     return found
 
 
@@ -137,8 +211,10 @@ def main(argv):
     except Broken as error:
         print(f"repo-rules: broken: {error}", file=sys.stderr)
         return 2
-    for rule, where in found:
+    for rule, where in found[:MAX_FINDINGS]:
         print(f"repo-rules: refused {rule}: {where}")
+    if len(found) > MAX_FINDINGS:
+        print(f"repo-rules: refused: {len(found) - MAX_FINDINGS} more refusals not listed")
     return 1 if found else 0
 
 

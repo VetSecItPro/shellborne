@@ -10,29 +10,104 @@ referenced, is refused as engine-in-daemon; the GUI with an engine symbol outsid
 refused as engine-in-gui. A folder with none of the named binaries is not run, and a missing daemon binary is
 broken, so the gate never passes on what it did not read. With --network, every Mach-O in the folder except
 the update module's binary is refused as network-in-binary for a getaddrinfo symbol or a link to CFNetwork or the
-Network framework; a folder with no Mach-O is not run. Exit 0 clean, 1 refused, 2 broken or not run.
+Network framework; a folder with no Mach-O is not run.
+
+Both tables are typed exactly: a malformed, duplicate or unknown field is broken, never read loosely. Only regular
+files are read: a named binary that is a symlink is broken, and the network scan never follows a symlink out of the
+folder. Every scan is bounded: at most MAX_FILES files, MAX_BINARY_BYTES per binary, MAX_OUTPUT bytes from one nm or
+otool run, MAX_SECONDS for the whole run, and at most MAX_FINDINGS refusals listed; past a cap the run is broken.
+File names are printed with control and non-ASCII characters escaped. Exit 0 clean, 1 refused, 2 broken or not run.
 """
+import os
 import pathlib
+import re
+import selectors
+import stat
 import subprocess
 import sys
+import time
 import tomllib
 
 TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
+MAX_FILES = 20000
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_OUTPUT = 256 * 1024 * 1024
+MAX_SECONDS = 1800
+MAX_FINDINGS = 1000
+SYMBOL_PREFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+BINARY_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+FRAMEWORK = re.compile(r"[A-Za-z0-9_]+\.framework")
+START = time.monotonic()
 
 
 class Broken(Exception):
     pass
 
 
-def table():
+def shown(name):
+    """A name safe to print: control, backslash and non-ASCII characters escaped, so a name cannot forge a line."""
+    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape", "backslashreplace").decode("ascii")
+                   for c in name)
+
+
+def remaining():
+    left = START + MAX_SECONDS - time.monotonic()
+    if left <= 0:
+        raise Broken(f"the run passed its cap of {MAX_SECONDS} seconds")
+    return left
+
+
+def strings(value, form):
+    return (isinstance(value, list) and value and all(isinstance(v, str) and form.fullmatch(v) for v in value)
+            and len(set(value)) == len(value)
+            and not any(part in (".", "..") for v in value for part in v.split("/")))
+
+
+SHAPES = {
+    "link": {"enforces": lambda v: isinstance(v, str) and v.strip(),
+             "engine_prefix": lambda v: isinstance(v, str) and SYMBOL_PREFIX.fullmatch(v),
+             "daemon_binaries": lambda v: strings(v, BINARY_PATH),
+             "gui_binaries": lambda v: strings(v, BINARY_PATH),
+             "gui_allowed_prefixes": lambda v: strings(v, SYMBOL_PREFIX)},
+    "network": {"enforces": lambda v: isinstance(v, str) and v.strip(),
+                "update_binaries": lambda v: strings(v, BINARY_PATH),
+                "forbidden_symbols": lambda v: strings(v, SYMBOL_PREFIX),
+                "forbidden_frameworks": lambda v: strings(v, FRAMEWORK)},
+}
+
+
+def table(name):
+    """The [link] or [network] table, every field present with its exact type and form, and nothing else."""
     try:
-        link = tomllib.loads(TABLE.read_text(encoding="utf-8")).get("link")
+        data = tomllib.loads(TABLE.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise Broken(f"cannot read {TABLE.name}: {error}")
-    needed = ("engine_prefix", "daemon_binaries", "gui_binaries", "gui_allowed_prefixes")
-    if not isinstance(link, dict) or not all(link.get(key) for key in needed):
-        raise Broken(f"{TABLE.name} has no complete [link] table")
-    return link
+    for section, shape in SHAPES.items():  # both tables are checked on every run, whichever mode reads one
+        found = data.get(section)
+        if not isinstance(found, dict) or set(found) != set(shape):
+            raise Broken(f"{TABLE.name}: the [{section}] table lacks or adds fields")
+        bad = [key for key, ok in shape.items() if not ok(found[key])]
+        if bad:
+            raise Broken(f"{TABLE.name}: the [{section}] table has a malformed {', '.join(bad)}")
+    link = data["link"]
+    if set(link["daemon_binaries"]) & set(link["gui_binaries"]):
+        raise Broken(f"{TABLE.name}: a binary is named as both daemon and GUI")
+    if any(not p.startswith(link["engine_prefix"]) for p in link["gui_allowed_prefixes"]):
+        raise Broken(f"{TABLE.name}: a GUI allowed prefix is not an engine prefix")
+    return data[name]
+
+
+def regular(path):
+    """A regular file under the cap, never a symlink."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
+    if not stat.S_ISREG(info.st_mode):
+        raise Broken(f"{shown(path.name)} is not a regular file (a symlink is never followed)")
+    if info.st_size > MAX_BINARY_BYTES:
+        raise Broken(f"{shown(path.name)} is over the {MAX_BINARY_BYTES}-byte cap for a binary")
+    return path
 
 
 MACH_O = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # thin, both byte orders
@@ -41,78 +116,121 @@ MACH_O = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\
 
 def is_mach_o(path):
     try:
-        with open(path, "rb") as handle:
-            return handle.read(4) in MACH_O
+        handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            return os.read(handle, 4) in MACH_O
+        finally:
+            os.close(handle)
     except OSError as error:
-        raise Broken(f"cannot read {path.name}: {error}")  # an unreadable candidate is never skipped
+        raise Broken(f"cannot read {shown(path.name)}: {error.strerror}")  # an unreadable candidate is never skipped
 
 
 def run(command):
+    """Run a tool with its output capped at MAX_OUTPUT bytes and its time capped by the run's deadline."""
     try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise Broken(f"{command[0]} could not run: {error}")
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except OSError as error:
+        raise Broken(f"{command[0]} could not run: {error.strerror}")
+    chunks, size = [], 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                if not selector.select(timeout=min(remaining(), 120)):
+                    raise Broken(f"{command[0]} did not finish in time")
+                chunk = os.read(child.stdout.fileno(), 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_OUTPUT:
+                    raise Broken(f"{command[0]} printed over the {MAX_OUTPUT}-byte cap")
+                chunks.append(chunk)
+        code = child.wait(timeout=min(remaining(), 120))
+    except subprocess.TimeoutExpired:
+        raise Broken(f"{command[0]} did not finish in time")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()
+    return code, b"".join(chunks).decode("utf-8", "replace")
 
 
 def linked(path):
-    listed = run(["otool", "-L", str(path)])
-    if listed.returncode != 0:
-        raise Broken(f"otool cannot read {path.name}")
-    return listed.stdout
+    code, out = run(["otool", "-L", str(path)])
+    if code != 0:
+        raise Broken(f"otool cannot read {shown(path.name)}")
+    return out
+
+
+def candidates(folder):
+    """Every regular file under the folder, never through a symlink, at most MAX_FILES."""
+    found = []
+    for top, dirs, files in os.walk(folder, followlinks=False):
+        remaining()
+        for name in files:
+            path = pathlib.Path(top) / name
+            if os.path.islink(path):
+                continue  # a symlink in a bundle points at a file the walk reaches directly, or out of the folder
+            found.append(path)
+            if len(found) > MAX_FILES:
+                raise Broken(f"{shown(str(folder))} holds over the {MAX_FILES}-file cap")
+    return sorted(found)
 
 
 def network(folder):
     """P0.9.6: getaddrinfo or a network framework in any Mach-O outside the update module."""
-    try:
-        net = tomllib.loads(TABLE.read_text(encoding="utf-8")).get("network")
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise Broken(f"cannot read {TABLE.name}: {error}")
-    if not isinstance(net, dict) or not all(net.get(k) for k in ("update_binaries", "forbidden_symbols", "forbidden_frameworks")):
-        raise Broken(f"{TABLE.name} has no complete [network] table")
+    net = table("network")
     found, read = [], 0
-    for path in sorted(p for p in folder.rglob("*") if p.is_file() and is_mach_o(p)):
+    for path in candidates(folder):
+        if not stat.S_ISREG(os.lstat(path).st_mode) or not is_mach_o(path):
+            continue
+        regular(path)
         read += 1
         rel = path.relative_to(folder).as_posix()
         if rel in net["update_binaries"]:  # the update module only at its exact path, never by a name found elsewhere
             continue
-        found += [("network-in-binary", f"{rel} {s}") for s in sorted(symbols(path)) if s in net["forbidden_symbols"]]
+        found += [("network-in-binary", f"{shown(rel)} {s}") for s in sorted(symbols(path)) if s in net["forbidden_symbols"]]
         libraries = linked(path)
-        found += [("network-in-binary", f"{rel} {f}") for f in net["forbidden_frameworks"] if f"/{f}/" in libraries]
+        found += [("network-in-binary", f"{shown(rel)} {f}") for f in net["forbidden_frameworks"] if f"/{f}/" in libraries]
     if not read:
-        raise Broken(f"not run: no Mach-O in {folder}")
+        raise Broken(f"not run: no Mach-O in {shown(str(folder))}")
     return found
 
 
 def symbols(path):
-    listed = run(["nm", "-P", str(path)])
-    if listed.returncode != 0:
-        raise Broken(f"nm cannot read {path.name}")
+    code, out = run(["nm", "-P", str(path)])
+    if code != 0:
+        raise Broken(f"nm cannot read {shown(path.name)}")
     names = set()
-    for line in listed.stdout.splitlines():
+    for line in out.splitlines():
         name = line.split(" ", 1)[0].split(":")[-1]
         names.add(name[1:] if name.startswith("_") else name)
     return names
 
 
+def exists(path):
+    return os.path.lexists(path)
+
+
 def main(argv):
     try:
+        remaining()
         if len(argv) == 3 and argv[1] == "--network":
             found = network(pathlib.Path(argv[2]))
-            for reason, where in found:
-                print(f"link-check: refused {reason}: {where}")
-            return 1 if found else 0
+            return report(found)
         if len(argv) != 2:
             raise Broken("usage: link-check [--network] <binary folder>")
-        link, folder = table(), pathlib.Path(argv[1])
-        present = [n for n in link["daemon_binaries"] + link["gui_binaries"] if (folder / n).is_file()]
+        link, folder = table("link"), pathlib.Path(argv[1])
+        present = [n for n in link["daemon_binaries"] + link["gui_binaries"] if exists(folder / n)]
         if not present:
-            raise Broken(f"not run: none of the named binaries is in {folder}")
-        missing = [n for n in link["daemon_binaries"] if not (folder / n).is_file()]
+            raise Broken(f"not run: none of the named binaries is in {shown(str(folder))}")
+        missing = [n for n in link["daemon_binaries"] if not exists(folder / n)]
         if missing:
-            raise Broken(f"daemon binaries missing from {folder}: {', '.join(missing)}")
+            raise Broken(f"daemon binaries missing from {shown(str(folder))}: {', '.join(missing)}")
         found = []
         for name in present:
-            engine = sorted(s for s in symbols(folder / name) if s.startswith(link["engine_prefix"]))
+            engine = sorted(s for s in symbols(regular(folder / name)) if s.startswith(link["engine_prefix"]))
             if name in link["daemon_binaries"]:
                 found += [("engine-in-daemon", f"{name} {s}") for s in engine]
             else:
@@ -121,8 +239,14 @@ def main(argv):
     except Broken as error:
         print(f"link-check: broken: {error}", file=sys.stderr)
         return 2
-    for reason, where in found:
+    return report(found)
+
+
+def report(found):
+    for reason, where in found[:MAX_FINDINGS]:
         print(f"link-check: refused {reason}: {where}")
+    if len(found) > MAX_FINDINGS:
+        print(f"link-check: refused: {len(found) - MAX_FINDINGS} more refusals not listed")
     return 1 if found else 0
 
 
