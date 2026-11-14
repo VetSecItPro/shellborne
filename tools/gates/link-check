@@ -250,6 +250,15 @@ def resolve(name, loader, executable, run_paths, folder, names_in_folder):
     else:
         tries = [pathlib.Path(name)]
     for candidate in tries:
+        lexical = pathlib.Path(os.path.normpath(os.path.abspath(candidate)))
+        if lexical.is_relative_to(root) or lexical.is_relative_to(folder.absolute()):
+            base_root = root if lexical.is_relative_to(root) else folder.absolute()
+            step = base_root
+            for part in lexical.relative_to(base_root).parts:  # a link the loader would follow, judged where it is
+                step = step / part
+                if step.is_symlink():
+                    raise Broken(f"{shown(loader.name)} loads {shown(name)} through a symlink in the build folder "
+                                 f"({shown(str(step.relative_to(base_root)))}); a link is never followed")
         try:
             real = candidate.resolve()
         except OSError:
