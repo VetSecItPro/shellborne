@@ -1,0 +1,189 @@
+# Where each kind of code may live (plan steps P0.9.1 and P0.9.2). tools/gates/repo-rules reads this table and
+# refuses a match outside the paths a rule allows. Each rule names the build rule it enforces and carries a
+# known-bad control line that its own patterns must match, checked on every run. Allowed paths are from the
+# repository root: one ending in / is a folder, any other is one exact file. Patterns are regular expressions,
+# matched line by line in tracked files with the listed suffixes; spanning patterns are matched across the lines
+# of the whole file and carry their own multi-line control. Comments count too, since the gate does not parse
+# source.
+
+[[rule]]
+id = "timer-or-watcher-outside-core"
+enforces = "timers and file watching go through the scheduler and the one event stream"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['\b(?:NS)?Timer\s*(?:\.init)?\s*\(', '\b(?:NS)?Timer\.(?:scheduledTimer|publish)\w*\b',
+            '\bNSTimer\s+(?:scheduledTimer|timer)\w*', '\bDispatchSource\.make(?:Timer|FileSystemObject)Source\b',
+            '\bDispatchSourceTimer\b', '\bdispatch_source_create\b', '\bDISPATCH_SOURCE_TYPE_(?:TIMER|VNODE)\b',
+            '\b(?:asyncAfter|dispatch_after(?:_f)?)\s*\(', '\bafterDelay:', '\bCFRunLoopTimerCreate\w*\b',
+            '\bEVFILT_(?:TIMER|VNODE)\b', '\bFSEventStreamCreate\b', '\bNSFilePresenter\b',
+            '\bnotify::(?:recommended_watcher|Watcher)\b', '\b(?:Recommended|Poll|Fsevent|FsEvent|Kqueue|Inotify)Watcher\b',
+            '\bTask\.sleep\b', '\b\w*[Cc]lock(?:\(\s*\))?\.sleep\s*\(', '\bthread::sleep\b',
+            '(?<![\w.:])(?:u|nano)?sleep\s*\(', '\b(?:setitimer|timer_create|timer_settime|timer_delete)\s*\(',
+            '(?<![\w.:])alarm\s*\(', '\bthis_thread\s*::\s*sleep_(?:for|until)\b']
+allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/event_loop.rs",
+           "crates/sb-host/src/event_loop.rs", "crates/sb-vt-worker/src/event_loop.rs"]
+control = "let poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }"
+
+[[rule]]
+id = "spawn-outside-scheduler"
+enforces = "one scheduler starts every process; the daemon alone spawns session hosts and their PTY"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['\bCommand::new\b', '\bposix_spawnp?\b', '\bv?fork\s*\(', '\bforkpty\s*\(', '\bexec[lv]p?e?\s*\(',
+            '\b(?:system|popen)\s*\(', '\bProcess\s*(?:\.init)?\s*\(\s*\)', '\bProcess\.(?:run|launchedProcess)\b', '\bSubprocess\s*\.\s*run\b', '\bNSTask\b']
+allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/spawn_host.rs",
+           "crates/sb-host/src/pty.rs"]
+control = 'let _ = std::process::Command::new("ls");'
+
+[[rule]]
+id = "network-outside-update"
+enforces = "network-capable code lives only in the update module"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii", ".modulemap", ".xcconfig", ".pbxproj"]
+patterns = ['\b(?:NS)?URLSession\b', '@?"https?://', '\b(?:Data|String|NSString|NSData)\s*\(\s*contentsOf\s*:',
+            '\bInputStream\s*\(\s*url\s*:', '\b(?:dataWithContentsOfURL|stringWithContentsOfURL|initWithContentsOfURL|inputStreamWithURL)\b', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
+            '\b(?:tokio|mio|async_std|smol|socket2)\s*::\s*net\b', '\bgetaddrinfo\b',
+            '\b(?:gethostbyname2?|gethostbyaddr|getnameinfo|res_n?query|res_n?search|DNSServiceQueryRecord|DNSServiceGetAddrInfo)\b',
+            '\b(?:AF|PF)_INET6?\b', '\bsockaddr_in6?\b', '\bINADDR_(?:ANY|LOOPBACK|BROADCAST|NONE)\b', '\bin6?addr_\w+',
+            '\binet_(?:pton|ntop|addr|aton|ntoa|network|makeaddr)\b', '\bNW(?:Connection|Listener|Browser|PathMonitor|Endpoint|Parameters)\b',
+            '\bnw_(?:connection|listener|browser|endpoint|parameters|path_monitor)_\w+',
+            '\bCF(?:Stream\w*SocketToHost|Host\w*|SocketCreate\w*)\b',
+            '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
+            '#\s*(?:include|import)\s*[<"](?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b',
+            '\blink\s+framework\s+"(?:Network|CFNetwork)"', '\.linkedFramework\s*\(\s*"(?:Network|CFNetwork)"', '-(?:weak_|reexport_|lazy_|needed_)?framework\W+(?:Network|CFNetwork)\b',
+            '\b(?:Network|CFNetwork)\.framework\b']
+ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}"\x27;]*(?:\{[^{}"\x27;]*\}[^{}"\x27;]*)*\}|net\b)']  # Unix domain sockets, however grouped
+spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
+allowed = ["apple/Sources/Update/"]
+control = "let s = URLSession.shared"
+spanning_control = "use std::{\n    io::{Read, Write},\n    net::TcpStream,\n};"
+
+[[rule]]
+id = "engine-outside-adapter"
+enforces = "engine symbols appear only in the engine adapter"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['\b(?i:ghostty)_(?!(?i:surface)_)\w+']  # upper-case constants and a name looked up at run time count too
+allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/"]
+control = "unsafe { ghostty_terminal_new(); }"
+
+[[rule]]
+id = "engine-module-outside-adapter"
+enforces = "only the engine adapter, the surface bridge and TerminalView bring in the engine's module, crate or header"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii", ".modulemap", ".xcconfig", ".pbxproj"]
+patterns = ['^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?i:ghostty)\w*\b',
+            '@import\s+(?i:ghostty)\w*\b', '#\s*(?:include|import)\s*[<"](?i:(?:lib)?ghostty)',
+            '\b(?:use|extern\s+crate)\s+(?:::)?(?:lib)?ghostty\w*\b', '\b(?:lib)?ghostty(?:_vt|_sys)?\s*::',
+            '\blink\s+(?:framework\s+)?"(?i:(?:lib)?ghostty)', '-(?:l|framework\W+)(?i:ghostty)',
+            '\.linked(?:Library|Framework)\s*\(\s*"(?i:(?:lib)?ghostty)']
+allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/", "apple/Sources/TerminalView/"]
+control = "import GhosttyKit"
+
+[[rule]]
+id = "surface-outside-terminalview"
+enforces = "the surface API appears only in TerminalView"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['\b(?i:ghostty_surface)_\w+']
+allowed = ["apple/Sources/TerminalView/"]
+control = "ghostty_surface_new(app, cfg)"
+
+[[rule]]
+id = "include-without-suffix"
+enforces = "a local include names a file with a suffix the source rules read"
+suffixes = [".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['#\s*(?:include|import)\s*"[^".]+"']
+allowed = []
+control = '#include "network_impl"'
+
+[[rule]]
+id = "x86-without-reason"
+enforces = "no x86-specific code path without a stated correctness reason"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['target_arch\s*=\s*"x86(?:_64)?"', '\barch\(\s*(?:x86_64|i386)\s*\)', '__(?:x86_64|i386|amd64)__',
+            '\bstd\s*::\s*arch\s*::\s*x86', '<(?:imm|xmm|emm|pmm|tmm|smm|nmm|wmm|amm|x86|ia32|cpuid)intrin\.h>|<cpuid\.h>',
+            '\b_mm(?:256|512)?_\w+\s*\(',
+            '\bTARGET_CPU_X86(?:_64)?\b', '\b_M_(?:X64|IX86|AMD64)\b', '\bCPU_TYPE_(?:X86_64|X86|I386)\b',
+            '\bNSBundleExecutableArchitectureX86_64\b']
+allowed = []
+reason = "x86-only:"
+control = '#[cfg(target_arch = "x86_64")]'
+
+[[rule]]
+id = "color-outside-design-system"
+enforces = "colors are design-system tokens, defined in DesignSystem only"
+suffixes = [".swift", ".m", ".mm"]
+patterns = ['"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?"', '#colorLiteral\s*\(',
+            '\[\s*(?:NS|UI)Color\s+colorWith\w*:', '\bCGColorCreate\w*\s*\(', '\[\s*(?:NS|UI)Color\s+(?:red|orange|yellow|green|blue|purple|brown|white|gray|black|clear|cyan|magenta|system\w+)Color\b',
+            '(?:\b(?:NS|UI|CG)?Color|(?<![\w])\.init)\(\s*(?:\.\w+\s*,\s*)?(?:\w*[Rr]ed|\w*[Ww]hite|\w*[Hh]ue|hex|\w*[Gg]ray|\w*[Cc]yan|colorSpace|components)\s*:',
+            '\b(?:Color|NSColor|UIColor|CGColor)\.(?:red|orange|yellow|green|mint|teal|cyan|blue|indigo|purple|pink|brown|white|gray|black|clear|magenta|darkGray|lightGray|label|secondaryLabel|tertiaryLabel|quaternaryLabel|primary|secondary|accentColor|system\w+)\b',
+            '\b(?:let|var)\s+\w+\s*:\s*(?:SwiftUI\.)?(?:Color|NSColor|UIColor)\s*=\s*\.\w+',
+            '\.(?:foregroundStyle|foregroundColor|tint|background|fill|stroke|border|accentColor|shadow|overlay)\(\s*(?:\w+\s*:\s*)?\.(?:red|orange|yellow|green|mint|teal|cyan|blue|indigo|purple|pink|brown|white|gray|black|clear)\b']
+allowed = ["apple/Sources/DesignSystem/"]
+control = 'let tint = Color(hex: "#3A7BD5")'
+
+[[rule]]
+id = "spacing-outside-design-system"
+enforces = "spacing values are design-system tokens, defined in DesignSystem only"
+suffixes = [".swift", ".m", ".mm"]
+patterns = ['\bconstraint\w*(?:Constant|EqualTo\w*):\s*-?\d', '\b(?:CGRectMake|NSMakeRect|CGRectInset|NSInsetRect|CGSizeMake|NSMakeSize)\s*\([^)]*?-?\d', '\bconstant\s*=\s*-?\d', '\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?[-+]?\d', '\bspacing:\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\.frame\(\s*(?:width|height|minWidth|minHeight|maxWidth|maxHeight):\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\b(?:NS|NSDirectional|UI)?EdgeInsets\(\s*top:\s*[-+]?\d', '\.(?:offset|position)\(\s*(?:x|y):\s*-?(?:CGFloat\(\s*)?\d',
+            '\b(?:equalToConstant|greaterThanOrEqualToConstant|lessThanOrEqualToConstant|constant|minLength):\s*-?(?:CGFloat\(\s*)?\d',
+            '\.(?:cornerRadius|lineSpacing|kerning|tracking)\(\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\.(?:spacing|constant|edgeInsets|cornerRadius|lineSpacing|borderWidth)\s*=\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\.frame\([^)]*\b(?:width|height|minWidth|minHeight|maxWidth|maxHeight|idealWidth|idealHeight):\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\b(?:let|var)\s+\w*(?:[Ss]pacing|[Pp]adding|[Ii]nset|[Gg]ap|[Mm]argin|[Gg]utter)\w*\s*(?::\s*\w+)?\s*=\s*(?:CGFloat\(\s*)?-?\d',
+            '\b(?:let|var)\s+\w+\s*:\s*CGFloat\s*=\s*-?\d',
+            '\b(?:let|var)\s+\w+\s*(?::\s*\w+)?\s*=\s*CGFloat\(\s*[-+]?\d']
+allowed = ["apple/Sources/DesignSystem/"]
+control = "Text(name).padding(12)"
+
+[[rule]]
+id = "control-outside-design-system"
+enforces = "controls come from the design system, never built raw"
+suffixes = [".swift", ".m", ".mm"]
+patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox|TextField|SecureTextField|SearchField|TokenField|ColorWell|DatePicker|PathControl|LevelIndicator|Matrix|TextView)\s*(?:\.init)?\s*\(',
+            '\bNSButton\.(?:checkbox|radioButton)WithTitle\b',
+            '\[\s*(?:\[\s*)?UI(?:Button|Switch|Slider|Stepper|SegmentedControl|TextField|TextView|DatePicker|ColorWell)\s+(?:alloc|new|\w+With\w*:)',
+            '\bUI(?:Button|Switch|Slider|Stepper|SegmentedControl|TextField|TextView|DatePicker|ColorWell)\s*(?:\.init)?\s*\(',
+            '\[\s*(?:\[\s*)?NS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox|TextField|SecureTextField|SearchField|TokenField|ColorWell|DatePicker|PathControl|LevelIndicator|Matrix|TextView)\s+(?:alloc|new|\w+With\w*:)', '\bNSTextField\.(?:label|wrappingLabel)WithString\b',
+            '(?<![\w.])(?<!struct )(?<!class )(?<!enum )(?<!extension )(?<!protocol )(?<!actor )(?<!typealias )(?:SwiftUI\.)?(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*(?:<[^>\n]*>)?\s*(?:\.init)?\s*[({]']
+allowed = ["apple/Sources/DesignSystem/"]
+control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
+
+# Native source the rules above cannot read. A tracked file in one of these languages is refused outside the
+# engine adapter, where the pinned engine's own source may be vendored, so no rule is passed by changing language.
+# Suffixes are compared without case, here and in every rule.
+[languages]
+enforces = "native code is written only in languages the source rules read"
+unread = [".zig", ".go", ".java", ".kt", ".kts", ".cs", ".d", ".nim", ".odin", ".s", ".asm", ".f90", ".pas", ".ada"]
+allowed = ["crates/sb-engine-vt/"]
+
+# Scripts are tooling: they live with the tools, the CI, the git hooks and the site, never where they could ship.
+# A tracked file with no known suffix that starts with #! counts as a script too.
+[scripts]
+enforces = "scripts live in tools, CI and the site, never in shipped code"
+unread = [".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".lua"]
+allowed = ["tools/", ".github/", ".githooks/", "docs/"]
+
+# Shaders live with the renderer, which sits behind TerminalView; a renderer module of its own moves this path.
+[shaders]
+enforces = "GPU shaders are written only in the renderer"
+unread = [".metal"]
+allowed = ["apple/Sources/TerminalView/"]
+
+# The link gate (P0.9.4). libghostty-vt runs only in the per-session vt worker: the supervisor, session
+# host, attach client and CLI binaries carry no engine symbol. The GUI's one input view encodes keys with
+# libghostty-vt's key encoder, so the GUI may carry that API alone: the encoder and the key events it
+# encodes (ghostty_key_encoder_*, ghostty_key_event_*, as the libghostty-vt C headers name them).
+[link]
+enforces = "the engine runs only in the vt worker; the GUI uses only its key encoder"
+engine_prefix = "ghostty_"
+daemon_binaries = ["sb-supervisor", "sb-host", "sb-attach", "sb-cli"]
+gui_binaries = ["Shellborne"]
+gui_allowed_prefixes = ["ghostty_key_encoder_", "ghostty_key_event_"]
+engine_libraries = ["libghostty-vt.dylib", "GhosttyKit"]  # the engine's own images by exact file name: the GUI skips only these
+
+# The network scan (P0.9.6). Every Mach-O in the build folder except the update module's binary is read for a
+# getaddrinfo symbol and for a link to CFNetwork or the Network framework.
+[network]
+enforces = "nothing outside the update module resolves names or links a network framework"
+update_binaries = ["ShellborneUpdate"]  # exact paths relative to the build folder, never a name found elsewhere
+forbidden_symbols = ["getaddrinfo", "gethostbyname", "gethostbyname2", "getnameinfo", "inet_pton", "inet_addr", "inet_aton"]
+forbidden_frameworks = ["Network.framework", "CFNetwork.framework"]
