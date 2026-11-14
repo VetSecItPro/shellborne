@@ -80,6 +80,12 @@ jobs:
       - name: Who frees at the C seam
         run: tools/gates/who-frees .
 
+      - name: Build settings target macOS 26 on both architectures
+        run: tools/gates/build-settings .
+
+      - name: No calendar dates in the Intel policy
+        run: tools/gates/term-lint .
+
       - name: Hidden characters, dashes, copy, pins, denied calls and bypass flags, with their tables from the base commit
         env:
           BASE: ${{ github.event.pull_request.base.sha }}

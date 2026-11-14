@@ -1,0 +1,155 @@
+"""The Mach-O reader and walker that link-check, lipo and build-settings share (plan steps P0.9.4 and P0.12.3).
+
+Not a gate: each gate loads this file from beside itself and builds one Reader with its own caps, so the caps stay
+in the gate that states them. One magic set, one bounded walk and one bounded tool runner, never a second copy.
+
+A Mach-O is known by its first four bytes, read with a no-follow and non-blocking open, never by name, suffix or
+execute bit. The walk streams the folder with no symlink followed: a symlink inside the folder is skipped, since its
+target is reached where it lives, and a symlink out of the folder or a directory that cannot be read is broken.
+Every scan is bounded by the Reader's caps on files walked, bytes per binary, bytes from one tool run and seconds for
+the whole run. File names are printed with control and non-ASCII characters escaped.
+"""
+import os
+import pathlib
+import selectors
+import stat
+import subprocess
+import time
+
+THIN = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"}  # thin, both byte orders
+UNIVERSAL = {b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}  # 32 and 64-bit
+
+
+class Broken(Exception):
+    pass
+
+
+class Collected:
+    """The first cap refusals, kept; every refusal, counted."""
+    def __init__(self, cap):
+        self.cap, self.kept, self.total = cap, [], 0
+
+    def add(self, item):
+        self.total += 1
+        if len(self.kept) < self.cap:
+            self.kept.append(item)
+
+
+def shown(name):
+    """A name safe to print: control, backslash and non-ASCII characters escaped, so a name cannot forge a line."""
+    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape", "backslashreplace").decode("ascii")
+                   for c in name)
+
+
+class Reader:
+    """One run's bounded reads, with the calling gate's caps and a deadline that starts when the Reader is made."""
+    def __init__(self, max_files, max_binary_bytes, max_output, max_seconds, place):
+        self.max_files, self.max_binary_bytes = max_files, max_binary_bytes
+        self.max_output, self.max_seconds, self.place = max_output, max_seconds, place
+        self.start = time.monotonic()
+
+    def remaining(self):
+        left = self.start + self.max_seconds - time.monotonic()
+        if left <= 0:
+            raise Broken(f"the run passed its cap of {self.max_seconds} seconds")
+        return left
+
+    def regular(self, path):
+        """A regular file under the cap, never a symlink."""
+        try:
+            info = os.lstat(path)
+        except OSError as error:
+            raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
+        if not stat.S_ISREG(info.st_mode):
+            raise Broken(f"{shown(path.name)} is not a regular file (a symlink is never followed)")
+        if info.st_size > self.max_binary_bytes:
+            raise Broken(f"{shown(path.name)} is over the {self.max_binary_bytes}-byte cap for a binary")
+        return path
+
+    def magic(self, path):
+        try:
+            handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                return os.read(handle, 4)
+            finally:
+                os.close(handle)
+        except OSError as error:
+            raise Broken(f"cannot read {shown(path.name)}: {error.strerror}")  # an unreadable candidate is never skipped
+
+    def is_mach_o(self, path):
+        return self.magic(path) in THIN | UNIVERSAL
+
+    def is_universal(self, path):
+        return self.magic(path) in UNIVERSAL
+
+    def run(self, command):
+        """Run a tool with its output capped at max_output bytes and its time capped by the run's deadline."""
+        try:
+            child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     stdin=subprocess.DEVNULL)
+        except OSError as error:
+            raise Broken(f"{command[0]} could not run: {error.strerror}")
+        chunks, size = [], 0
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                while True:
+                    if not selector.select(timeout=min(self.remaining(), 120)):
+                        raise Broken(f"{command[0]} did not finish in time")
+                    chunk = os.read(child.stdout.fileno(), 1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > self.max_output:
+                        raise Broken(f"{command[0]} printed over the {self.max_output}-byte cap")
+                    chunks.append(chunk)
+            code = child.wait(timeout=min(self.remaining(), 120))
+        except subprocess.TimeoutExpired:
+            raise Broken(f"{command[0]} did not finish in time")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            child.stdout.close()
+        return code, b"".join(chunks).decode("utf-8", "replace")
+
+    def archs(self, path):
+        """The slices lipo reports for a Mach-O; a file lipo cannot read, or one with no slice, is broken."""
+        code, out = self.run(["lipo", "-archs", str(path)])
+        found = out.split()
+        if code != 0 or not found:
+            raise Broken(f"lipo cannot read {shown(path.name)}")
+        return found
+
+    def candidates(self, folder):
+        """Every regular file under the folder, read as a stream with no symlink followed, at most max_files entries
+        seen. A symlink that leaves the folder, or a directory that cannot be read, is broken; a symlink inside the
+        folder is skipped, since its target is reached where it lives."""
+        root = pathlib.Path(folder).resolve()
+        found, seen, stack = [], 0, [pathlib.Path(folder)]
+        while stack:
+            self.remaining()
+            top = stack.pop()
+            try:
+                entries = os.scandir(top)
+            except OSError as error:
+                raise Broken(f"cannot read {shown(str(top))}: {error.strerror}")
+            with entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > self.max_files:
+                        raise Broken(f"{shown(str(folder))} holds over the {self.max_files}-file cap")
+                    path = pathlib.Path(entry.path)
+                    try:
+                        if entry.is_symlink():
+                            if not path.resolve().is_relative_to(root):
+                                raise Broken(f"{shown(str(path.relative_to(folder)))} is a symlink out of the "
+                                             f"{self.place}")
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(path)
+                        elif entry.is_file(follow_symlinks=False):
+                            found.append(path)
+                    except OSError as error:
+                        raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
+        return sorted(found)

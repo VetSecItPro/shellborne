@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Build settings gate: while Intel is supported, every build targets macOS 26 for both slices (plan step P0.12.4).
+
+Usage: build-settings <repo> [--stub <bundle>]
+
+Reads the tracked settings text of <repo> (git ls-files, through the bounded reader in repo-rules beside this file):
+apple/Package.swift and any other tracked Package.swift, every .xcconfig and .pbxproj, .cargo/config.toml, and every
+tracked script and workflow (a script suffix, a build file name, or a first line starting with #!). Every occurrence
+is judged, not only the project-level one, so an override in one target or one configuration is caught:
+    deployment-target          a deployment target that is not exactly macOS 26: a Package.swift platform, an
+                               xcconfig or project setting, an environment assignment, or a raw minimum-version or
+                               target-triple flag in unsafeFlags, a rustflag, a script or a workflow
+    missing-deployment-target  apple/Package.swift untracked, or with no macOS platform
+    archs                      an ARCHS that does not name exactly arm64 and x86_64 ($(ARCHS_STANDARD) included)
+    excluded-archs             an EXCLUDED_ARCHS naming either slice, conditional or not
+    only-active-arch           ONLY_ACTIVE_ARCH = YES outside a Debug configuration
+In an xcconfig or project file the value must be the literal 26; in a script or workflow only a literal value is
+judged, since a value computed when the build runs is out of reach. That is what --stub is for: it walks the built
+bundle with the Mach-O reader in mach-o-reader (the one lipo and link-check use), and every slice of every Mach-O
+must carry a macOS build version with a minimum of exactly 26, or is refused as slice-minimum, naming the slice. A
+bundle with no Mach-O is not run, never clean.
+
+A refusal reads "build-settings: refused <rule>: <file>[:<line>]" and never quotes the source, with control and
+non-ASCII characters in the name escaped. Every read is bounded: repo-rules' caps on tracked names and bytes per
+file, MAX_DEPTH nested braces in a project file, MAX_FILES entries walked, MAX_BINARY_BYTES per binary, MAX_OUTPUT
+bytes from one tool run, MAX_SECONDS for the stub read, and at most MAX_FINDINGS refusals kept, the rest counted.
+Exit 0 clean, 1 refused, 2 broken or not run.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import stat
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+SOURCE_READER = HERE / "repo-rules"
+SHARED = HERE / "mach-o-reader"
+GATE = "build-settings"
+PACKAGE = "apple/Package.swift"
+SLICES = {"arm64", "x86_64"}
+MAX_DEPTH = 64
+MAX_FILES = 200000
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_OUTPUT = 16 * 1024 * 1024
+MAX_SECONDS = 1800
+MAX_FINDINGS = 1000
+SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".fish", ".command", ".py", ".rb", ".pl", ".mk", ".yml", ".yaml")
+SCRIPT_NAMES = ("Makefile", "GNUmakefile", "justfile", "build.rs", ".envrc")
+NAME = "MACOSX_DEPLOYMENT" + "_TARGET"  # split so this file's own text never reads as an assignment
+ASSIGNED = re.compile(NAME + r"(?:\[[^\]\n]*\])*[\"'\]]*\s*[:=]\s*(?:\{[^}\n]*?\bvalue\s*=\s*)?[\"']?(?P<v>[^\s\"';,}]*)")
+MIN_FLAG = re.compile(r"-m(?:macosx|macos)-version-min=[\"']?(?P<v>[^\s\"',)\]]*)")
+TRIPLE = re.compile(r"\b(?:arm64e?|arm64_32|aarch64|x86_64h?|i386)-apple-macos(?:x)?(?P<v>[0-9][0-9.]*)")
+PLATFORM = re.compile(r"\.macOS\(")
+PLATFORM_FORM = re.compile(r"\.macOS\(\s*(?:\"(?P<s>[^\"\n]*)\"|\.v(?P<v>[0-9]+)(?:_(?P<m>[0-9]+))?)\s*\)")
+SETTING = re.compile(r"^\s*\"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P<cond>(?:\[[^\]\n]*\])*)\"?\s*=\s*(?P<value>.*?)\s*;?\s*$")
+
+
+def load(name, path):
+    """A module beside this file, loaded without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    try:
+        loader = importlib.machinery.SourceFileLoader(name, str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"{GATE}: broken: cannot load {path.name}: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+RR = load("repo_rules", SOURCE_READER)
+MO = load("mach_o_reader", SHARED)
+BROKEN = (RR.Broken, MO.Broken)
+
+
+def exact_26(value):
+    """True for 26, 26.0 or 26.0.0 and nothing else."""
+    parts = value.split(".")
+    return 1 <= len(parts) <= 3 and parts[0] == "26" and all(p == "0" for p in parts[1:])
+
+
+def tokens(value):
+    return [t for t in re.split(r"[\s,()\"']+", value) if t]
+
+
+def flag_findings(line):
+    """A raw minimum-version flag or versioned target triple on a line, wherever it appears, whose literal version is
+    not 26. A flag that takes its version from a setting is skipped, since the setting itself is judged."""
+    return any(not exact_26(m.group("v").rstrip(".")) for pattern in (MIN_FLAG, TRIPLE) for m in pattern.finditer(line)
+               if m.group("v")[:1].isdigit())
+
+
+def literal_assignments(line):
+    """Each literal value assigned to the deployment target on a script or workflow line; a reference is skipped."""
+    return [m.group("v") for m in ASSIGNED.finditer(line) if m.group("v")[:1].isdigit()]
+
+
+def judge_package(name, text, found):
+    platforms = 0
+    for number, line in enumerate(text.splitlines(), 1):
+        where = f"{RR.shown(name)}:{number}"
+        for match in PLATFORM.finditer(line):
+            platforms += 1
+            form = PLATFORM_FORM.match(line, match.start())
+            if not form:
+                found.add(("deployment-target", where))
+            elif form.group("s") is not None:
+                if not exact_26(form.group("s")):
+                    found.add(("deployment-target", where))
+            elif form.group("v") != "26" or form.group("m") not in (None, "0"):
+                found.add(("deployment-target", where))
+        if flag_findings(line):
+            found.add(("deployment-target", where))
+    if name == PACKAGE and not platforms:
+        found.add(("missing-deployment-target", RR.shown(name)))
+
+
+def judge_setting(key, value, debug, where, found):
+    """One xcconfig or project setting. The deployment target must be the literal 26 here."""
+    if key == NAME and not exact_26(value.strip("\"'")):
+        found.add(("deployment-target", where))
+    elif key == "ARCHS" and sorted(tokens(value)) != sorted(SLICES):
+        found.add(("archs", where))
+    elif key == "EXCLUDED_ARCHS" and SLICES & set(tokens(value)):
+        found.add(("excluded-archs", where))
+    elif key == "ONLY_ACTIVE_ARCH" and value.strip("\"'").upper() == "YES" and not debug:
+        found.add(("only-active-arch", where))
+    if flag_findings(value):
+        found.add(("deployment-target", where))
+
+
+def judge_xcconfig(name, text, found):
+    file_debug = pathlib.PurePosixPath(name).name.lower().startswith("debug")
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("//", 1)[0]
+        setting = SETTING.match(line)
+        if not setting or line.lstrip().startswith("#"):
+            continue
+        cond = setting.group("cond").lower()
+        debug = file_debug or "config=debug" in cond
+        judge_setting(setting.group("key"), setting.group("value"), debug, f"{RR.shown(name)}:{number}", found)
+
+
+def without_comments(line, state):
+    """A project file line with /* */ comments removed outside quoted strings, and its braces outside strings, in
+    order. state carries an open comment across lines."""
+    out, braces, at, quoted = [], [], 0, False
+    while at < len(line):
+        if state["comment"]:
+            end = line.find("*/", at)
+            if end < 0:
+                return "".join(out), braces
+            state["comment"], at = False, end + 2
+            continue
+        char = line[at]
+        if quoted:
+            out.append(char)
+            if char == "\\" and at + 1 < len(line):
+                out.append(line[at + 1])
+                at += 1
+            elif char == '"':
+                quoted = False
+        elif line.startswith("/*", at):
+            state["comment"], at = True, at + 2
+            continue
+        elif line.startswith("//", at):
+            break
+        else:
+            out.append(char)
+            if char == '"':
+                quoted = True
+            elif char in "{}":
+                braces.append((char, "".join(out)))
+        at += 1
+    return "".join(out), braces
+
+
+def judge_pbxproj(name, text, found):
+    """Every setting in every XCBuildConfiguration, with that configuration's name deciding Debug."""
+    stack, state, pending = [], {"comment": False}, None
+    for number, raw in enumerate(text.splitlines(), 1):
+        line, braces = without_comments(raw, state)
+        if pending:  # a parenthesized list value, read to its close
+            pending["value"] += " " + line
+            if ")" in line:
+                stack[-1]["settings"].append((pending["key"], pending["value"], pending["line"]))
+                pending = None
+            continue
+        if not braces and stack:
+            top = stack[-1]
+            if re.search(r"\bisa\s*=\s*XCBuildConfiguration\s*;", line):
+                top["isa"] = True
+            named = re.match(r"^\s*name\s*=\s*\"?([^\";]*)\"?\s*;", line)
+            if named:
+                top["name"] = named.group(1)
+            if top["settings_of"] is not None:
+                setting = SETTING.match(line)
+                if setting:
+                    entry = {"key": setting.group("key"), "value": setting.group("value"), "line": number}
+                    if entry["value"].startswith("(") and ")" not in entry["value"]:
+                        pending = entry
+                    else:
+                        top["settings"].append((entry["key"], entry["value"], number))
+            continue
+        for brace, before in braces:
+            if brace == "{":
+                if len(stack) >= MAX_DEPTH:
+                    raise RR.Broken(f"{RR.shown(name)} nests over the {MAX_DEPTH}-brace cap")
+                is_settings = bool(re.search(r"\bbuildSettings\s*=\s*\{$", before))
+                stack.append({"isa": False, "name": None, "settings": [], "settings_of": stack[-1] if is_settings
+                              and stack else None})
+            elif stack:
+                frame = stack.pop()
+                if frame["settings_of"] is not None:
+                    frame["settings_of"]["settings"].extend(frame["settings"])
+                elif frame["isa"]:
+                    debug = (frame["name"] or "").lower().startswith("debug")
+                    for key, value, line_number in frame["settings"]:
+                        judge_setting(key, value, debug, f"{RR.shown(name)}:{line_number}", found)
+
+
+def judge_script(name, text, found):
+    for number, line in enumerate(text.splitlines(), 1):
+        if any(not exact_26(v.rstrip(".")) for v in literal_assignments(line)) or flag_findings(line):
+            found.add(("deployment-target", f"{RR.shown(name)}:{number}"))
+
+
+def is_script(repo, name):
+    base = pathlib.PurePosixPath(name).name
+    if name.startswith(".github/workflows/") or base.endswith(SCRIPT_SUFFIXES) or base in SCRIPT_NAMES:
+        return True
+    if name.endswith((".cargo/config.toml", ".cargo/config")):
+        return True
+    try:
+        info = os.lstat(pathlib.Path(repo) / name)
+    except OSError as error:
+        raise RR.Broken(f"cannot read {RR.shown(name)}: {error.strerror}")
+    return stat.S_ISREG(info.st_mode) and RR.starts_with_shebang(repo, name)
+
+
+def judge_repo(repo, found):
+    names = RR.tracked(repo)
+    if PACKAGE not in names:
+        found.add(("missing-deployment-target", PACKAGE))
+    for name in names:
+        base = pathlib.PurePosixPath(name).name
+        if base == "Package.swift":
+            judge_package(name, RR.read_source(repo, name), found)
+        elif base.endswith(".xcconfig"):
+            judge_xcconfig(name, RR.read_source(repo, name), found)
+        elif base.endswith(".pbxproj"):
+            judge_pbxproj(name, RR.read_source(repo, name), found)
+        elif is_script(repo, name):
+            judge_script(name, RR.read_source(repo, name), found)
+
+
+def slice_minimums(read, path, arch):
+    """The macOS minimums one slice declares: each LC_BUILD_VERSION for macOS, and any older LC_VERSION_MIN_MACOSX."""
+    code, out = read.run(["otool", "-arch", arch, "-l", str(path)])
+    if code != 0:
+        raise MO.Broken(f"otool cannot read the {MO.shown(arch)} slice of {MO.shown(path.name)}")
+    lines, minimums = [line.split() for line in out.splitlines()], []
+    for at, words in enumerate(lines):
+        if words == ["cmd", "LC_BUILD_VERSION"]:
+            fields = dict(w[:2] for w in lines[at + 1:at + 6] if len(w) >= 2)
+            if fields.get("platform", "").upper() in ("1", "MACOS"):
+                minimums.append(fields.get("minos", ""))
+        elif words == ["cmd", "LC_VERSION_MIN_MACOSX"]:
+            fields = dict(w[:2] for w in lines[at + 1:at + 4] if len(w) >= 2)
+            minimums.append(fields.get("version", ""))
+    return minimums
+
+
+def judge_stub(bundle, found):
+    read = MO.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT, MAX_SECONDS, place="bundle")
+    try:
+        info = os.lstat(bundle)
+    except OSError as error:
+        raise MO.Broken(f"cannot read {MO.shown(str(bundle))}: {error.strerror}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise MO.Broken(f"{MO.shown(str(bundle))} is not a bundle folder (a symlink is never followed)")
+    judged = 0
+    for path in read.candidates(bundle):
+        read.remaining()
+        if not read.is_mach_o(path):
+            continue
+        read.regular(path)
+        judged += 1
+        rel = MO.shown(path.relative_to(bundle).as_posix())
+        for arch in read.archs(path):
+            minimums = slice_minimums(read, path, arch)
+            if not minimums or not all(exact_26(m) for m in minimums):
+                found.add(("slice-minimum", f"{rel} {MO.shown(arch)}"))
+    if not judged:
+        raise MO.Broken(f"not run: no Mach-O in {MO.shown(str(bundle))}")
+
+
+def main(argv):
+    try:
+        args = argv[1:]
+        stub = None
+        if len(args) == 3 and args[1] == "--stub":
+            stub = pathlib.Path(args[2])
+        elif len(args) != 1 or args[0].startswith("-"):
+            raise MO.Broken("usage: build-settings <repo> [--stub <bundle>]")
+        found = MO.Collected(MAX_FINDINGS)
+        judge_repo(args[0], found)
+        if stub is not None:
+            judge_stub(stub, found)
+    except BROKEN as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    for rule, where in found.kept:
+        print(f"{GATE}: refused {rule}: {where}")
+    if found.total > len(found.kept):
+        print(f"{GATE}: {found.total} refusals in all, {found.total - len(found.kept)} not listed")
+    return 1 if found.total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
