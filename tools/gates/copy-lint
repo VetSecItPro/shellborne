@@ -63,7 +63,7 @@ REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 WORD = re.compile(r"[A-Za-z]+")
 CLI_SOURCES = "crates/sb-cli/src/"
 PROSE_FILES = ("README.md", "CONTRIBUTING.md")
-SPARKLE_CHAR = "✨"
+SPARKLE_CHAR = "\u2728"
 SPARKLE = re.compile(r"sparkle", re.IGNORECASE)
 FRAMEWORK = "Sparkle"  # the updater framework's name is not an icon
 UI_CALL = re.compile(
@@ -80,7 +80,7 @@ ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"', "'": "'", "\\":
 CONTROLS = {
     "forbidden-term": "Title\nShellborne is a security product.\n",
     "british-spelling": "Theme\nPick a colour theme.\n",
-    "sparkle-icon": 'import SwiftUI\nlet badge = Image(systemName: "sparkles")\n// done ✨\n',
+    "sparkle-icon": 'import SwiftUI\nlet badge = Image(systemName: "sparkles")\n// done \u2728\n',
     "ui-literal": 'import SwiftUI\nlet view = Text("Open the control pane")\n',
 }
 CONTROL_NAMES = {"forbidden-term": "docs/control.md", "british-spelling": "docs/control.md",

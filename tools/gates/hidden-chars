@@ -54,9 +54,9 @@ SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
 REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 
 # Known-bad control: an instruction-file fixture with a right-to-left override and a tag letter, on lines 2 and 3.
-CONTROL = "# Build\nRun the gates.‮ Then stop.\nRule\U000e0041 two.\n"
+CONTROL = "# Build\nRun the gates.\u202e Then stop.\nRule\U000e0041 two.\n"
 CONTROL_LINES = {2, 3}
-DASH_CONTROL = "Line one\nOpen a pane — then run.\n"
+DASH_CONTROL = "Line one\nOpen a pane \u2014 then run.\n"
 
 
 def reader():
