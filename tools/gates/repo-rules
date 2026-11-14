@@ -81,7 +81,8 @@ def load_table(path=None):
     return rules, load_languages(path, data, rules)
 
 
-LANGUAGE_TABLES = (("languages", LANGUAGE_RULE), ("scripts", SCRIPT_RULE))
+SHADER_RULE = "shader-outside-renderer"
+LANGUAGE_TABLES = (("languages", LANGUAGE_RULE), ("scripts", SCRIPT_RULE), ("shaders", SHADER_RULE))
 
 
 def load_languages(path, data, rules):
@@ -270,19 +271,25 @@ def starts_with_shebang(repo, name):
         raise Broken(f"cannot read {shown(name)}: {error.strerror}")
 
 
-CONTINUES = ("::", ".")
+CONTINUES = ("::", ".", "(")  # a line ending in an open parenthesis continues its call
+OPENS = ("::", ".", "(")
 
 
 def joined_lines(lines):
-    """Lines with continuations joined: a line ending in, or a next line starting with, :: or . is joined to its
-    neighbor without the break, so a call or path split at a separator reads as one line. Yields (first line
-    index, joined text) only for groups of two or more lines."""
+    """Lines with continuations joined: a line ending in ::, . or (, or a next line starting with ::, . or (, is joined
+    to its neighbor without the break, so a call or path split at a separator or before its parenthesis reads as
+    one line; a line ending in a backslash splices with the next as the C preprocessor does, so a name split by a
+    continuation reads whole. Yields (first line index, joined text) only for groups of two or more lines."""
     index = 0
     while index < len(lines):
         start, text = index, lines[index]
-        while index + 1 < len(lines) and (text.rstrip().endswith(CONTINUES) or lines[index + 1].lstrip().startswith(CONTINUES)):
+        while index + 1 < len(lines) and (text.rstrip().endswith(CONTINUES) or text.endswith("\\")
+                                           or lines[index + 1].lstrip().startswith(OPENS)):
             index += 1
-            text = text.rstrip() + lines[index].strip()
+            if text.endswith("\\"):
+                text = text[:-1] + lines[index]  # a preprocessor splice: no space, the name continues
+            else:
+                text = text.rstrip() + lines[index].strip()
         if index > start:
             yield start, text
         index += 1

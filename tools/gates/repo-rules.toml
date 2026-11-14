@@ -46,7 +46,7 @@ patterns = ['\b(?:NS)?URLSession\b', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as
             '\bCF(?:Stream\w*SocketToHost|Host\w*|SocketCreate\w*)\b',
             '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
             '#\s*(?:include|import)\s*[<"](?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b',
-            '\blink\s+framework\s+"(?:Network|CFNetwork)"', '-(?:weak_|reexport_|lazy_|needed_)?framework\W+(?:Network|CFNetwork)\b',
+            '\blink\s+framework\s+"(?:Network|CFNetwork)"', '\.linkedFramework\s*\(\s*"(?:Network|CFNetwork)"', '-(?:weak_|reexport_|lazy_|needed_)?framework\W+(?:Network|CFNetwork)\b',
             '\b(?:Network|CFNetwork)\.framework\b']
 ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|net\b)']  # Unix domain sockets, however grouped
 spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
@@ -145,6 +145,12 @@ allowed = ["crates/sb-engine-vt/"]
 enforces = "scripts live in tools, CI and the site, never in shipped code"
 unread = [".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".lua"]
 allowed = ["tools/", ".github/", ".githooks/", "docs/"]
+
+# Shaders live with the renderer, which sits behind TerminalView; a renderer module of its own moves this path.
+[shaders]
+enforces = "GPU shaders are written only in the renderer"
+unread = [".metal"]
+allowed = ["apple/Sources/TerminalView/"]
 
 # The link gate (P0.9.4). libghostty-vt runs only in the per-session vt worker: the supervisor, session
 # host, attach client and CLI binaries carry no engine symbol. The GUI's one input view encodes keys with
