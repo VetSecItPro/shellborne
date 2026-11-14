@@ -10,8 +10,8 @@ enforces = "timers and file watching go through the scheduler and the one event 
 suffixes = [".swift", ".rs"]
 patterns = ['\bTimer\.(?:scheduledTimer|publish)\b', '\bDispatchSource\.make(?:Timer|FileSystemObject)Source\b',
             '\bFSEventStreamCreate\b', '\bnotify::(?:recommended_watcher|Watcher)\b']
-allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/",
-           "crates/sb-host/", "crates/sb-vt-worker/"]
+allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/event_loop.rs",
+           "crates/sb-host/src/event_loop.rs", "crates/sb-vt-worker/src/event_loop.rs"]
 control = "let poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }"
 
 [[rule]]
@@ -19,23 +19,24 @@ id = "spawn-outside-scheduler"
 enforces = "one scheduler starts every process; the daemon alone spawns session hosts and their PTY"
 suffixes = [".swift", ".rs"]
 patterns = ['\bCommand::new\b', '\bposix_spawnp?\b', '\bfork\s*\(', '\bProcess\s*\(\s*\)', '\bNSTask\b']
-allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/",
-           "crates/sb-host/"]
+allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/spawn_host.rs",
+           "crates/sb-host/src/pty.rs"]
 control = 'let _ = std::process::Command::new("ls");'
 
 [[rule]]
 id = "network-outside-update"
 enforces = "network-capable code lives only in the update module"
-suffixes = [".swift", ".rs", ".c", ".h"]
-patterns = ['\bURLSession\b', '\bstd::net\b', '\bgetaddrinfo\b', '^\s*import\s+(?:Network|CFNetwork)\b',
-            '#\s*(?:include|import)\s*<(?:Network|CFNetwork)/']
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm"]
+patterns = ['\bURLSession\b', '\bstd\s*::\s*(?:\{[^}]*\bnet\b|net\b)', '\bgetaddrinfo\b',
+            '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
+            '#\s*(?:include|import)\s*<(?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b']
 allowed = ["apple/Sources/Update/"]
 control = "let s = URLSession.shared"
 
 [[rule]]
 id = "engine-outside-adapter"
 enforces = "engine symbols appear only in the engine adapter"
-suffixes = [".swift", ".rs", ".c", ".h"]
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm"]
 patterns = ['\bghostty_(?!surface_)\w+']
 allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/", "apple/Sources/TerminalView/"]
 control = "unsafe { ghostty_terminal_new(); }"
@@ -43,9 +44,9 @@ control = "unsafe { ghostty_terminal_new(); }"
 [[rule]]
 id = "surface-outside-terminalview"
 enforces = "the surface API appears only in TerminalView"
-suffixes = [".swift", ".rs", ".c", ".h"]
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm"]
 patterns = ['\bghostty_surface_\w+']
-allowed = ["apple/Sources/TerminalView/", "apple/Sources/EngineSurface/"]
+allowed = ["apple/Sources/TerminalView/"]
 control = "ghostty_surface_new(app, cfg)"
 
 [[rule]]
@@ -69,7 +70,9 @@ control = 'let tint = Color(hex: "#3A7BD5")'
 id = "spacing-outside-design-system"
 enforces = "spacing values are design-system tokens, defined in DesignSystem only"
 suffixes = [".swift"]
-patterns = ['\.padding\(\s*(?:\.\w+\s*,\s*)?\d', '\bspacing:\s*\d', '\.frame\(\s*(?:width|height):\s*\d']
+patterns = ['\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?\d', '\bspacing:\s*(?:CGFloat\(\s*)?\d',
+            '\.frame\(\s*(?:width|height|minWidth|minHeight|maxWidth|maxHeight):\s*(?:CGFloat\(\s*)?\d',
+            '\bNSEdgeInsets\(\s*top:\s*\d']
 allowed = ["apple/Sources/DesignSystem/"]
 control = "Text(name).padding(12)"
 
@@ -77,7 +80,9 @@ control = "Text(name).padding(12)"
 id = "control-outside-design-system"
 enforces = "controls come from the design system, never built raw"
 suffixes = [".swift"]
-patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox)\s*\(']
+patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox)\s*\(',
+            '\bNSButton\.(?:checkbox|radioButton)WithTitle\b',
+            '(?<![\w.])(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu)\s*\(']
 allowed = ["apple/Sources/DesignSystem/"]
 control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
 
@@ -96,6 +101,6 @@ gui_allowed_prefixes = ["ghostty_key_encoder_", "ghostty_key_event_"]
 # getaddrinfo symbol and for a link to CFNetwork or the Network framework.
 [network]
 enforces = "nothing outside the update module resolves names or links a network framework"
-update_binaries = ["ShellborneUpdate"]
+update_binaries = ["ShellborneUpdate"]  # exact paths relative to the build folder, never a name found elsewhere
 forbidden_symbols = ["getaddrinfo"]
 forbidden_frameworks = ["Network.framework", "CFNetwork.framework"]

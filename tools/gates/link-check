@@ -35,19 +35,27 @@ def table():
     return link
 
 
-MACH_O = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"}
+MACH_O = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # thin, both byte orders
+          b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}  # universal, 32 and 64-bit
 
 
 def is_mach_o(path):
     try:
         with open(path, "rb") as handle:
             return handle.read(4) in MACH_O
-    except OSError:
-        return False
+    except OSError as error:
+        raise Broken(f"cannot read {path.name}: {error}")  # an unreadable candidate is never skipped
+
+
+def run(command):
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Broken(f"{command[0]} could not run: {error}")
 
 
 def linked(path):
-    listed = subprocess.run(["otool", "-L", str(path)], capture_output=True, text=True, timeout=120)
+    listed = run(["otool", "-L", str(path)])
     if listed.returncode != 0:
         raise Broken(f"otool cannot read {path.name}")
     return listed.stdout
@@ -64,18 +72,19 @@ def network(folder):
     found, read = [], 0
     for path in sorted(p for p in folder.rglob("*") if p.is_file() and is_mach_o(p)):
         read += 1
-        if path.name in net["update_binaries"]:
+        rel = path.relative_to(folder).as_posix()
+        if rel in net["update_binaries"]:  # the update module only at its exact path, never by a name found elsewhere
             continue
-        found += [("network-in-binary", f"{path.name} {s}") for s in sorted(symbols(path)) if s in net["forbidden_symbols"]]
+        found += [("network-in-binary", f"{rel} {s}") for s in sorted(symbols(path)) if s in net["forbidden_symbols"]]
         libraries = linked(path)
-        found += [("network-in-binary", f"{path.name} {f}") for f in net["forbidden_frameworks"] if f"/{f}/" in libraries]
+        found += [("network-in-binary", f"{rel} {f}") for f in net["forbidden_frameworks"] if f"/{f}/" in libraries]
     if not read:
         raise Broken(f"not run: no Mach-O in {folder}")
     return found
 
 
 def symbols(path):
-    listed = subprocess.run(["nm", "-P", str(path)], capture_output=True, text=True, timeout=120)
+    listed = run(["nm", "-P", str(path)])
     if listed.returncode != 0:
         raise Broken(f"nm cannot read {path.name}")
     names = set()

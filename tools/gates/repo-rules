@@ -22,6 +22,8 @@ import tomllib
 
 TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
 FIELDS = {"id", "enforces", "suffixes", "patterns", "allowed", "control"}
+SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
+PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
 MAX_FILES = 20000
 MAX_BYTES = 2 * 1024 * 1024
 
@@ -38,10 +40,14 @@ def load_rules(path=TABLE):
     rules = data.get("rule")
     if not isinstance(rules, list) or not rules:
         raise Broken(f"{path.name} has no rules")
-    out = []
+    out, seen = [], set()
     for rule in rules:
         if not isinstance(rule, dict) or not FIELDS <= set(rule) or set(rule) - FIELDS - {"reason"}:
             raise Broken(f"{path.name}: a rule lacks or adds fields: {rule.get('id') if isinstance(rule, dict) else rule}")
+        typed(path, rule)
+        if rule["id"] in seen:
+            raise Broken(f"{path.name}: rule id {rule['id']} appears twice")
+        seen.add(rule["id"])
         try:
             compiled = [re.compile(p) for p in rule["patterns"]]
         except (re.error, TypeError) as error:
@@ -52,8 +58,30 @@ def load_rules(path=TABLE):
     return out
 
 
+def typed(path, rule):
+    """Every field has its exact type and form, so a malformed table is broken, never read loosely."""
+    def strings(value, pattern=None, empty=False):
+        return (isinstance(value, list) and (empty or value) and all(isinstance(v, str) and v for v in value)
+                and all(pattern.fullmatch(v) for v in value) if pattern else isinstance(value, list) and (empty or value)
+                and all(isinstance(v, str) and v for v in value))
+    problems = [name for name, ok in (
+        ("id", isinstance(rule["id"], str) and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", rule["id"])),
+        ("enforces", isinstance(rule["enforces"], str) and rule["enforces"].strip()),
+        ("control", isinstance(rule["control"], str) and rule["control"].strip()),
+        ("suffixes", strings(rule["suffixes"], SUFFIX)),
+        ("patterns", strings(rule["patterns"])),
+        ("allowed", strings(rule["allowed"], PREFIX, empty=True) and not any(".." in v.split("/") for v in rule["allowed"])),
+        ("reason", "reason" not in rule or (isinstance(rule["reason"], str) and rule["reason"].strip())),
+    ) if not ok]
+    if problems:
+        raise Broken(f"{path.name}: rule {rule.get('id')!r} has a malformed {', '.join(problems)}")
+
+
 def tracked(repo):
-    listed = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, timeout=120)
+    try:
+        listed = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Broken(f"git could not list the tree: {error}")
     if listed.returncode != 0:
         raise Broken(f"git cannot list the tree at {repo}")
     names = [n.decode("utf-8", "surrogateescape") for n in listed.stdout.split(b"\0") if n]
