@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Call gate: no analytics, telemetry or crash-reporting SDK and no AI-service client is in any build (plan step
+P0.11.6).
+
+Usage: deny-calls [--tables-from <ref>] <repo>
+
+Reads deny-calls.toml beside this file, or with --tables-from from tools/gates/ at that commit of the repository
+(git cat-file blob <ref>:tools/gates/deny-calls.toml), so a branch cannot drop a name from its own list. It refuses:
+  - analytics-package and ai-package: a listed package named in a Cargo.toml dependency table, a Cargo.lock
+    package, a Package.swift package URL (its last path part) or a Package.resolved pin;
+  - analytics-import and ai-import: a listed module brought in by source: a Swift import, a Rust use, extern crate
+    or path root, a C or Objective-C #include, #import or @import of <Module/...>;
+  - ai-host: a listed AI API host name, or any name under it, anywhere in source text;
+  - unlisted-update-host: any host in a URL, or set as a host, inside the update module's paths other than the
+    configured update host, matched exactly. The update module may name that host and no other.
+Names are matched as whole names: a package compared without case and with - and _ the same, a module name exactly
+as listed, so a crate called sentryless or a module called SentryFreeKit passes. Source means tracked .rs, .swift,
+.c, .h, .m, .mm, .cc, .cpp and .hpp files; docs are never read. The gate governs Shellborne's own code, never an
+agent a person runs in a pane, so a harness name in adapter code passes.
+
+Files are listed and read through the repo-rules reader, with its caps: tracked regular files only, opened without
+following a link, 2 MiB each; a symlink or special file breaks the run. A refusal names the rule and file:line and
+never prints source; at most the first 1000 are printed and the rest counted. Each run first proves the gate
+refuses a seeded lockfile entry for every listed package and a seeded line for every listed AI host; if one is not
+refused, the gate is broken. Limits: only listed names
+are caught, and a renamed vendored copy passes until the built bundle is inspected. Exit 0 clean, 1 refused, 2
+broken; a missing, malformed or empty table, a manifest that does not parse, or an unreadable file is broken.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import tomllib
+
+# Known-bad controls: a lockfile that pulls in each listed package and a source line naming each listed AI host.
+CONTROL = ('[[package]]\nname = "{name}"\nversion = "0.34.0"\n', 'const HOST: &str = "{name}";\n')
+
+HERE = pathlib.Path(__file__).resolve().parent
+READER = HERE / "repo-rules"
+TABLE_NAME = "deny-calls.toml"
+GATE = "deny-calls"
+MAX_TABLE_BYTES = 256 * 1024
+MAX_NAMES = 1000
+REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
+HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+")
+PACKAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")  # a name with a hyphen is never a module, so it never matches
+PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
+SHAPE = {"analytics": {"packages", "imports"}, "ai": {"packages", "imports", "hosts"}, "update": {"paths", "hosts"}}
+SOURCE_SUFFIXES = (".rs", ".swift", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".hpp")
+DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
+
+SWIFT_IMPORT = re.compile(r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*import\s+"
+                          r"(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?([A-Za-z_][A-Za-z0-9_]*)")
+RUST_IMPORT = re.compile(r"\b(?:use|extern\s+crate)\s+(?:::)?([A-Za-z_][A-Za-z0-9_]*)")
+RUST_PATH = re.compile(r"(?<![\w:])(?:::)?([A-Za-z_][A-Za-z0-9_]*)\s*::")
+C_IMPORT = re.compile(r"#\s*(?:include|import)\s*[<\"]([A-Za-z_][A-Za-z0-9_]*)/|@import\s+([A-Za-z_][A-Za-z0-9_]*)")
+URL_HOST = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://(?:[^/\s\"'@]*@)?(\[[^\]\s]*\]|[^/\s\"'?#:\\]+)")
+HOST_FIELD = re.compile(r"\bhost\s*[:=]\s*\"([^\"\\]+)\"")
+TOML_HEADER = re.compile(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$")
+TOML_KEY = re.compile(r"^\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_-]+))\s*(?:\.\s*[A-Za-z0-9_-]+\s*)?=")
+TOML_PACKAGE = re.compile(r"\bpackage\s*=\s*[\"']([^\"']+)[\"']")
+LOCK_NAME = re.compile(r"^\s*name\s*=\s*\"([^\"]+)\"")
+SWIFT_URL = re.compile(r"\burl\s*:\s*\"([^\"]+)\"")
+SWIFT_ID = re.compile(r"\.package\s*\(\s*id\s*:\s*\"([^\"]+)\"")
+RESOLVED_FIELD = re.compile(r"\"(identity|location)\"\s*:\s*\"([^\"]+)\"")
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def table_bytes(rr, repo, ref):
+    """The table's bytes, from beside this file or, with a ref, from that commit."""
+    if ref is None:
+        try:
+            with open(HERE / TABLE_NAME, "rb") as handle:
+                raw = handle.read(MAX_TABLE_BYTES + 1)
+        except OSError as error:
+            raise rr.Broken(f"cannot read {TABLE_NAME}: {error.strerror}")
+    else:
+        if not REF.fullmatch(ref) or ref.startswith("-"):
+            raise rr.Broken(f"--tables-from needs a plain commit name, not {rr.shown(ref)}")
+        try:
+            done = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:tools/gates/{TABLE_NAME}"],
+                                  capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            raise rr.Broken(f"git could not read {TABLE_NAME} from {rr.shown(ref)}")
+        if done.returncode != 0:
+            raise rr.Broken(f"{rr.shown(ref)} has no readable tools/gates/{TABLE_NAME}")
+        raw = done.stdout
+    if len(raw) > MAX_TABLE_BYTES:
+        raise rr.Broken(f"{TABLE_NAME} is over the {MAX_TABLE_BYTES}-byte cap")
+    return raw
+
+
+def package_key(name):
+    """A package name as compared: without case, with - and _ the same."""
+    return name.lower().replace("_", "-")
+
+
+def load_table(rr, raw):
+    """The lists, each typed and non-empty, so no rule is left with nothing to match."""
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise rr.Broken(f"{TABLE_NAME} is malformed: {type(error).__name__}")
+    if set(data) != set(SHAPE) or any(not isinstance(data[key], dict) or set(data[key]) != fields
+                                      for key, fields in SHAPE.items()):
+        raise rr.Broken(f"{TABLE_NAME} must hold exactly [analytics] packages and imports, [ai] packages, imports "
+                        "and hosts, and [update] paths and hosts")
+    forms = {"packages": PACKAGE, "imports": MODULE, "hosts": HOST, "paths": PREFIX}
+    for key, fields in SHAPE.items():
+        for field in fields:
+            values = data[key][field]
+            if (not isinstance(values, list) or not values or len(values) > MAX_NAMES
+                    or not all(isinstance(v, str) and forms[field].fullmatch(v) for v in values)):
+                raise rr.Broken(f"{TABLE_NAME}: [{key}] {field} must be a non-empty list of plain names, with no "
+                                "wildcard, and an empty list cannot fail")
+    if any(".." in path.split("/") for path in data["update"]["paths"]):
+        raise rr.Broken(f"{TABLE_NAME}: an [update] path climbs out of the tree")
+    return {
+        "packages": {**{package_key(n): "analytics-package" for n in data["analytics"]["packages"]},
+                     **{package_key(n): "ai-package" for n in data["ai"]["packages"]}},
+        "imports": {**{n: "analytics-import" for n in data["analytics"]["imports"]},
+                    **{n: "ai-import" for n in data["ai"]["imports"]}},
+        "ai_hosts": [host_pattern(h) for h in data["ai"]["hosts"]],
+        "ai_host_names": list(data["ai"]["hosts"]),
+        "update_paths": data["update"]["paths"],
+        "update_hosts": {h.lower() for h in data["update"]["hosts"]},
+    }
+
+
+def host_pattern(host):
+    """A host, or any name under it, as a whole name without case."""
+    return re.compile(r"(?<![A-Za-z0-9-])" + re.escape(host) + r"(?![A-Za-z0-9-]|\.[A-Za-z0-9])", re.IGNORECASE)
+
+
+def last_part(url):
+    """A package URL's last path part, without a .git suffix or a trailing slash."""
+    part = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    return part[:-4] if part.lower().endswith(".git") else part
+
+
+def cargo_manifest(rr, name, text, table):
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        raise rr.Broken(f"{rr.shown(name)} does not parse as TOML")
+    found, section = [], ()
+    for number, line in enumerate(text.splitlines(), 1):
+        header = TOML_HEADER.match(line)
+        if header:
+            section = tuple(part.strip().strip("\"'") for part in re.split(r"\.(?=(?:[^\"']*[\"'][^\"']*[\"'])*[^\"']*$)",
+                                                                             header.group(1)))
+            if len(section) >= 2 and section[-2] in DEPENDENCY_KEYS:  # [dependencies.name]
+                if package_key(section[-1]) in table["packages"]:
+                    found.append((table["packages"][package_key(section[-1])], number))
+            continue
+        renamed = TOML_PACKAGE.search(line)
+        if renamed and package_key(renamed.group(1)) in table["packages"] and section and (
+                section[-1] in DEPENDENCY_KEYS or (len(section) >= 2 and section[-2] in DEPENDENCY_KEYS)):
+            found.append((table["packages"][package_key(renamed.group(1))], number))
+            continue
+        key = TOML_KEY.match(line)
+        if key and section and section[-1] in DEPENDENCY_KEYS:
+            dep = next(group for group in key.groups() if group)
+            if package_key(dep) in table["packages"]:
+                found.append((table["packages"][package_key(dep)], number))
+    return found
+
+
+def cargo_lock(rr, name, text, table):
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        raise rr.Broken(f"{rr.shown(name)} does not parse as TOML")
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        match = LOCK_NAME.match(line)
+        if match and package_key(match.group(1)) in table["packages"]:
+            found.append((table["packages"][package_key(match.group(1))], number))
+    return found
+
+
+def swift_manifest(rr, name, text, table):
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        names = [last_part(m.group(1)) for m in SWIFT_URL.finditer(line)]
+        names += [m.group(1).rsplit(".", 1)[-1] for m in SWIFT_ID.finditer(line)]
+        for package in names:
+            if package_key(package) in table["packages"]:
+                found.append((table["packages"][package_key(package)], number))
+    return found
+
+
+def swift_resolved(rr, name, text, table):
+    try:
+        json.loads(text)
+    except ValueError:
+        raise rr.Broken(f"{rr.shown(name)} does not parse as JSON")
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        for field, value in RESOLVED_FIELD.findall(line):
+            package = value if field == "identity" else last_part(value)
+            if package_key(package) in table["packages"]:
+                found.append((table["packages"][package_key(package)], number))
+    return found
+
+
+MANIFESTS = {"Cargo.toml": cargo_manifest, "Cargo.lock": cargo_lock, "Package.swift": swift_manifest,
+             "Package.resolved": swift_resolved}
+
+
+def source_findings(name, text, table, update):
+    """(rule, line) for each listed import, AI host and, in the update module, each unlisted host."""
+    lowered = name.lower()
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        modules = []
+        if lowered.endswith(".swift"):
+            match = SWIFT_IMPORT.match(line)
+            modules += [match.group(1)] if match else []
+        elif lowered.endswith(".rs"):
+            modules += RUST_IMPORT.findall(line) + RUST_PATH.findall(line)
+        if not lowered.endswith((".swift", ".rs")) or "#" in line or "@import" in line:
+            modules += [a or b for a, b in C_IMPORT.findall(line)]
+        for module in modules:
+            if module in table["imports"]:
+                found.append((table["imports"][module], number))
+        if any(pattern.search(line) for pattern in table["ai_hosts"]):
+            found.append(("ai-host", number))
+        if update:
+            hosts = URL_HOST.findall(line) + HOST_FIELD.findall(line)
+            if any(host.lower().rstrip(".") not in table["update_hosts"] for host in hosts):
+                found.append(("unlisted-update-host", number))
+    return found
+
+
+def judge(rr, name, text, table):
+    """Every refusal for one tracked file."""
+    base = pathlib.PurePosixPath(name).name
+    found = []
+    if base in MANIFESTS:
+        found += MANIFESTS[base](rr, name, text, table)
+    if name.lower().endswith(SOURCE_SUFFIXES):
+        found += source_findings(name, text, table, rr.allowed_at(name, table["update_paths"]))
+    return sorted(set(found), key=lambda item: (item[1], item[0]))
+
+
+def prove_controls(rr, table):
+    """A seeded lockfile naming each listed package, and a seeded line naming each listed AI host, must be refused
+    by its own rule, or the gate cannot fail and is broken."""
+    if not isinstance(CONTROL, tuple) or len(CONTROL) != 2 or not all(isinstance(part, str) for part in CONTROL):
+        raise rr.Broken("the seeded control is not a lockfile and a source line, so this gate cannot fail")
+    lockfile, source = CONTROL
+    cases = [("Cargo.lock", lockfile, name, rule) for name, rule in table["packages"].items()]
+    cases += [("control.rs", source, host, "ai-host") for host in table["ai_host_names"]]
+    for file_name, template, name, rule in cases:
+        if rule not in {found for found, _ in judge(rr, file_name, template.replace("{name}", name), table)}:
+            raise rr.Broken(f"the seeded {rule} control was not refused, so this gate cannot fail")
+    if not any(rule == "analytics-package" for *_, rule in cases):
+        raise rr.Broken("the seeded analytics-package control was not run, so this gate cannot fail")
+    print(f"{GATE}: control analytics-package, ai-package and ai-host refused as expected")
+
+
+def main(argv):
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"{GATE}: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        ref, args = None, list(argv)
+        if len(args) == 3 and args[0] == "--tables-from":
+            ref, args = args[1], args[2:]
+        if len(args) != 1 or args[0].startswith("-"):
+            raise rr.Broken(f"usage: {GATE} [--tables-from <ref>] <repo>")
+        repo = args[0]
+        table = load_table(rr, table_bytes(rr, repo, ref))
+        prove_controls(rr, table)
+        found = rr.Collected()
+        for name in rr.tracked(repo):
+            rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
+            if not (pathlib.PurePosixPath(name).name in MANIFESTS or name.lower().endswith(SOURCE_SUFFIXES)):
+                continue
+            for rule, line in judge(rr, name, rr.read_source(repo, name), table):
+                found.add(f"{rule}: {rr.shown(name)}:{line}")
+    except rr.Broken as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    for where in found.kept:
+        print(f"{GATE}: refused {where}")
+    if found.total > len(found.kept):
+        print(f"{GATE}: refused: {found.total - len(found.kept)} more refusals not listed")
+    return 1 if found.total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

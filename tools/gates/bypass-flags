@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Launch gate: no launch or config-writing code path holds a harness bypass flag or permission key (plan step
+P0.11.8).
+
+Usage: bypass-flags [--tables-from <ref>] <repo>
+
+Reads bypass-flags.toml beside this file, or with --tables-from from tools/gates/ at that commit of the repository
+(git cat-file blob <ref>:tools/gates/bypass-flags.toml), so a branch cannot drop a flag or a path from its own list.
+The table holds flags (each harness's exact flag strings), keys (the permission keys) and launch_paths (the launch
+and config-writing paths: a folder ends in /, anything else is one exact file, never a wildcard). It refuses:
+  - bypass-flag: a listed flag string in a tracked file under a launch path;
+  - permission-key: a listed permission key in a tracked file under a launch path.
+A match is the exact string with no letter, digit, underscore or hyphen on either side, so a longer flag that starts
+with a listed one passes. Only launch paths are read: the same string in adapter display code, which shows the mode a
+harness reports, passes. Shellborne runs the person's exact command and never adds one of these strings itself.
+
+Files are listed and read through the repo-rules reader, with its caps: tracked regular files only, opened without
+following a link, 2 MiB each; a symlink or special file breaks the run, and so does a file under a launch path that
+is not UTF-8 text. A refusal names the rule and file:line and never prints source; at most the first 1000 are
+printed and the rest counted. Each run first proves the gate refuses a seeded launch line holding each listed flag
+and each listed key; if one is not refused, the gate is broken. Limit: a flag built from fragments is not caught.
+Exit 0 clean, 1 refused, 2 broken; a missing, malformed or empty table is broken.
+"""
+import importlib.machinery
+import importlib.util
+import pathlib
+import re
+import subprocess
+import sys
+import tomllib
+
+# Known-bad control: a launch line that adds a bypass flag, and a config line that writes a permission key.
+CONTROL = ('    vec!["claude", "--dangerously-skip-permissions"]\n', '    settings.insert("{key}", true);\n')
+
+HERE = pathlib.Path(__file__).resolve().parent
+READER = HERE / "repo-rules"
+TABLE_NAME = "bypass-flags.toml"
+GATE = "bypass-flags"
+MAX_TABLE_BYTES = 256 * 1024
+MAX_ENTRIES = 500
+REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
+STRING = re.compile(r"[A-Za-z0-9._:=/-]{2,200}")
+PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
+SHAPE = ("flags", "keys", "launch_paths")
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def table_bytes(rr, repo, ref):
+    """The table's bytes, from beside this file or, with a ref, from that commit."""
+    if ref is None:
+        try:
+            with open(HERE / TABLE_NAME, "rb") as handle:
+                raw = handle.read(MAX_TABLE_BYTES + 1)
+        except OSError as error:
+            raise rr.Broken(f"cannot read {TABLE_NAME}: {error.strerror}")
+    else:
+        if not REF.fullmatch(ref) or ref.startswith("-"):
+            raise rr.Broken(f"--tables-from needs a plain commit name, not {rr.shown(ref)}")
+        try:
+            done = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:tools/gates/{TABLE_NAME}"],
+                                  capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            raise rr.Broken(f"git could not read {TABLE_NAME} from {rr.shown(ref)}")
+        if done.returncode != 0:
+            raise rr.Broken(f"{rr.shown(ref)} has no readable tools/gates/{TABLE_NAME}")
+        raw = done.stdout
+    if len(raw) > MAX_TABLE_BYTES:
+        raise rr.Broken(f"{TABLE_NAME} is over the {MAX_TABLE_BYTES}-byte cap")
+    return raw
+
+
+def exact(text):
+    """The string as a whole: no letter, digit, underscore or hyphen on either side."""
+    return re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(text) + r"(?![A-Za-z0-9_-])")
+
+
+def load_table(rr, raw):
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise rr.Broken(f"{TABLE_NAME} is malformed: {type(error).__name__}")
+    if set(data) != set(SHAPE):
+        raise rr.Broken(f"{TABLE_NAME} must hold exactly flags, keys and launch_paths")
+    for field, form in (("flags", STRING), ("keys", STRING), ("launch_paths", PREFIX)):
+        values = data[field]
+        if (not isinstance(values, list) or not values or len(values) > MAX_ENTRIES
+                or not all(isinstance(v, str) and form.fullmatch(v) for v in values)):
+            raise rr.Broken(f"{TABLE_NAME}: {field} must be a non-empty list of exact strings, with no wildcard, "
+                            "and an empty list cannot fail")
+    if any(".." in path.split("/") for path in data["launch_paths"]):
+        raise rr.Broken(f"{TABLE_NAME}: a launch path climbs out of the tree")
+    rules = [("bypass-flag", text, exact(text)) for text in data["flags"]]
+    rules += [("permission-key", text, exact(text)) for text in data["keys"]]
+    return rules, data["launch_paths"]
+
+
+def judge(text, rules):
+    """(rule, line) for each listed string in one launch-path file."""
+    found = set()
+    for number, line in enumerate(text.splitlines(), 1):
+        for rule, _, pattern in rules:
+            if pattern.search(line):
+                found.add((rule, number))
+    return sorted(found, key=lambda item: (item[1], item[0]))
+
+
+def prove_controls(rr, rules):
+    """A seeded launch line holding each listed flag, and one holding each listed key, must be refused by its own
+    rule, or the gate cannot fail and is broken."""
+    if not isinstance(CONTROL, tuple) or len(CONTROL) != 2 or not all(isinstance(part, str) for part in CONTROL):
+        raise rr.Broken("the seeded control is not a launch line and a config line, so this gate cannot fail")
+    flag_line, key_line = CONTROL
+    planted = re.search(r'"(--[^"]+)"', flag_line)
+    if not planted:
+        raise rr.Broken("the seeded launch line plants no flag, so this gate cannot fail")
+    for rule, text, _ in rules:
+        line = flag_line.replace(planted.group(1), text) if rule == "bypass-flag" else key_line.replace("{key}", text)
+        if (rule, 1) not in judge(line, rules):
+            raise rr.Broken(f"the seeded {rule} control was not refused, so this gate cannot fail")
+    if ("bypass-flag", 1) not in judge(flag_line, rules):
+        raise rr.Broken("the seeded launch line was not refused, so this gate cannot fail")
+    print(f"{GATE}: control bypass-flag and permission-key refused as expected")
+
+
+def main(argv):
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"{GATE}: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        ref, args = None, list(argv)
+        if len(args) == 3 and args[0] == "--tables-from":
+            ref, args = args[1], args[2:]
+        if len(args) != 1 or args[0].startswith("-"):
+            raise rr.Broken(f"usage: {GATE} [--tables-from <ref>] <repo>")
+        repo = args[0]
+        rules, paths = load_table(rr, table_bytes(rr, repo, ref))
+        prove_controls(rr, rules)
+        found = rr.Collected()
+        for name in rr.tracked(repo):
+            rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
+            if not rr.allowed_at(name, paths):
+                continue
+            for rule, line in judge(rr.read_source(repo, name), rules):
+                found.add(f"{rule}: {rr.shown(name)}:{line}")
+    except rr.Broken as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    for where in found.kept:
+        print(f"{GATE}: refused {where}")
+    if found.total > len(found.kept):
+        print(f"{GATE}: refused: {found.total - len(found.kept)} more refusals not listed")
+    return 1 if found.total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

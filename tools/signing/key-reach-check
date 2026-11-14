@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""key-reach-check: show the builder account cannot read or sign with the release keys.
+
+Usage:
+    key-reach-check --keychain <path> --names <file> --signer <path> [--timeout <seconds>]
+
+Run on this Mac from the builder account, never in CI. --names is a TOML list of what to probe, and
+never key material:
+
+    [[item]]      a Keychain generic password, looked up by service and account only
+    [[eddsa]]     an EdDSA key account, probed by a signing attempt
+    [[path]]      a named key path, checked with access(R_OK) and lstat, never opened
+
+Lookups run `security` from PATH against the --keychain path, never with -w, -g, -X, -p, an export
+verb or dump-keychain, and keep only the exit status: 0 reachable, 44 unreachable, anything else
+broken. The signer runs as `<signer> --account <account> <fixture>` on a copy of the fixture in a
+temp folder that is deleted; its output is discarded unread. Exit 0 is reachable, exit 1 is
+unreachable only when the control signed, and anything else (another code, a signal, a timeout, a
+prompt that waits) is broken.
+
+Each run plants a control item and a control EdDSA account under a random name with the prefix
+shellborne-keyreach-control- in --keychain, probes them first, and removes them even on failure. A
+control read as unreachable means a blind instrument: broken. Limit: the control EdDSA item is planted
+by attributes only, so a real signer that looks keys up under its own service reads the control as
+unreachable and the run is broken, never a pass.
+
+Exit 0 nothing reachable, 1 something reachable, 2 broken. This tool never receives, prints, logs or
+stores a byte of a key, of the signer's output or of a probed file.
+Plan-Step: P0.11.12
+"""
+import argparse
+import os
+import pathlib
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+CONTROL_PREFIX = "shellborne-keyreach-control-"
+FIXTURE = pathlib.Path(__file__).resolve().parent / "sign-probe-fixture.txt"
+NOT_FOUND = 44
+DEFAULT_TIMEOUT = 30.0
+MAX_NAMES_BYTES = 64 * 1024
+MAX_ENTRIES = 200
+MAX_FIELD = 512
+FIELDS = {"item": ("service", "account"), "eddsa": ("account",), "path": ("path",)}
+
+
+class Broken(Exception):
+    pass
+
+
+class Stopped(Exception):
+    pass
+
+
+def say(line):
+    print(f"key-reach-check: {line}", flush=True)
+
+
+def stop(signum, _frame):
+    raise Stopped(f"stopped by signal {signum}")
+
+
+def read_names(path):
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_NAMES_BYTES + 1)
+    except OSError as error:
+        raise Broken(f"cannot read the names list: {error.strerror}") from None
+    if len(data) > MAX_NAMES_BYTES:
+        raise Broken(f"the names list is over {MAX_NAMES_BYTES} bytes")
+    try:
+        table = tomllib.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        raise Broken("the names list is not valid TOML") from None
+    unknown = set(table) - set(FIELDS)
+    if unknown:
+        raise Broken(f"the names list has unknown tables: {', '.join(sorted(unknown))}")
+    entries = {}
+    for kind, fields in FIELDS.items():
+        listed = table.get(kind, [])
+        if not isinstance(listed, list) or not all(isinstance(entry, dict) for entry in listed):
+            raise Broken(f"[[{kind}]] must be an array of tables")
+        entries[kind] = []
+        for entry in listed:
+            if set(entry) != set(fields):
+                raise Broken(f"each [[{kind}]] entry holds exactly: {', '.join(fields)}")
+            for field in fields:
+                value = entry[field]
+                if not isinstance(value, str) or not value or len(value) > MAX_FIELD or "\0" in value:
+                    raise Broken(f"[[{kind}]] {field} must be a non-empty string under {MAX_FIELD} characters")
+                if value.startswith(CONTROL_PREFIX):
+                    raise Broken(f"[[{kind}]] {field} uses the control prefix")
+            entries[kind].append(tuple(entry[field] for field in fields))
+    total = sum(len(listed) for listed in entries.values())
+    if total == 0:
+        raise Broken("the names list is empty, so nothing would be probed")
+    if total > MAX_ENTRIES:
+        raise Broken(f"the names list has {total} entries, over the {MAX_ENTRIES} cap")
+    return entries
+
+
+def run_quiet(argv, timeout):
+    """Runs argv with no input and its output discarded unread. Returns the exit status, or None on a timeout.
+    The whole process group is killed on a timeout, so nothing is left waiting at a prompt."""
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                process.kill()
+            process.wait()
+
+
+class Probe:
+    def __init__(self, security, keychain, signer, timeout):
+        self.security = security
+        self.keychain = keychain
+        self.signer = signer
+        self.timeout = timeout
+        self.planted = []
+
+    def security_status(self, *args):
+        status = run_quiet([self.security, *args, self.keychain], self.timeout)
+        if status is None:
+            raise Broken(f"security {args[0]} did not finish within {self.timeout:g} s")
+        return status
+
+    def plant(self, service, account):
+        self.planted.append((service, account))
+        status = self.security_status("add-generic-password", "-s", service, "-a", account)
+        if status != 0:
+            raise Broken(f"could not plant a control item (security exit {status})")
+
+    def remove_planted(self):
+        failures = []
+        for service, account in self.planted:
+            try:
+                status = self.security_status("delete-generic-password", "-s", service, "-a", account)
+            except Broken as error:
+                failures.append(str(error))
+                continue
+            if status not in (0, NOT_FOUND):
+                failures.append(f"could not remove the control {service} (security exit {status})")
+        self.planted = []
+        return failures
+
+    def item_reachable(self, service, account):
+        status = self.security_status("find-generic-password", "-s", service, "-a", account)
+        if status == 0:
+            return True
+        if status == NOT_FOUND:
+            return False
+        if status < 0:
+            raise Broken(f"security find-generic-password ended on signal {-status}")
+        raise Broken(f"security find-generic-password exited {status}, neither found nor not found")
+
+    def signs(self, account):
+        with tempfile.TemporaryDirectory(prefix="key-reach-sign-") as tmp:
+            copy = pathlib.Path(tmp) / FIXTURE.name
+            shutil.copyfile(FIXTURE, copy)
+            status = run_quiet([self.signer, "--account", account, str(copy)], self.timeout)
+        if status is None:
+            raise Broken(f"the signer did not finish within {self.timeout:g} s (a timeout or a prompt that waits)")
+        if status == 0:
+            return True
+        if status == 1:
+            return False
+        if status < 0:
+            raise Broken(f"the signer ended on signal {-status}")
+        raise Broken(f"the signer exited {status}, neither signed nor refused")
+
+
+def path_reachable(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise Broken(f"lstat failed on a named path: {error.strerror}") from None
+    return os.access(path, os.R_OK)
+
+
+def check(args, probe, entries):
+    """Returns the reachable lines. Raises Broken when an instrument cannot be trusted."""
+    tag = secrets.token_hex(8)
+    control_item = (f"{CONTROL_PREFIX}item-{tag}", f"{CONTROL_PREFIX}item-{tag}")
+    control_eddsa = f"{CONTROL_PREFIX}eddsa-{tag}"
+    probe.plant(*control_item)
+    probe.plant(f"{CONTROL_PREFIX}eddsa-{tag}", control_eddsa)
+    if not probe.item_reachable(*control_item):
+        raise Broken("the control item read as unreachable, so the lookup is blind")
+    if not probe.signs(control_eddsa):
+        raise Broken("the control EdDSA account did not sign, so the signing probe is blind")
+    found = []
+    for service, account in entries["item"]:
+        if probe.item_reachable(service, account):
+            found.append(f"reachable item service {service} account {account}")
+    for (account,) in entries["eddsa"]:
+        if probe.signs(account):
+            found.append(f"reachable eddsa account {account}")
+    for (path,) in entries["path"]:
+        if path_reachable(path):
+            found.append(f"reachable path {path}")
+    return found
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="key-reach-check", add_help=True)
+    parser.add_argument("--keychain", required=True)
+    parser.add_argument("--names", required=True)
+    parser.add_argument("--signer", required=True)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        say("broken: usage: key-reach-check --keychain <path> --names <file> --signer <path> [--timeout <seconds>]")
+        return 2
+    if not args.timeout > 0:
+        say("broken: --timeout must be a positive number of seconds")
+        return 2
+    try:
+        entries = read_names(args.names)
+    except Broken as error:
+        say(f"broken: {error}")
+        return 2
+    security = shutil.which("security")
+    if not security:
+        say("broken: security(1) is not on PATH")
+        return 2
+    if not os.access(args.signer, os.X_OK):
+        say("broken: the signer is not an executable file")
+        return 2
+    if not FIXTURE.is_file():
+        say("broken: the signing fixture is missing")
+        return 2
+    probe = Probe(security, args.keychain, args.signer, args.timeout)
+    previous = {number: signal.signal(number, stop) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    problems = []
+    found = []
+    try:
+        found = check(args, probe, entries)
+    except (Broken, Stopped) as error:
+        problems.append(str(error))
+    finally:
+        problems += probe.remove_planted()
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    if problems:
+        for problem in problems:
+            say(f"broken: {problem}")
+        return 2
+    for line in found:
+        say(line)
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -176,6 +176,26 @@ within = ["apple/Sources/PlatformShell/", "apple/Sources/TerminalView/", "apple/
 within_marker = '@MainActor\b'
 control = "@MainActor final class Box { let lock = NSLock() }"
 
+# Launch Services and Apple Events (plan step P0.11.7). Shellborne registers no URL scheme, at build time or at run
+# time, and installs no handler for the get-URL Apple Event; no path is allowed.
+[[rule]]
+id = "url-handler-registration"
+enforces = "nothing registers a URL scheme handler or answers the get-URL Apple Event"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['\bLSSetDefaultHandlerForURLScheme\b', '\bkAEGetURL\b', '\btoOpenURLsWithScheme\b']
+allowed = []
+control = 'LSSetDefaultHandlerForURLScheme("shellborne" as CFString, bundleID as CFString)'
+
+# A global event tap reads every key the person types in any app (the limit of plan step P0.11.9: it is a privacy
+# grant, not an entitlement, so source is where it is caught); no path is allowed.
+[[rule]]
+id = "global-event-tap"
+enforces = "nothing creates a global event tap that reads input meant for other apps"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
+patterns = ['\bCGEventTapCreate\w*', '\bCGEvent\s*\.\s*tapCreate\w*']
+allowed = []
+control = "let tap = CGEventTapCreate(.cgSessionEventTap, .headInsertEventTap, .defaultTap, mask, callback, nil)"
+
 # Native source the rules above cannot read. A tracked file in one of these languages is refused outside the
 # engine adapter, where the pinned engine's own source may be vendored, so no rule is passed by changing language.
 # Suffixes are compared without case, here and in every rule.

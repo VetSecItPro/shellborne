@@ -1,0 +1,31 @@
+# The harness bypass flags and permission keys no launch path may hold (plan step P0.11.8). tools/gates/bypass-flags
+# reads only the launch_paths below and refuses each string here as an exact match, with no letter, digit,
+# underscore or hyphen on either side. Shellborne runs the person's exact agent command and adds only a harness's
+# documented resume argument, so none of these strings belongs in code that builds a command line or writes a config.
+# Adapter display code, which shows the mode a harness reports, is not a launch path and may name them.
+# In CI the gate reads this file from the base commit, so a branch cannot drop a flag, a key or a path.
+
+flags = [
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+    "--full-auto",
+    "--allow-all-tools",
+]
+
+keys = [
+    "skipDangerousModePermissionPrompt",
+    "bypassPermissions",
+    "danger-full-access",
+]
+
+# Where a command line is built, a process is started or a config is written: a folder ends in /, anything else is
+# one exact file, never a wildcard. A new launch or config-writing path joins this list in the change that adds it.
+launch_paths = [
+    "crates/sb-supervisor/",
+    "crates/sb-host/",
+    "crates/sb-cli/",
+    "crates/sb-core/src/scheduler/",
+    "apple/Sources/CoreClient/Scheduler/",
+]

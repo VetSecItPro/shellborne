@@ -80,11 +80,11 @@ jobs:
       - name: Who frees at the C seam
         run: tools/gates/who-frees .
 
-      - name: Hidden characters, dashes, copy and pins, with their tables from the base commit
+      - name: Hidden characters, dashes, copy, pins, denied calls and bypass flags, with their tables from the base commit
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          for pair in hidden-chars:hidden-chars.toml copy-lint:copy-lint.toml pins:pins.toml; do
+          for pair in hidden-chars:hidden-chars.toml copy-lint:copy-lint.toml pins:pins.toml deny-calls:deny-calls.toml bypass-flags:bypass-flags.toml; do
             gate="${pair%%:*}"; table="${pair#*:}"
             if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/$table" 2>/dev/null; then
               "tools/gates/$gate" --tables-from "$BASE" .

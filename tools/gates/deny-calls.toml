@@ -1,0 +1,71 @@
+# The analytics and AI-call deny-lists (plan step P0.11.6). tools/gates/deny-calls reads this table and refuses a
+# listed package in a manifest or lockfile, a listed module brought in by source, and a listed AI API host in
+# source. Package names are compared without case, with - and _ the same; module names are exact. A host matches
+# itself and every name under it. In CI the gate reads this file from the base commit, so a branch cannot drop a name.
+# No harness command belongs here: the gate governs Shellborne's own code, never an agent a person runs in a pane.
+
+# Analytics, telemetry and crash-reporting SDKs.
+[analytics]
+packages = [
+    # Rust crates
+    "sentry", "sentry-core", "sentry-types", "sentry-backtrace", "sentry-contexts", "sentry-panic", "sentry-anyhow",
+    "sentry-tracing", "sentry-log", "sentry-slog", "sentry-debug-images", "sentry-rust-minidump", "bugsnag",
+    "rollbar", "posthog-rs", "posthog-core", "mixpanel", "mixpanel-rs", "amplitude", "segment", "analytics-rs",
+    "aptabase", "honeybadger", "newrelic", "opentelemetry-otlp", "opentelemetry-datadog", "opentelemetry-jaeger",
+    "opentelemetry-zipkin", "opentelemetry-application-insights", "datadog-apm", "crashreport",
+    # Swift packages, by the last part of the package URL
+    "sentry-cocoa", "firebase-ios-sdk", "bugsnag-cocoa", "bugsnag-cocoa-performance", "posthog-ios",
+    "mixpanel-swift", "mixpanel-iphone", "amplitude-swift", "amplitude-ios", "analytics-swift", "analytics-ios",
+    "appcenter-sdk-apple", "plcrashreporter", "kscrash", "dd-sdk-ios", "instabug-sp", "embrace-apple-sdk",
+    "swift-sdk-telemetrydeck", "aptabase-swift", "countly-sdk-ios", "flurry-ios-sdk", "rollbar-apple",
+    "raygun4apple", "newrelic-ios-agent-spm", "appsflyerframework", "smartlook-ios-sdk", "heap-swift-core-sdk",
+]
+imports = [
+    # Swift, Objective-C and C module names
+    "Sentry", "SentrySwiftUI", "Firebase", "FirebaseCore", "FirebaseAnalytics", "FirebaseCrashlytics",
+    "FirebasePerformance", "Bugsnag", "BugsnagPerformance", "PostHog", "Mixpanel", "Amplitude", "AmplitudeSwift",
+    "AppCenter", "AppCenterAnalytics", "AppCenterCrashes", "CrashReporter", "KSCrash", "KSCrashRecording",
+    "Crashlytics", "DatadogCore", "DatadogRUM", "DatadogLogs", "DatadogTrace", "DatadogCrashReporting", "Instabug",
+    "EmbraceIO", "TelemetryDeck", "TelemetryClient", "Aptabase", "Countly", "Flurry_iOS_SDK", "RollbarNotifier",
+    "Raygun4Apple", "NewRelic", "AppsFlyerLib", "SmartlookAnalytics", "HeapSwiftCore",
+    # Rust crate names as source spells them
+    "sentry", "sentry_core", "sentry_types", "sentry_backtrace", "sentry_contexts", "sentry_panic", "sentry_anyhow",
+    "sentry_tracing", "sentry_log", "sentry_slog", "sentry_rust_minidump", "bugsnag", "rollbar", "posthog_rs",
+    "posthog_core", "mixpanel", "aptabase", "honeybadger", "newrelic", "opentelemetry_otlp", "opentelemetry_datadog",
+    "opentelemetry_jaeger", "opentelemetry_zipkin", "opentelemetry_application_insights",
+]
+
+# AI-service clients and API hosts.
+[ai]
+packages = [
+    # Rust crates
+    "async-openai", "openai", "openai-api-rs", "openai-dive", "openai-rust", "chatgpt-rs", "anthropic",
+    "anthropic-sdk", "anthropic-rs", "async-anthropic", "clust", "misanthropic", "ollama-rs", "genai", "rig-core",
+    "llm-chain", "langchain-rust", "google-generative-ai-rs", "gemini-ai", "mistralai-client", "cohere-rust",
+    "groq-api-rs", "replicate-rust", "aws-sdk-bedrockruntime", "aws-sdk-bedrock",
+    # Swift packages, by the last part of the package URL
+    "openai-swift", "swiftopenai", "swiftanthropic", "anthropic-swift-sdk", "generative-ai-swift", "ollama-swift",
+    "aiproxyswift", "chatgptswift", "langchain-swift", "swift-ai", "firebase-vertexai",
+]
+imports = [
+    # Swift module names
+    "OpenAI", "SwiftOpenAI", "SwiftAnthropic", "AnthropicSwiftSDK", "GoogleGenerativeAI", "OllamaKit", "AIProxy",
+    "ChatGPTSwift", "LangChain", "FirebaseVertexAI", "FirebaseAI",
+    # Rust crate names as source spells them
+    "async_openai", "openai", "openai_api_rs", "openai_dive", "openai_rust", "chatgpt", "anthropic", "anthropic_sdk",
+    "anthropic_rs", "async_anthropic", "clust", "misanthropic", "ollama_rs", "genai", "rig", "llm_chain",
+    "langchain_rust", "google_generative_ai_rs", "mistralai_client", "cohere_rust", "groq_api_rs",
+    "aws_sdk_bedrockruntime", "aws_sdk_bedrock",
+]
+hosts = [
+    "api.openai.com", "openai.azure.com", "api.anthropic.com", "generativelanguage.googleapis.com",
+    "aiplatform.googleapis.com", "api.mistral.ai", "api.cohere.ai", "api.cohere.com", "api.groq.com",
+    "api.together.xyz", "api.together.ai", "api.perplexity.ai", "api.deepseek.com", "api.x.ai", "openrouter.ai",
+    "api.fireworks.ai", "api-inference.huggingface.co", "router.huggingface.co", "api.replicate.com",
+    "inference.ai.azure.com",
+]
+
+# The update module may name the configured update host and no other: exact names, no wildcard.
+[update]
+paths = ["apple/Sources/Update/"]
+hosts = ["shellborne.dev"]
