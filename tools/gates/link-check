@@ -183,20 +183,35 @@ def linked(path):
 
 
 def candidates(folder):
-    """Every regular file under the folder, never through a symlink, at most MAX_FILES."""
-    found = []
-    for top, dirs, files in os.walk(folder, followlinks=False):
+    """Every regular file under the folder, read as a stream with no symlink followed, at most MAX_FILES entries
+    seen. A symlink that leaves the folder, or a directory that cannot be read, is broken; a symlink inside the
+    folder is skipped, since its target is reached where it lives."""
+    root = pathlib.Path(folder).resolve()
+    found, seen, stack = [], 0, [pathlib.Path(folder)]
+    while stack:
         remaining()
-        for name in files:
-            path = pathlib.Path(top) / name
-            if os.path.islink(path):
-                target = path.resolve()
-                if not target.is_relative_to(pathlib.Path(folder).resolve()):
-                    raise Broken(f"{shown(str(path.relative_to(folder)))} is a symlink out of the build folder")
-                continue  # a symlink inside the folder: its target is scanned where it lives
-            found.append(path)
-            if len(found) > MAX_FILES:
-                raise Broken(f"{shown(str(folder))} holds over the {MAX_FILES}-file cap")
+        top = stack.pop()
+        try:
+            entries = os.scandir(top)
+        except OSError as error:
+            raise Broken(f"cannot read {shown(str(top))}: {error.strerror}")
+        with entries:
+            for entry in entries:
+                seen += 1
+                if seen > MAX_FILES:
+                    raise Broken(f"{shown(str(folder))} holds over the {MAX_FILES}-file cap")
+                path = pathlib.Path(entry.path)
+                try:
+                    if entry.is_symlink():
+                        if not path.resolve().is_relative_to(root):
+                            raise Broken(f"{shown(str(path.relative_to(folder)))} is a symlink out of the build folder")
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        found.append(path)
+                except OSError as error:
+                    raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
     return sorted(found)
 
 
