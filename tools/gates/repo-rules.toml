@@ -28,7 +28,7 @@ id = "spawn-outside-scheduler"
 enforces = "one scheduler starts every process; the daemon alone spawns session hosts and their PTY"
 suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii"]
 patterns = ['\bCommand::new\b', '\bposix_spawnp?\b', '\bv?fork\s*\(', '\bforkpty\s*\(', '\bexec[lv]p?e?\s*\(',
-            '\b(?:system|popen)\s*\(', '\bProcess\s*(?:\.init)?\s*\(\s*\)', '\bProcess\.run\b', '\bNSTask\b']
+            '\b(?:system|popen)\s*\(', '\bProcess\s*(?:\.init)?\s*\(\s*\)', '\bProcess\.(?:run|launchedProcess)\b', '\bSubprocess\s*\.\s*run\b', '\bNSTask\b']
 allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/spawn_host.rs",
            "crates/sb-host/src/pty.rs"]
 control = 'let _ = std::process::Command::new("ls");'
@@ -37,7 +37,8 @@ control = 'let _ = std::process::Command::new("ls");'
 id = "network-outside-update"
 enforces = "network-capable code lives only in the update module"
 suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii", ".modulemap", ".xcconfig", ".pbxproj"]
-patterns = ['\b(?:NS)?URLSession\b', '@?"https?://', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
+patterns = ['\b(?:NS)?URLSession\b', '@?"https?://', '\b(?:Data|String|NSString|NSData)\s*\(\s*contentsOf\s*:',
+            '\bInputStream\s*\(\s*url\s*:', '\b(?:dataWithContentsOfURL|stringWithContentsOfURL|initWithContentsOfURL|inputStreamWithURL)\b', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
             '\b(?:tokio|mio|async_std|smol|socket2)\s*::\s*net\b', '\bgetaddrinfo\b',
             '\b(?:gethostbyname2?|gethostbyaddr|getnameinfo|res_n?query|res_n?search|DNSServiceQueryRecord|DNSServiceGetAddrInfo)\b',
             '\b(?:AF|PF)_INET6?\b', '\bsockaddr_in6?\b', '\bINADDR_(?:ANY|LOOPBACK|BROADCAST|NONE)\b', '\bin6?addr_\w+',
@@ -48,7 +49,7 @@ patterns = ['\b(?:NS)?URLSession\b', '@?"https?://', '\b(?:extern\s+crate|use)\s
             '#\s*(?:include|import)\s*[<"](?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b',
             '\blink\s+framework\s+"(?:Network|CFNetwork)"', '\.linkedFramework\s*\(\s*"(?:Network|CFNetwork)"', '-(?:weak_|reexport_|lazy_|needed_)?framework\W+(?:Network|CFNetwork)\b',
             '\b(?:Network|CFNetwork)\.framework\b']
-ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|net\b)']  # Unix domain sockets, however grouped
+ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}"\x27;]*(?:\{[^{}"\x27;]*\}[^{}"\x27;]*)*\}|net\b)']  # Unix domain sockets, however grouped
 spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
 allowed = ["apple/Sources/Update/"]
 control = "let s = URLSession.shared"
@@ -69,7 +70,8 @@ suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".h
 patterns = ['^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?i:ghostty)\w*\b',
             '@import\s+(?i:ghostty)\w*\b', '#\s*(?:include|import)\s*[<"](?i:(?:lib)?ghostty)',
             '\b(?:use|extern\s+crate)\s+(?:::)?(?:lib)?ghostty\w*\b', '\b(?:lib)?ghostty(?:_vt|_sys)?\s*::',
-            '\blink\s+(?:framework\s+)?"(?i:(?:lib)?ghostty)', '-(?:l|framework\W+)(?i:ghostty)']
+            '\blink\s+(?:framework\s+)?"(?i:(?:lib)?ghostty)', '-(?:l|framework\W+)(?i:ghostty)',
+            '\.linked(?:Library|Framework)\s*\(\s*"(?i:(?:lib)?ghostty)']
 allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/", "apple/Sources/TerminalView/"]
 control = "import GhosttyKit"
 
@@ -107,7 +109,7 @@ id = "color-outside-design-system"
 enforces = "colors are design-system tokens, defined in DesignSystem only"
 suffixes = [".swift", ".m", ".mm"]
 patterns = ['"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?"', '#colorLiteral\s*\(',
-            '\[\s*(?:NS|UI)Color\s+colorWith\w*:', '\[\s*(?:NS|UI)Color\s+(?:red|orange|yellow|green|blue|purple|brown|white|gray|black|clear|cyan|magenta|system\w+)Color\b',
+            '\[\s*(?:NS|UI)Color\s+colorWith\w*:', '\bCGColorCreate\w*\s*\(', '\[\s*(?:NS|UI)Color\s+(?:red|orange|yellow|green|blue|purple|brown|white|gray|black|clear|cyan|magenta|system\w+)Color\b',
             '(?:\b(?:NS|UI|CG)?Color|(?<![\w])\.init)\(\s*(?:\.\w+\s*,\s*)?(?:\w*[Rr]ed|\w*[Ww]hite|\w*[Hh]ue|hex|\w*[Gg]ray|\w*[Cc]yan|colorSpace|components)\s*:',
             '\b(?:Color|NSColor|UIColor|CGColor)\.(?:red|orange|yellow|green|mint|teal|cyan|blue|indigo|purple|pink|brown|white|gray|black|clear|magenta|darkGray|lightGray|label|secondaryLabel|tertiaryLabel|quaternaryLabel|primary|secondary|accentColor|system\w+)\b',
             '\b(?:let|var)\s+\w+\s*:\s*(?:SwiftUI\.)?(?:Color|NSColor|UIColor)\s*=\s*\.\w+',
@@ -119,7 +121,7 @@ control = 'let tint = Color(hex: "#3A7BD5")'
 id = "spacing-outside-design-system"
 enforces = "spacing values are design-system tokens, defined in DesignSystem only"
 suffixes = [".swift", ".m", ".mm"]
-patterns = ['\bconstraint\w*(?:Constant|EqualTo\w*):\s*-?\d', '\bconstant\s*=\s*-?\d', '\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?[-+]?\d', '\bspacing:\s*(?:CGFloat\(\s*)?[-+]?\d',
+patterns = ['\bconstraint\w*(?:Constant|EqualTo\w*):\s*-?\d', '\b(?:CGRectMake|NSMakeRect|CGRectInset|NSInsetRect|CGSizeMake|NSMakeSize)\s*\([^)]*?-?\d', '\bconstant\s*=\s*-?\d', '\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?[-+]?\d', '\bspacing:\s*(?:CGFloat\(\s*)?[-+]?\d',
             '\.frame\(\s*(?:width|height|minWidth|minHeight|maxWidth|maxHeight):\s*(?:CGFloat\(\s*)?[-+]?\d',
             '\b(?:NS|NSDirectional|UI)?EdgeInsets\(\s*top:\s*[-+]?\d', '\.(?:offset|position)\(\s*(?:x|y):\s*-?(?:CGFloat\(\s*)?\d',
             '\b(?:equalToConstant|greaterThanOrEqualToConstant|lessThanOrEqualToConstant|constant|minLength):\s*-?(?:CGFloat\(\s*)?\d',
@@ -138,6 +140,8 @@ enforces = "controls come from the design system, never built raw"
 suffixes = [".swift", ".m", ".mm"]
 patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox|TextField|SecureTextField|SearchField|TokenField|ColorWell|DatePicker|PathControl|LevelIndicator|Matrix|TextView)\s*(?:\.init)?\s*\(',
             '\bNSButton\.(?:checkbox|radioButton)WithTitle\b',
+            '\[\s*(?:\[\s*)?UI(?:Button|Switch|Slider|Stepper|SegmentedControl|TextField|TextView|DatePicker|ColorWell)\s+(?:alloc|new|\w+With\w*:)',
+            '\bUI(?:Button|Switch|Slider|Stepper|SegmentedControl|TextField|TextView|DatePicker|ColorWell)\s*(?:\.init)?\s*\(',
             '\[\s*(?:\[\s*)?NS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox|TextField|SecureTextField|SearchField|TokenField|ColorWell|DatePicker|PathControl|LevelIndicator|Matrix|TextView)\s+(?:alloc|new|\w+With\w*:)', '\bNSTextField\.(?:label|wrappingLabel)WithString\b',
             '(?<![\w.])(?<!struct )(?<!class )(?<!enum )(?<!extension )(?<!protocol )(?<!actor )(?<!typealias )(?:SwiftUI\.)?(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*(?:<[^>\n]*>)?\s*(?:\.init)?\s*[({]']
 allowed = ["apple/Sources/DesignSystem/"]
