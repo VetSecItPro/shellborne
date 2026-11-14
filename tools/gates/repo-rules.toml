@@ -35,15 +35,17 @@ control = 'let _ = std::process::Command::new("ls");'
 [[rule]]
 id = "network-outside-update"
 enforces = "network-capable code lives only in the update module"
-suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".modulemap", ".xcconfig", ".pbxproj"]
 patterns = ['\b(?:NS)?URLSession\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
             '\b(?:tokio|mio|async_std|smol|socket2)\s*::\s*net\b', '\bgetaddrinfo\b',
             '\b(?:gethostbyname2?|gethostbyaddr|getnameinfo|res_n?query|res_n?search|DNSServiceQueryRecord|DNSServiceGetAddrInfo)\b',
-            '\bsocket\s*\(\s*(?:AF|PF)_INET6?\b', '\bNW(?:Connection|Listener|Browser|PathMonitor|Endpoint|Parameters)\b',
+            '\b(?:AF|PF)_INET6?\b', '\bsockaddr_in6?\b', '\bINADDR_(?:ANY|LOOPBACK|BROADCAST|NONE)\b', '\bin6?addr_\w+',
+            '\binet_(?:pton|ntop|addr|aton|ntoa|network|makeaddr)\b', '\bNW(?:Connection|Listener|Browser|PathMonitor|Endpoint|Parameters)\b',
             '\bnw_(?:connection|listener|browser|endpoint|parameters|path_monitor)_\w+',
             '\bCF(?:Stream\w*SocketToHost|Host\w*|SocketCreate\w*)\b',
             '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
-            '#\s*(?:include|import)\s*[<"](?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b']
+            '#\s*(?:include|import)\s*[<"](?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b',
+            '\blink\s+framework\s+"(?:Network|CFNetwork)"', '-framework\W+(?:Network|CFNetwork)\b']
 ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|net\b)']  # Unix domain sockets, however grouped
 spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
 allowed = ["apple/Sources/Update/"]
@@ -61,10 +63,11 @@ control = "unsafe { ghostty_terminal_new(); }"
 [[rule]]
 id = "engine-module-outside-adapter"
 enforces = "only the engine adapter, the surface bridge and TerminalView bring in the engine's module, crate or header"
-suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".modulemap", ".xcconfig", ".pbxproj"]
 patterns = ['^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?i:ghostty)\w*\b',
             '@import\s+(?i:ghostty)\w*\b', '#\s*(?:include|import)\s*[<"](?i:(?:lib)?ghostty)',
-            '\b(?:use|extern\s+crate)\s+(?:::)?(?:lib)?ghostty\w*\b', '\b(?:lib)?ghostty(?:_vt|_sys)?\s*::']
+            '\b(?:use|extern\s+crate)\s+(?:::)?(?:lib)?ghostty\w*\b', '\b(?:lib)?ghostty(?:_vt|_sys)?\s*::',
+            '\blink\s+(?:framework\s+)?"(?i:(?:lib)?ghostty)', '-(?:l|framework\W+)(?i:ghostty)']
 allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/", "apple/Sources/TerminalView/"]
 control = "import GhosttyKit"
 
@@ -91,7 +94,7 @@ id = "color-outside-design-system"
 enforces = "colors are design-system tokens, defined in DesignSystem only"
 suffixes = [".swift"]
 patterns = ['"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?"',
-            '(?:\b(?:NS|UI|CG)?Color|(?<![\w])\.init)\(\s*(?:\.\w+\s*,\s*)?(?:\w*[Rr]ed|\w*[Ww]hite|\w*[Hh]ue|hex|\w*[Gg]ray)\s*:',
+            '(?:\b(?:NS|UI|CG)?Color|(?<![\w])\.init)\(\s*(?:\.\w+\s*,\s*)?(?:\w*[Rr]ed|\w*[Ww]hite|\w*[Hh]ue|hex|\w*[Gg]ray|\w*[Cc]yan|colorSpace|components)\s*:',
             '\b(?:Color|NSColor|UIColor|CGColor)\.(?:red|orange|yellow|green|mint|teal|cyan|blue|indigo|purple|pink|brown|white|gray|black|clear|magenta|darkGray|lightGray|label|secondaryLabel|tertiaryLabel|quaternaryLabel|system\w+)\b',
             '\.(?:foregroundStyle|foregroundColor|tint|background|fill|stroke|border|accentColor|shadow|overlay)\(\s*(?:\w+\s*:\s*)?\.(?:red|orange|yellow|green|mint|teal|cyan|blue|indigo|purple|pink|brown|white|gray|black|clear)\b']
 allowed = ["apple/Sources/DesignSystem/"]
@@ -101,11 +104,11 @@ control = 'let tint = Color(hex: "#3A7BD5")'
 id = "spacing-outside-design-system"
 enforces = "spacing values are design-system tokens, defined in DesignSystem only"
 suffixes = [".swift"]
-patterns = ['\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?\d', '\bspacing:\s*(?:CGFloat\(\s*)?\d',
-            '\.frame\(\s*(?:width|height|minWidth|minHeight|maxWidth|maxHeight):\s*(?:CGFloat\(\s*)?\d',
-            '\b(?:NS|NSDirectional|UI)?EdgeInsets\(\s*top:\s*-?\d', '\.(?:offset|position)\(\s*(?:x|y):\s*-?(?:CGFloat\(\s*)?\d',
+patterns = ['\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?[-+]?\d', '\bspacing:\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\.frame\(\s*(?:width|height|minWidth|minHeight|maxWidth|maxHeight):\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\b(?:NS|NSDirectional|UI)?EdgeInsets\(\s*top:\s*[-+]?\d', '\.(?:offset|position)\(\s*(?:x|y):\s*-?(?:CGFloat\(\s*)?\d',
             '\b(?:equalToConstant|greaterThanOrEqualToConstant|lessThanOrEqualToConstant|constant|minLength):\s*-?(?:CGFloat\(\s*)?\d',
-            '\.(?:cornerRadius|lineSpacing|kerning|tracking)\(\s*(?:CGFloat\(\s*)?\d',
+            '\.(?:cornerRadius|lineSpacing|kerning|tracking)\(\s*(?:CGFloat\(\s*)?[-+]?\d',
             '\.(?:spacing|constant|edgeInsets|cornerRadius|lineSpacing)\s*=\s*-?\d',
             '\b(?:let|var)\s+\w*(?:[Ss]pacing|[Pp]adding|[Ii]nset|[Gg]ap|[Mm]argin|[Gg]utter)\w*\s*(?::\s*\w+)?\s*=\s*(?:CGFloat\(\s*)?-?\d',
             '\b(?:let|var)\s+\w+\s*:\s*CGFloat\s*=\s*-?\d']
@@ -152,5 +155,5 @@ gui_allowed_prefixes = ["ghostty_key_encoder_", "ghostty_key_event_"]
 [network]
 enforces = "nothing outside the update module resolves names or links a network framework"
 update_binaries = ["ShellborneUpdate"]  # exact paths relative to the build folder, never a name found elsewhere
-forbidden_symbols = ["getaddrinfo"]
+forbidden_symbols = ["getaddrinfo", "gethostbyname", "gethostbyname2", "getnameinfo", "inet_pton", "inet_addr", "inet_aton"]
 forbidden_frameworks = ["Network.framework", "CFNetwork.framework"]

@@ -231,54 +231,60 @@ def load_commands(path):
     return names, rpaths
 
 
-def resolve(name, loader, executable, rpaths, folder, index):
-    """Where a loaded library lives inside the build folder, or None for a system library outside it."""
-    def expand(text):
-        return (text.replace("@executable_path", str(executable.parent)).replace("@loader_path", str(loader.parent)))
-    tries = []
+def resolve(name, loader, executable, run_paths, folder, names_in_folder):
+    """Where the loader would find a library, the way dyld does: an @rpath name against the run paths of the loading
+    image and then of every image above it, each @loader_path taken from the image that declared it. Returns the
+    path inside the build folder, or None for a library outside it (the system's). A library the folder holds under
+    that name but no run path reaches is broken: matching by name alone could scan a clean copy the loader skips."""
+    root = folder.resolve()
+
+    def expand(text, owner):
+        return text.replace("@executable_path", str(executable.parent)).replace("@loader_path", str(owner.parent))
+
     if name.startswith("@rpath/"):
-        tries = [pathlib.Path(expand(r)) / name[len("@rpath/"):] for r in rpaths]
+        rest = name[len("@rpath/"):]
+        tries = [pathlib.Path(expand(r, owner)) / rest for r, owner in run_paths]
     elif name.startswith(("@executable_path/", "@loader_path/")):
-        tries = [pathlib.Path(expand(name))]
+        tries = [pathlib.Path(expand(name, loader))]
     else:
         tries = [pathlib.Path(name)]
-    root = folder.resolve()
     for candidate in tries:
         try:
             real = candidate.resolve()
         except OSError:
             continue
-        if real.is_relative_to(root) and real.is_file():
-            return real
-    if name.startswith("@rpath/"):  # an install name the run paths miss: a library of the same name in the folder
-        return index.get(pathlib.PurePosixPath(name).name)
+        if real.is_file():
+            return real if real.is_relative_to(root) else None
+    base = pathlib.PurePosixPath(name).name
+    if base in names_in_folder:
+        raise Broken(f"{shown(loader.name)} loads {shown(name)}, which no run path reaches although the build folder "
+                     f"holds a {shown(base)}")
     return None
 
 
 def process_images(binary, folder, engine_names):
     """The binary and every Mach-O it loads from inside the build folder, at any depth, plus each load of a library
-    named for the engine. Yields ("image", path) and ("engine-load", library name)."""
-    index = {}
-    for path in candidates(folder):
-        if stat.S_ISREG(os.lstat(path).st_mode):
-            index.setdefault(path.name, path.resolve())
-    queue, seen = [binary.resolve()], set()
+    named for the engine. Every image meets the byte cap. Yields ("image", path) and ("engine-load", name)."""
+    names_in_folder = {path.name for path in candidates(folder) if stat.S_ISREG(os.lstat(path).st_mode)}
+    queue, seen = [(binary.resolve(), [])], set()
     while queue:
-        image = queue.pop()
+        image, inherited = queue.pop()
         if image in seen:
             continue
         seen.add(image)
         if len(seen) > MAX_FILES:
             raise Broken(f"{shown(binary.name)} loads over the {MAX_FILES}-image cap")
+        regular(image)
         yield "image", image
         names, rpaths = load_commands(image)
+        run_paths = [(r, image) for r in rpaths] + inherited  # the image's own run paths first, then its loaders'
         for name in names:
             base = pathlib.PurePosixPath(name).name.lower()
             if any(base.startswith(e) for e in engine_names):
                 yield "engine-load", name
-            found = resolve(name, image, binary, rpaths, folder, index)
+            found = resolve(name, image, binary, run_paths, folder, names_in_folder)
             if found and found not in seen and is_mach_o(found):
-                queue.append(found)
+                queue.append((found, run_paths))
 
 
 def symbols(path):
