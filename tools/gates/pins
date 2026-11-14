@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Pin gate: every dependency, engine and image is pinned by exact revision or hash, and nothing is fetched at
+build time without a checksum check (plan step P0.11.5).
+
+Usage: pins [--tables-from <ref>] <repo>
+
+Reads the tracked files of <repo> and refuses:
+  - cargo-git-rev: a Cargo git dependency, in any dependency, workspace, target, patch or replace table, without a
+    rev of exactly 40 lowercase hex characters;
+  - swiftpm-requirement: a remote .package( requirement in a Package.swift other than exact or revision;
+  - missing-lockfile: a Cargo workspace root, or a crate outside any workspace that no other manifest names as a
+    path dependency, with no tracked Cargo.lock beside it; a Package.swift with a remote dependency and no
+    tracked Package.resolved beside it;
+  - unlocked-build: a cargo command that resolves dependencies, in a workflow, a local action or a build script,
+    without a locked flag;
+  - unverified-download: a download in a workflow, a local action or a build script that no checksum
+    verification follows later in the same file. A git fetch from the repository's own origin is not a
+    download, whatever it fetches;
+  - ghostty-pin: a Ghostty pin (a PIN.toml under a ghostty folder) whose commit is not 40 lowercase hex;
+  - zig-hash: a build.zig.zon dependency that is not a path inside the tree and has no hash;
+  - docker-digest: a Dockerfile FROM, or a workflow container or service image, not pinned by sha256 digest.
+The download, checksum and build words live in pins.toml beside this file; --tables-from <ref> reads it from
+tools/gates/ at that commit of the repository instead, so in CI a pull request cannot drop a word. Each run first
+proves every word refuses its own seeded line and passes its own verified or locked line; a word that cannot go red
+breaks the run.
+
+A build script is a tracked .sh, .bash, .zsh or .mk file, a Makefile or justfile, or a file with a shell shebang.
+Workflow commands are read from run: values only. This gate reads text; it never builds, runs repository code or
+uses the network, and it does not read a dependency's own build script. Files are listed and read through the
+repo-rules reader, with its caps: tracked regular files only, never through a link, 2 MiB each. A refusal names the
+rule and file:line, never the source. Exit 0 clean, 1 refused, 2 broken; a missing, malformed or empty table, a
+manifest that does not parse, or an unreadable file is broken, never a pass.
+"""
+import importlib.machinery
+import importlib.util
+import pathlib
+import posixpath
+import re
+import sys
+import tomllib
+
+HERE = pathlib.Path(__file__).resolve().parent
+TABLE = "pins.toml"
+MAX_FINDINGS = 1000
+REVISION = re.compile(r"^[0-9a-f]{40}$")
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".mk")
+SCRIPT_NAMES = ("Makefile", "makefile", "GNUmakefile", "justfile")
+SHELL_SHEBANG = re.compile(r"^#!\s*\S*(?:/|\benv\s+)(?:ba|z|da|k)?sh\b")
+DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
+SEPARATOR = re.compile(r"&&|\|\||;|\|")
+# git fetch options that take their value as the next word, so it is not read as the remote.
+FETCH_VALUE_OPTIONS = {"--depth", "--deepen", "--shallow-since", "--shallow-exclude", "--negotiation-tip", "--refmap",
+                       "-o", "--server-option", "-j", "--jobs", "--upload-pack", "--recurse-submodules-default"}
+CONTROL_URL = "https://example.invalid/control.tgz"
+
+
+def load(name, path):
+    """A sibling gate, loaded as a module without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class Broken(Exception):
+    pass
+
+
+def word_pattern(command):
+    """A command phrase as whole words, any run of white space between them, a cargo toolchain or a one-letter
+    option with its value allowed between the first word and the rest (git -C dir fetch is git fetch)."""
+    words = command.split()
+    between = r"(?:\s+(?:\+\S+|-[A-Za-z]\s+\S+))*" if len(words) > 1 else ""
+    body = re.escape(words[0]) + between + "".join(r"\s+" + re.escape(word) for word in words[1:])
+    return re.compile(r"(?<![\w./-])" + body + r"(?![\w-])")
+
+
+def load_rules(text):
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise Broken(f"{TABLE} is malformed: {error}")
+    shape = {"downloads": {"commands"}, "checksums": {"commands"}, "builds": {"commands", "locked"}}
+    if set(data) != set(shape) or any(not isinstance(data[key], dict) or set(data[key]) != fields
+                                      for key, fields in shape.items()):
+        raise Broken(f"{TABLE} must hold exactly [downloads], [checksums] and [builds] with their word lists, "
+                     "so no rule is left without words")
+    rules = {}
+    for key, fields in shape.items():
+        for field in fields:
+            values = data[key][field]
+            if (not isinstance(values, list) or not values or len(values) > 200
+                    or not all(isinstance(v, str) and v.strip() and len(v) <= 100 for v in values)):
+                raise Broken(f"{TABLE}: [{key}] {field} must be a list of words, and an empty list cannot fail")
+            rules[(key, field)] = [" ".join(v.split()) for v in values]
+    return {
+        "downloads": [(word, word_pattern(word)) for word in rules[("downloads", "commands")]],
+        "checksums": [word_pattern(word) for word in rules[("checksums", "commands")]],
+        "builds": [word_pattern(word) for word in rules[("builds", "commands")]],
+        "locked": rules[("builds", "locked")],
+        "words": rules,
+    }
+
+
+def logical_lines(numbered):
+    """(first line number, text) with backslash continuations joined and comment lines dropped."""
+    pending, start = None, None
+    for number, line in numbered:
+        if pending is None:
+            if line.strip().startswith("#"):
+                continue
+            pending, start = "", number
+        if line.rstrip().endswith("\\"):
+            pending += line.rstrip()[:-1] + " "
+            continue
+        yield start, pending + line
+        pending = None
+    if pending is not None:
+        yield start, pending
+
+
+def segment_after(text, index):
+    """The command from index to the next shell separator."""
+    found = SEPARATOR.search(text, index)
+    return text[index:found.start() if found else len(text)]
+
+
+def fetch_from_origin(arguments):
+    """True when a git fetch names no remote, or the repository's own origin."""
+    words = [word.strip("\"'") for word in arguments.split()]
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in ("--all", "--multiple"):
+            return False
+        if word.startswith("-"):
+            index += 2 if word in FETCH_VALUE_OPTIONS else 1
+            continue
+        return word == "origin"
+    return True
+
+
+def command_findings(lines, rules):
+    """(rule, line number) for each unlocked build and unverified download in a file's command lines."""
+    found, downloads, checks = [], [], []
+    for number, text in lines:
+        for pattern in rules["builds"]:
+            for match in pattern.finditer(text):
+                rest = segment_after(text, match.end()).split()
+                if not any(word == flag or word.startswith(flag + "=") for word in rest for flag in rules["locked"]):
+                    found.append(("unlocked-build", number))
+        for word, pattern in rules["downloads"]:
+            for match in pattern.finditer(text):
+                if word == "git fetch" and fetch_from_origin(segment_after(text, match.end())):
+                    continue
+                downloads.append((number, match.end()))
+        for pattern in rules["checksums"]:
+            checks += [(number, match.start()) for match in pattern.finditer(text)]
+    for number, end in downloads:
+        if not any((check_number, at) > (number, end) for check_number, at in checks):
+            found.append(("unverified-download", number))
+    return found
+
+
+def prove_controls(rules):
+    """Every word must refuse its own seeded line and pass its own verified or locked line."""
+    first_check = rules["words"][("checksums", "commands")][0]
+    for word, _ in rules["downloads"]:
+        bad = command_findings([(1, f"{word} {CONTROL_URL}")], rules)
+        good = command_findings([(1, f"{word} {CONTROL_URL}"), (2, f"{first_check} -")], rules)
+        if ("unverified-download", 1) not in bad or good:
+            raise Broken("a download word does not refuse its own seeded download")
+    for check in rules["words"][("checksums", "commands")]:
+        first_download = rules["downloads"][0][0]
+        if command_findings([(1, f"{first_download} {CONTROL_URL}"), (2, f"{check} -")], rules):
+            raise Broken("a checksum word does not pass its own verified download")
+    for word in rules["words"][("builds", "commands")]:
+        if ("unlocked-build", 1) not in command_findings([(1, word)], rules):
+            raise Broken("a build word does not refuse its own seeded build")
+        if command_findings([(1, f"{word} {rules['locked'][0]}")], rules):
+            raise Broken("a build word does not pass its own locked build")
+
+
+def run_lines(lines):
+    """(line number, text) of every command inside a workflow or action run: value, inline or block."""
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^(\s*(?:-\s+)?)run\s*:\s*(.*)$", lines[index])
+        if not match:
+            index += 1
+            continue
+        indent = len(match.group(1))  # the column of the run key; a block value sits deeper
+        value = match.group(2).strip()
+        if value[:1] in ("|", ">"):
+            index += 1
+            while index < len(lines) and (not lines[index].strip() or len(lines[index]) - len(lines[index].lstrip()) > indent):
+                yield index + 1, lines[index]
+                index += 1
+            continue
+        if value and not value.startswith("#"):
+            yield index + 1, value
+        index += 1
+
+
+def is_script(rr, repo, name):
+    path = pathlib.PurePosixPath(name)
+    if path.suffix.lower() in SCRIPT_SUFFIXES or path.name in SCRIPT_NAMES:
+        return True
+    if path.suffix or not rr.starts_with_shebang(repo, name):
+        return False
+    first = rr.read_source(repo, name).split("\n", 1)[0]
+    return bool(SHELL_SHEBANG.match(first))
+
+
+def is_dockerfile(name):
+    base = pathlib.PurePosixPath(name).name
+    return base in ("Dockerfile", "Containerfile") or base.startswith("Dockerfile.") or base.lower().endswith(".dockerfile")
+
+
+def toml_keys(text):
+    """Yield (1-based line, key path) for each table header and each key line, so a finding names the line."""
+    current = ()
+    for number, line in enumerate(text.splitlines(), 1):
+        header = re.match(r"^\s*\[\s*([^\[\]]+?)\s*\]\s*(?:#.*)?$", line)
+        if header:
+            current = dotted(header.group(1))
+            yield number, current
+            continue
+        key = re.match(r"^\s*((?:\"[^\"]*\"|'[^']*'|[\w-]+)(?:\s*\.\s*(?:\"[^\"]*\"|'[^']*'|[\w-]+))*)\s*=", line)
+        if key:
+            yield number, current + dotted(key.group(1))
+
+
+def dotted(text):
+    return tuple(a or b or c for a, b, c in re.findall(r"\"([^\"]*)\"|'([^']*)'|([\w-]+)", text))
+
+
+def locate(text, path):
+    for number, keys in toml_keys(text):
+        if keys[:len(path)] == path:
+            return number
+    return 1
+
+
+def dependency_tables(data):
+    """(key path, table) for every table of dependencies a Cargo manifest can hold."""
+    for key in DEPENDENCY_KEYS:
+        yield (key,), data.get(key)
+    targets = data.get("target")
+    for target, body in (targets.items() if isinstance(targets, dict) else []):
+        for key in DEPENDENCY_KEYS:
+            yield ("target", target, key), body.get(key) if isinstance(body, dict) else None
+    workspace = data.get("workspace")
+    yield ("workspace", "dependencies"), workspace.get("dependencies") if isinstance(workspace, dict) else None
+    patches = data.get("patch")
+    for registry, body in (patches.items() if isinstance(patches, dict) else []):
+        yield ("patch", registry), body
+    yield ("replace",), data.get("replace")
+
+
+def check_cargo(rr, repo, names, findings):
+    tracked = set(names)
+    manifests = {}
+    for name in names:
+        if pathlib.PurePosixPath(name).name == "Cargo.toml":
+            text = rr.read_source(repo, name)
+            try:
+                manifests[name] = (text, tomllib.loads(text))
+            except tomllib.TOMLDecodeError:
+                raise Broken(f"{rr.shown(name)} is not valid TOML")
+    path_targets = set()
+    for name, (text, data) in manifests.items():
+        folder = posixpath.dirname(name)
+        for where, table in dependency_tables(data):
+            for dependency, spec in (table.items() if isinstance(table, dict) else []):
+                if not isinstance(spec, dict):
+                    continue
+                if "path" in spec and isinstance(spec["path"], str):
+                    path_targets.add(posixpath.normpath(posixpath.join(folder, spec["path"])))
+                if "git" in spec and not REVISION.match(str(spec.get("rev", ""))):
+                    findings.append(("cargo-git-rev", f"{rr.shown(name)}:{locate(text, where + (dependency,))}"))
+    roots = {posixpath.dirname(name) for name, (_, data) in manifests.items() if "workspace" in data}
+    for name, (_, data) in manifests.items():
+        folder = posixpath.dirname(name)
+        lock = posixpath.join(folder, "Cargo.lock") if folder else "Cargo.lock"
+        if "workspace" in data:
+            needs = True
+        else:
+            member = any(root == "" or folder.startswith(root + "/") for root in roots if root != folder)
+            needs = "package" in data and not member and posixpath.normpath(folder or ".") not in path_targets
+        if needs and lock not in tracked:
+            findings.append(("missing-lockfile", f"{rr.shown(name)} (no tracked Cargo.lock beside it)"))
+
+
+def swift_blank(text):
+    """The text with // and /* */ comments blanked outside strings, newlines kept."""
+    out, index, quote = [], 0, False
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and index + 1 < len(text):
+                out.append(text[index:index + 2])
+                index += 2
+                continue
+            if char in '"\n':
+                quote = False
+            out.append(char)
+        elif char == '"':
+            quote = True
+            out.append(char)
+        elif text.startswith("//", index) or text.startswith("/*", index):
+            end = text.find("\n", index) if text[index + 1] == "/" else text.find("*/", index + 2) + 2
+            end = len(text) if end < index + 2 else end
+            out.append("".join("\n" if c == "\n" else " " for c in text[index:end]))
+            index = end
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def package_calls(text):
+    """(1-based line, argument text) of each .package( call; raises ValueError when one never closes."""
+    clean = swift_blank(text)
+    for match in re.finditer(r"\.package\s*\(", clean):
+        depth, index, quote = 1, match.end(), False
+        while index < len(clean) and depth:
+            char = clean[index]
+            if quote:
+                if char == "\\":
+                    index += 1
+                elif char == '"':
+                    quote = False
+            elif char == '"':
+                quote = True
+            else:
+                depth += {"(": 1, ")": -1}.get(char, 0)
+            index += 1
+        if depth:
+            raise ValueError("a .package( call never closes")
+        yield clean.count("\n", 0, match.start()) + 1, clean[match.end():index - 1]
+
+
+def check_swift(rr, repo, names, findings):
+    tracked = set(names)
+    for name in names:
+        if pathlib.PurePosixPath(name).name != "Package.swift":
+            continue
+        try:
+            calls = list(package_calls(rr.read_source(repo, name)))
+        except ValueError as error:
+            raise Broken(f"cannot read {rr.shown(name)}: {error}")
+        remote = False
+        for number, arguments in calls:
+            if re.search(r"\bpath\s*:", arguments) and not re.search(r"\burl\s*:", arguments):
+                continue  # a package inside the tree
+            remote = True
+            if not re.search(r"\b(?:exact|revision)\s*:|\.(?:exact|revision)\s*\(", arguments):
+                findings.append(("swiftpm-requirement", f"{rr.shown(name)}:{number} (neither exact nor revision)"))
+        folder = posixpath.dirname(name)
+        resolved = posixpath.join(folder, "Package.resolved") if folder else "Package.resolved"
+        if remote and resolved not in tracked:
+            findings.append(("missing-lockfile", f"{rr.shown(name)} (no tracked Package.resolved beside it)"))
+
+
+def check_ghostty(rr, deps, repo, names, findings):
+    for name in filter(deps.ghostty_pin, names):
+        text = rr.read_source(repo, name)
+        try:
+            commit = tomllib.loads(text).get("commit", "")
+        except tomllib.TOMLDecodeError:
+            raise Broken(f"{rr.shown(name)} is not valid TOML")
+        if not REVISION.match(str(commit)):
+            number = deps.line_holding(text, r"^\s*commit\s*=")
+            findings.append(("ghostty-pin", f"{rr.shown(name)}:{number} (not a 40-hex commit)"))
+
+
+def check_zig(rr, deps, repo, names, findings):
+    for name in names:
+        if pathlib.PurePosixPath(name).name != "build.zig.zon":
+            continue
+        try:
+            entries = deps.zon_dependencies(rr.read_source(repo, name))
+        except ValueError as error:
+            raise Broken(f"cannot read {rr.shown(name)}: {error}")
+        for _, number, fields in entries:
+            if not fields.get("hash") and not ("path" in fields and "url" not in fields):
+                findings.append(("zig-hash", f"{rr.shown(name)}:{number} (a dependency with no hash)"))
+
+
+def image_pinned(image, stages):
+    return image == "scratch" or image.lower() in stages or bool(DIGEST.search(image))
+
+
+def docker_findings(text):
+    stages, found = set(), []
+    for number, line in logical_lines(enumerate(text.splitlines(), 1)):
+        match = re.match(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", line, re.IGNORECASE)
+        if match:
+            if not image_pinned(match.group(1), stages):
+                found.append(number)
+            if match.group(2):
+                stages.add(match.group(2).lower())
+    return found
+
+
+def workflow_image_findings(lines, action):
+    found = []
+    for number, line in enumerate(lines, 1):
+        match = re.match(r"^\s*(?:-\s+)?(container|image)\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        value = match.group(2).split(" #", 1)[0].strip().strip("\"'")
+        if not value or value.startswith("#"):
+            continue  # a mapping follows; its image: line is judged on its own
+        local = action and match.group(1) == "image" and ":" not in value and value.endswith("Dockerfile")
+        if not local and not DIGEST.search(value):
+            found.append(number)
+    return found
+
+
+def main(argv):
+    ref = None
+    if len(argv) == 3 and argv[0] == "--tables-from":
+        ref, argv = argv[1], argv[2:]
+    if len(argv) != 1 or argv[0].startswith("-"):
+        print("pins: broken: usage: pins [--tables-from <ref>] <repo>", file=sys.stderr)
+        return 2
+    repo = pathlib.Path(argv[0])
+    try:
+        rr = load("repo_rules", HERE / "repo-rules")
+        deps = load("deps_gate", HERE / "deps")
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"pins: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    findings = []
+    try:
+        rules = load_rules(deps.table_text(repo, ref, TABLE))
+        prove_controls(rules)
+        names = rr.tracked(repo)
+        check_cargo(rr, repo, names, findings)
+        check_swift(rr, repo, names, findings)
+        check_ghostty(rr, deps, repo, names, findings)
+        check_zig(rr, deps, repo, names, findings)
+        for name in names:
+            workflow = name.startswith(".github/workflows/") and name.endswith((".yml", ".yaml"))
+            action = name.startswith(".github/actions/") and pathlib.PurePosixPath(name).name in ("action.yml", "action.yaml")
+            if workflow or action:
+                lines = rr.read_source(repo, name).splitlines()
+                commands = list(logical_lines(run_lines(lines)))
+                images = workflow_image_findings(lines, action)
+            elif is_dockerfile(name):
+                commands, images = [], docker_findings(rr.read_source(repo, name))
+            elif is_script(rr, repo, name):
+                commands = list(logical_lines(enumerate(rr.read_source(repo, name).splitlines(), 1)))
+                images = []
+            else:
+                continue
+            for rule, number in command_findings(commands, rules):
+                findings.append((rule, f"{rr.shown(name)}:{number}"))
+            for number in images:
+                findings.append(("docker-digest", f"{rr.shown(name)}:{number} (an image with no sha256 digest)"))
+    except (Broken, deps.Broken, rr.Broken) as error:
+        print(f"pins: broken: {error}", file=sys.stderr)
+        return 2
+    for kind, where in findings[:MAX_FINDINGS]:
+        print(f"pins: refused {kind} {where}", file=sys.stderr)
+    if len(findings) > MAX_FINDINGS:
+        print(f"pins: refused: {len(findings) - MAX_FINDINGS} more refusals not listed", file=sys.stderr)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

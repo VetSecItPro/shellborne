@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Hidden-character gate: no tracked file holds an invisible or bidi character, or a long dash (plan step P0.11.2).
+
+Usage: hidden-chars <repo> [--also <path>]... [--tables-from <ref>]
+
+Reads hidden-chars.toml beside this file: the refused character ranges, the long dashes, the binary suffixes and an
+allowlist of exact tracked fixture paths, each with a reason;
+an entry for a path that is not tracked breaks the run. With --tables-from the table is read from that commit instead
+(git cat-file blob <ref>:tools/gates/hidden-chars.toml), so a branch cannot widen its own allowlist.
+
+Every tracked file is read through the repo-rules reader, with its caps: tracked regular files only, opened without
+following a link, a byte cap per file and an entry cap on the listing. A file with a listed binary suffix is not
+decoded; every other file must be valid UTF-8, so a bad byte cannot hide the rest of it. Each --also path is one
+exact file, tracked or not, inside the repository or not: a symlink is read at its target only when that target is
+a regular file, and a missing path or anything else breaks the run.
+
+Rules: hidden-character (a listed invisible or bidi character, including emoji tag sequences and variation
+selectors) and dash (U+2012 to U+2015). A refusal names the rule and file:line and never prints source; at most the
+first 1000 are printed and the rest counted. It does not catch look-alike letters, visible instructions, text inside
+images or binaries, or commit messages. Each run first proves the gate refuses its own control text; if it does
+not, the gate is broken, and so is any error it did not expect. Exit 0 clean, 1 refused, 2 broken.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tomllib
+
+
+def crashed(kind, value, trace):
+    """Any error the run did not expect, even while this file loads its controls and rules, is broken (exit 2),
+    never read as a refusal or a pass. Only the error's type is printed, never source."""
+    sys.stderr.write(f"hidden-chars: broken: an unexpected {kind.__name__} stopped the run, so no control or rule "
+                     "result can be trusted\n")
+    sys.stderr.flush()
+    os._exit(2)
+
+
+sys.excepthook = crashed
+
+HERE = pathlib.Path(__file__).resolve().parent
+READER = HERE / "repo-rules"
+TABLE_NAME = "hidden-chars.toml"
+TABLE_REF_PATH = f"tools/gates/{TABLE_NAME}"
+GATE = "hidden-chars"
+MAX_TABLE_BYTES = 256 * 1024
+MAX_RANGES = 200
+MAX_ALLOW = 500
+EXACT_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
+REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
+
+# Known-bad control: an instruction-file fixture with a right-to-left override and a tag letter, on lines 2 and 3.
+CONTROL = "# Build\nRun the gates.‮ Then stop.\nRule\U000e0041 two.\n"
+CONTROL_LINES = {2, 3}
+DASH_CONTROL = "Line one\nOpen a pane — then run.\n"
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def table_bytes(rr, repo, ref):
+    """The table's bytes, from beside this file or, with a ref, from that commit."""
+    if ref is None:
+        path = HERE / TABLE_NAME
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(MAX_TABLE_BYTES + 1)
+        except OSError as error:
+            raise rr.Broken(f"cannot read {TABLE_NAME}: {error.strerror}")
+    else:
+        if not REF.fullmatch(ref) or ref.startswith("-"):
+            raise rr.Broken(f"--tables-from needs a plain commit name, not {rr.shown(ref)}")
+        try:
+            done = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{TABLE_REF_PATH}"],
+                                  capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            raise rr.Broken(f"git could not read {TABLE_NAME} from {rr.shown(ref)}")
+        if done.returncode != 0:
+            raise rr.Broken(f"{rr.shown(ref)} has no readable {TABLE_REF_PATH}")
+        raw = done.stdout
+    if len(raw) > MAX_TABLE_BYTES:
+        raise rr.Broken(f"{TABLE_NAME} is over the {MAX_TABLE_BYTES}-byte cap")
+    return raw
+
+
+def code_points(rr, value, key):
+    """A list of [first, last] code point pairs, as a character class."""
+    if not isinstance(value, list) or not value or len(value) > MAX_RANGES:
+        raise rr.Broken(f"{TABLE_NAME}: {key} must be a list of 1 to {MAX_RANGES} ranges")
+    parts = []
+    for pair in value:
+        if not (isinstance(pair, list) and len(pair) == 2 and all(type(v) is int for v in pair)
+                and 0 <= pair[0] <= pair[1] <= 0x10FFFF):
+            raise rr.Broken(f"{TABLE_NAME}: a {key} entry is not a [first, last] pair of code points")
+        parts.append(f"\\U{pair[0]:08x}-\\U{pair[1]:08x}")
+    return re.compile("[" + "".join(parts) + "]")
+
+
+def load_table(rr, repo, ref):
+    try:
+        data = tomllib.loads(table_bytes(rr, repo, ref).decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise rr.Broken(f"cannot read {TABLE_NAME}: {error}")
+    if not {"ranges", "dashes", "binary"} <= set(data) or set(data) - {"ranges", "dashes", "binary", "allow"}:
+        raise rr.Broken(f"{TABLE_NAME} lacks or adds keys")
+    binary = data["binary"]
+    if not (isinstance(binary, list) and all(isinstance(v, str) and SUFFIX.fullmatch(v) for v in binary)):
+        raise rr.Broken(f"{TABLE_NAME}: binary must be a list of suffixes")
+    allow = data.get("allow", [])
+    if not isinstance(allow, list) or len(allow) > MAX_ALLOW:
+        raise rr.Broken(f"{TABLE_NAME}: allow must be at most {MAX_ALLOW} [[allow]] entries")
+    paths = set()
+    for entry in allow:
+        if not isinstance(entry, dict) or set(entry) != {"path", "reason"}:
+            raise rr.Broken(f"{TABLE_NAME}: an [[allow]] entry needs exactly a path and a reason")
+        path, reason = entry["path"], entry["reason"]
+        if not (isinstance(path, str) and EXACT_PATH.fullmatch(path)
+                and not any(part in (".", "..") for part in path.split("/"))):
+            raise rr.Broken(f"{TABLE_NAME}: an [[allow]] path is not one exact file path: {rr.shown(str(path))}")
+        words = re.findall(r"[A-Za-z]{2,}", reason) if isinstance(reason, str) else []
+        if not words or any(word.lower() in rr.PLACEHOLDERS for word in words):
+            raise rr.Broken(f"{TABLE_NAME}: the [[allow]] entry for {rr.shown(path)} has no real reason")
+        paths.add(path)
+    return {"hidden-character": code_points(rr, data["ranges"], "ranges"),
+            "dash": code_points(rr, data["dashes"], "dashes"),
+            "binary": tuple(v.lower() for v in binary), "allow": paths}
+
+
+def refused_lines(table, text):
+    """(rule, line number) for each line holding a refused character, once per rule and line."""
+    out = []
+    for index, line in enumerate(text.split("\n")):
+        for rule in ("hidden-character", "dash"):
+            if table[rule].search(line):
+                out.append((rule, index + 1))
+    return out
+
+
+def prove_control(rr, table):
+    """The control text must be refused on each planted line, or the gate cannot fail and is broken."""
+    if {line for rule, line in refused_lines(table, CONTROL) if rule == "hidden-character"} != CONTROL_LINES:
+        raise rr.Broken("the seeded instruction-file control was not refused, so this gate cannot fail")
+    if ("dash", 2) not in refused_lines(table, DASH_CONTROL):
+        raise rr.Broken("the seeded dash control was not refused, so this gate cannot fail")
+    print(f"{GATE}: control refused as expected")
+
+
+def scan(rr, table, repo, also):
+    found = rr.Collected()
+    names = rr.tracked(repo)
+    listed = set(names)
+    untracked = sorted(table["allow"] - listed)
+    if untracked:
+        raise rr.Broken(f"{TABLE_NAME}: the [[allow]] path {rr.shown(untracked[0])} is not a tracked file, so the "
+                        "entry allows nothing real")
+    for name in names:
+        rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
+        if name.lower().endswith(table["binary"]) or name in table["allow"]:
+            continue
+        for rule, line in refused_lines(table, rr.read_source(repo, name)):
+            found.add(f"{rule}: {rr.shown(name)}:{line}")
+    root = os.path.realpath(repo)
+    for given in also:
+        target = os.path.realpath(given)  # an exact path, read at its target; read_source refuses a non-regular file
+        if not os.path.lexists(given):
+            raise rr.Broken(f"--also path {rr.shown(given)} does not exist")
+        inside = os.path.relpath(target, root)
+        if not inside.startswith("..") and inside in listed:
+            continue  # already read as a tracked file
+        for rule, line in refused_lines(table, rr.read_source("/", target)):
+            found.add(f"{rule}: {rr.shown(given)}:{line}")
+    return found.kept, found.total
+
+
+def arguments(rr, argv):
+    repo, also, ref, rest = None, [], None, list(argv[1:])
+    while rest:
+        arg = rest.pop(0)
+        if arg in ("--also", "--tables-from"):
+            if not rest:
+                raise rr.Broken(f"{arg} needs a value")
+            value = rest.pop(0)
+            if arg == "--also":
+                also.append(value)
+            elif ref is not None:
+                raise rr.Broken("--tables-from is given once")
+            else:
+                ref = value
+        elif arg.startswith("-") or repo is not None:
+            raise rr.Broken(f"usage: {GATE} <repo> [--also <path>]... [--tables-from <ref>]")
+        else:
+            repo = arg
+    if repo is None:
+        raise rr.Broken(f"usage: {GATE} <repo> [--also <path>]... [--tables-from <ref>]")
+    return repo, also, ref
+
+
+def main(argv):
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"{GATE}: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        repo, also, ref = arguments(rr, argv)
+        table = load_table(rr, repo, ref)
+        prove_control(rr, table)
+        kept, total = scan(rr, table, repo, also)
+    except rr.Broken as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    for where in kept:
+        print(f"{GATE}: refused {where}")
+    if total > len(kept):
+        print(f"{GATE}: refused: {total - len(kept)} more refusals not listed")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

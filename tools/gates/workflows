@@ -1,23 +1,43 @@
 #!/usr/bin/env python3
-"""Workflow gate: GitHub Actions pinned to commit SHAs, least-privilege tokens, no untrusted triggers.
+"""Workflow gate: GitHub Actions pinned to commit SHAs, least-privilege tokens, no untrusted triggers, and no
+signing key name (plan steps P0.21.5 and P0.11.4).
 
-Usage: workflows <repo>
+Usage: workflows [--tables-from <ref>] <repo>
 
-Checks every file in .github/workflows/:
+Checks every tracked file in .github/workflows/ (.yml or .yaml) and every tracked action file under
+.github/actions/ (action.yml or action.yaml):
   - unpinned-action: a `uses:` that is not a local path, a docker image by digest, or owner/repo@<40-hex SHA>;
-  - permissions: no top-level `permissions:` block, or `write-all` anywhere;
+  - permissions: a workflow with no top-level `permissions:` block, a job with no `permissions:` of its own
+    (an explicit `permissions: {}` counts), or `write-all` anywhere;
   - untrusted-trigger: `pull_request_target` or `workflow_run`, which hand secrets or a write token
-    to code from an untrusted pull request;
-  - actionlint findings, at the pinned actionlint version.
-Exit 0 clean, 1 refused, 2 broken; a missing or different actionlint is broken, never a pass.
-Plan-Step: P0.21.5
+    to code from an untrusted pull request. The one exception is a pull_request_target workflow that opts in
+    with `# untrusted-trigger: base-only` and keeps its terms (see base_only below);
+  - key-name: a line naming the update signing key, by any pattern in workflows.toml beside this file, matched
+    without case anywhere on the line, comments included. Secret names themselves are checked by the
+    repo-settings gate; a key under an innocent name passes here;
+  - actionlint findings on the workflows, at the pinned actionlint version.
+
+--tables-from <ref> reads workflows.toml from tools/gates/ at that commit of the repository, so in CI a pull
+request cannot drop its own key name. Files are listed and read through the repo-rules reader, with its caps:
+tracked regular files only, never through a link, 2 MiB each, UTF-8 only; an oversized, symlinked or non-UTF-8
+file is broken, never read whole or followed. Each run first proves every key-name pattern refuses its own seeded
+line. A refusal names the rule and file:line, never the source. Exit 0 clean, 1 refused, 2 broken; a missing or
+different actionlint, or a missing, malformed or empty table, is broken, never a pass.
 """
+import importlib.machinery
+import importlib.util
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
+HERE = pathlib.Path(__file__).resolve().parent
+READER = HERE / "repo-rules"
+TABLE = "workflows.toml"
+MAX_TABLE_BYTES = 256 * 1024
+MAX_FINDINGS = 1000
 ACTIONLINT = "1.7.12"
 USES = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?([^'\"\s#]+)")
 PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
@@ -25,6 +45,77 @@ DIGEST = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
 UNTRUSTED = re.compile(r"\b(pull_request_target|workflow_run)\b")
 BASE_ONLY = "# untrusted-trigger: base-only"
 HEAD_AS_DATA = re.compile(r"^\s+[A-Z_]+:\s*\$\{\{\s*github\.event\.pull_request\.head\.sha\s*\}\}\s*$")
+
+
+class Broken(Exception):
+    pass
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def table_text(repo, ref):
+    """workflows.toml: from this folder, or from tools/gates/ at <ref> of the repository, under a byte cap."""
+    if ref is None:
+        try:
+            with open(HERE / TABLE, "rb") as handle:
+                raw = handle.read(MAX_TABLE_BYTES + 1)
+        except OSError as error:
+            raise Broken(f"cannot read {TABLE}: {error.strerror}")
+    else:
+        if not ref or ref.startswith("-"):
+            raise Broken("--tables-from needs a commit, not an option")
+        try:
+            result = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:tools/gates/{TABLE}"],
+                                    capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            raise Broken(f"git could not read {TABLE} at the named commit")
+        if result.returncode != 0:
+            raise Broken(f"there is no tools/gates/{TABLE} at the named commit")
+        raw = result.stdout
+    if len(raw) > MAX_TABLE_BYTES:
+        raise Broken(f"{TABLE} is over the {MAX_TABLE_BYTES}-byte cap for a table")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Broken(f"{TABLE} is not UTF-8")
+
+
+def key_patterns(text):
+    """The key-name patterns, lowercased. None, or anything but a list of words, is broken: the rule could not fail."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise Broken(f"{TABLE} is malformed: {error}")
+    section = data.get("key-names")
+    patterns = section.get("patterns") if isinstance(section, dict) else None
+    if set(data) != {"key-names"} or not isinstance(section, dict) or set(section) != {"patterns"}:
+        raise Broken(f"{TABLE} must hold exactly a [key-names] table with a patterns list")
+    if (not isinstance(patterns, list) or not patterns or len(patterns) > 200
+            or not all(isinstance(p, str) and p.strip() and len(p) <= 100 for p in patterns)):
+        raise Broken(f"{TABLE} names no key-name patterns, so the rule could not fail")
+    return [p.strip().lower() for p in patterns]
+
+
+def names_key(line, patterns):
+    low = line.lower()
+    return any(pattern in low for pattern in patterns)
+
+
+def prove_controls(patterns):
+    """Each pattern, planted in an env line in upper case, must be refused, and a plain line must pass."""
+    for pattern in patterns:
+        if not names_key(f"          RELEASE_{pattern.upper()}_VALUE: x", patterns):
+            raise Broken("a key-name pattern does not refuse its own seeded line")
+    if names_key("          ", patterns):
+        raise Broken("a key-name pattern refuses an empty line")
 
 
 def base_only(lines):
@@ -50,49 +141,120 @@ def base_only(lines):
     return all(HEAD_AS_DATA.match(line) for line in lines if "pull_request.head" in line)
 
 
+def significant(line):
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith("#")
+
+
+def jobs_without_permissions(lines):
+    """The 1-based line of each job under the top-level jobs: key that has no permissions: key of its own."""
+    start = next((i for i, line in enumerate(lines) if re.match(r"^jobs\s*:\s*(#.*)?$", line)), None)
+    if start is None:
+        return []
+    body = []
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if significant(line) and not line[0].isspace():
+            break
+        body.append(index)
+    job_indent = next((len(lines[i]) - len(lines[i].lstrip()) for i in body if significant(lines[i])), None)
+    if job_indent is None:
+        return []
+    jobs = [i for i in body if significant(lines[i]) and len(lines[i]) - len(lines[i].lstrip()) == job_indent]
+    missing = []
+    for position, job in enumerate(jobs):
+        end = jobs[position + 1] if position + 1 < len(jobs) else (body[-1] + 1)
+        inner = [i for i in range(job + 1, end) if significant(lines[i])]
+        child = min((len(lines[i]) - len(lines[i].lstrip()) for i in inner), default=None)
+        has = any(len(lines[i]) - len(lines[i].lstrip()) == child and re.match(r"^\s*permissions\s*:", lines[i])
+                  for i in inner)
+        if not has:
+            missing.append(job + 1)
+    return missing
+
+
+def check_file(rel, text, is_workflow, patterns, findings):
+    lines = text.splitlines()
+    shown = rel
+    if is_workflow:
+        exempt = base_only(lines)
+        if not any(re.match(r"^permissions\s*:", line) for line in lines):
+            findings.append(("permissions", f"{shown} (no top-level permissions block)"))
+        for number in jobs_without_permissions(lines):
+            findings.append(("permissions", f"{shown}:{number} (a job with no permissions of its own)"))
+    else:
+        exempt = False
+    for number, line in enumerate(lines, 1):
+        code = line.split("#", 1)[0]
+        match = USES.match(code)
+        if match:
+            ref = match.group(1)
+            if not (ref.startswith("./") or PINNED.match(ref) or DIGEST.match(ref)):
+                findings.append(("unpinned-action", f"{shown}:{number}"))
+        if re.search(r"\bwrite-all\b", code):
+            findings.append(("permissions", f"{shown}:{number}"))
+        found = UNTRUSTED.search(code)
+        if found and not (exempt and found.group(1) == "pull_request_target"):
+            findings.append(("untrusted-trigger", f"{shown}:{number}"))
+        if names_key(line, patterns):
+            findings.append(("key-name", f"{shown}:{number} (names the update signing key)"))
+
+
+def selected(name):
+    path = pathlib.PurePosixPath(name)
+    if name.startswith(".github/workflows/") and path.suffix in (".yml", ".yaml"):
+        return "workflow"
+    if name.startswith(".github/actions/") and path.name in ("action.yml", "action.yaml"):
+        return "action"
+    return None
+
+
 def broken(message):
     print(f"workflows: broken: {message}", file=sys.stderr)
     return 2
 
 
 def main(argv):
-    if len(argv) != 1:
-        return broken("usage: workflows <repo>")
-    folder = pathlib.Path(argv[0]) / ".github" / "workflows"
-    files = sorted(p for p in folder.glob("*") if p.suffix in (".yml", ".yaml")) if folder.is_dir() else []
-    findings = []
-    for path in files:
-        rel = path.relative_to(argv[0]).as_posix()
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        exempt = base_only(lines)
-        if not any(re.match(r"^permissions\s*:", line) for line in lines):
-            findings.append(("permissions", f"{rel} (no top-level permissions block)"))
-        for number, line in enumerate(lines, 1):
-            code = line.split("#", 1)[0]
-            match = USES.match(code)
-            if match:
-                ref = match.group(1)
-                if not (ref.startswith("./") or PINNED.match(ref) or DIGEST.match(ref)):
-                    findings.append(("unpinned-action", f"{rel}:{number}"))
-            if re.search(r"\bwrite-all\b", code):
-                findings.append(("permissions", f"{rel}:{number}"))
-            found = UNTRUSTED.search(code)
-            if found and not (exempt and found.group(1) == "pull_request_target"):
-                findings.append(("untrusted-trigger", f"{rel}:{number}"))
-    if files:
+    ref = None
+    if len(argv) == 3 and argv[0] == "--tables-from":
+        ref, argv = argv[1], argv[2:]
+    if len(argv) != 1 or argv[0].startswith("-"):
+        return broken("usage: workflows [--tables-from <ref>] <repo>")
+    repo = pathlib.Path(argv[0])
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        return broken(f"cannot load the repo-rules reader: {type(error).__name__}")
+    findings, workflows = [], []
+    try:
+        patterns = key_patterns(table_text(repo, ref))
+        prove_controls(patterns)
+        for name in rr.tracked(repo):
+            kind = selected(name)
+            if not kind:
+                continue
+            text = rr.read_source(repo, name)
+            if kind == "workflow":
+                workflows.append(repo / name)
+            check_file(rr.shown(name), text, kind == "workflow", patterns, findings)
+    except (Broken, rr.Broken) as error:
+        return broken(str(error))
+    if workflows:
         tool = shutil.which("actionlint")
         if not tool:
             return broken(f"actionlint is not installed; install actionlint {ACTIONLINT}. This gate never passes without it.")
         version = subprocess.run([tool, "-version"], capture_output=True, text=True).stdout.split()
         if not version or version[0] != ACTIONLINT:
             return broken(f"actionlint {version[0] if version else 'unknown'} found, {ACTIONLINT} pinned")
-        lint = subprocess.run([tool, "-no-color", "-oneline", *map(str, files)], capture_output=True, text=True)
+        lint = subprocess.run([tool, "-no-color", "-oneline", *map(str, workflows)], capture_output=True, text=True)
         for line in lint.stdout.splitlines():
             findings.append(("actionlint", line.split(": ", 1)[0]))
         if lint.returncode not in (0, 1):
             return broken(f"actionlint failed: {lint.stderr.strip()[:300]}")
-    for kind, where in findings:
+    for kind, where in findings[:MAX_FINDINGS]:
         print(f"workflows: refused {kind} {where}", file=sys.stderr)
+    if len(findings) > MAX_FINDINGS:
+        print(f"workflows: refused: {len(findings) - MAX_FINDINGS} more refusals not listed", file=sys.stderr)
     return 1 if findings else 0
 
 

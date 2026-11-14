@@ -1,0 +1,20 @@
+# Rule words for the pin gate (tools/gates/pins). Each entry is a command, matched as whole words, with any
+# run of white space between its words. In CI the gate reads this file from the base commit, so a pull
+# request cannot drop a word to pass its own download or build step.
+# Plan-Step: P0.11.5
+
+# A download: refused unless a checksum verification follows it in the same file. A git fetch from the
+# repository's own origin is not a download.
+[downloads]
+commands = ["curl", "wget", "git clone", "git fetch"]
+
+# A checksum verification that counts after a download.
+[checksums]
+commands = ["sha256sum -c", "sha256sum --check", "shasum -a 256 -c", "shasum -a 256 --check",
+            "shasum --algorithm 256 -c", "shasum --algorithm 256 --check"]
+
+# A cargo command that resolves dependencies: refused without one of the locked flags.
+[builds]
+commands = ["cargo build", "cargo test", "cargo clippy", "cargo install", "cargo run", "cargo check",
+            "cargo bench", "cargo doc", "cargo nextest"]
+locked = ["--locked", "--frozen"]

@@ -1,0 +1,8 @@
+# Names of the update signing key that no workflow or local action may hold (tools/gates/workflows).
+# Each pattern is matched without case anywhere on a line, comments included. The signing key stays
+# offline and never enters CI; a key under an innocent name is covered by the offline key checks instead.
+# In CI the gate reads this file from the base commit, so a pull request cannot drop a name.
+# Plan-Step: P0.11.4
+
+[key-names]
+patterns = ["sparkle", "eddsa", "ed25519", "su_private"]
