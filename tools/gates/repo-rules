@@ -9,7 +9,9 @@ patterns matched across lines of the whole file, the file suffixes it reads, the
 folder ends in /, anything else is one exact file), the build rule it enforces and known-bad controls; every run
 first checks that each rule's patterns match its own controls, so a rule that cannot fail stops the check. A rule
 with a reason marker allows a match whose line, or the line above it, carries that marker inside a // or /*
-comment followed by a real reason, never a placeholder.
+comment followed by a real reason, never a placeholder. A rule with a within list reads only files under those
+paths, and, when it also has a within_marker pattern, any other file whose text matches that pattern anywhere; the
+marker must match the rule's own control, so the scope cannot quietly shrink to nothing.
 
 Suffixes are compared without case. The [languages] table names native languages the rules cannot read; a tracked
 file in one is refused as source-language-unread outside the paths that table allows, so no rule is passed by
@@ -33,7 +35,7 @@ import tomllib
 
 TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
 FIELDS = {"id", "enforces", "suffixes", "patterns", "allowed", "control"}
-OPTIONAL = {"reason", "spanning", "spanning_control", "ignore"}
+OPTIONAL = {"reason", "spanning", "spanning_control", "ignore", "within", "within_marker"}
 SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
 PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
 MAX_FILES = 20000
@@ -71,8 +73,9 @@ def load_table(path=None):
     if isinstance(rules, list) and len(rules) > MAX_RULES:
         raise Broken(f"{path.name} has over the cap of {MAX_RULES} rules")
     for rule in rules if isinstance(rules, list) else []:
-        for field in ("patterns", "spanning", "ignore"):
+        for field in ("patterns", "spanning", "ignore", "within", "within_marker"):
             values = rule.get(field, []) if isinstance(rule, dict) else []
+            values = [values] if isinstance(values, str) else values
             if isinstance(values, list) and (len(values) > MAX_PATTERNS or any(
                     isinstance(v, str) and len(v) > MAX_PATTERN_CHARS for v in values)):
                 raise Broken(f"{path.name}: a rule's {field} pass the cap of {MAX_PATTERNS} patterns of "
@@ -124,13 +127,16 @@ def load_rules(path, data):
             compiled = [re.compile(p) for p in rule["patterns"]]
             spanning = [re.compile(p, re.MULTILINE) for p in rule.get("spanning", [])]
             ignore = [re.compile(p) for p in rule.get("ignore", [])]
+            marker = re.compile(rule["within_marker"]) if "within_marker" in rule else None
         except (re.error, TypeError) as error:
             raise Broken(f"{path.name}: rule {rule['id']} has a bad pattern: {error}")
         if not compiled or not any(p.search(rule["control"]) for p in compiled):
             raise Broken(f"{path.name}: rule {rule['id']}: its patterns do not match its own control, so it cannot fail")
         if spanning and not all(p.search(rule["spanning_control"]) for p in spanning):
             raise Broken(f"{path.name}: rule {rule['id']}: a spanning pattern does not match its own control, so it cannot fail")
-        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning, ignore_compiled=ignore,
+        if marker and not marker.search(rule["control"]):
+            raise Broken(f"{path.name}: rule {rule['id']}: its within_marker does not match its own control, so it cannot fail")
+        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning, ignore_compiled=ignore, marker_compiled=marker,
                         suffixes=[s.lower() for s in rule["suffixes"]]))
     return out
 
@@ -154,6 +160,10 @@ def typed(path, rule):
                                                 and "\n" in rule["spanning_control"])),
         ("spanning_control", "spanning_control" not in rule or "spanning" in rule),
         ("ignore", "ignore" not in rule or strings(rule["ignore"])),
+        ("within", "within" not in rule or (strings(rule["within"], PREFIX)
+                                            and not any(".." in v.split("/") for v in rule["within"]))),
+        ("within_marker", "within_marker" not in rule or ("within" in rule and isinstance(rule["within_marker"], str)
+                                                          and rule["within_marker"].strip())),
     ) if not ok]
     if problems:
         raise Broken(f"{path.name}: rule {rule.get('id')!r} has a malformed {', '.join(problems)}")
@@ -369,6 +379,9 @@ def findings(repo, rules, languages):
         lines = text.splitlines()
         for rule in rules:
             if not lowered.endswith(tuple(rule["suffixes"])) or allowed_at(name, rule["allowed"]):
+                continue
+            if "within" in rule and not (allowed_at(name, rule["within"]) or (
+                    rule["marker_compiled"] and rule["marker_compiled"].search(text))):
                 continue
             hits = set()
             view = blanked(text, rule["ignore_compiled"]) if rule["ignore_compiled"] else text

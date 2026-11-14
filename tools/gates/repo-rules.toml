@@ -3,8 +3,8 @@
 # known-bad control line that its own patterns must match, checked on every run. Allowed paths are from the
 # repository root: one ending in / is a folder, any other is one exact file. Patterns are regular expressions,
 # matched line by line in tracked files with the listed suffixes; spanning patterns are matched across the lines
-# of the whole file and carry their own multi-line control. Comments count too, since the gate does not parse
-# source.
+# of the whole file and carry their own multi-line control. A rule with a within list reads only files under it,
+# plus any file its within_marker pattern matches. Comments count too, since the gate does not parse source.
 
 [[rule]]
 id = "timer-or-watcher-outside-core"
@@ -18,7 +18,8 @@ patterns = ['\b(?:NS)?Timer\s*(?:\.init)?\s*\(', '\b(?:NS)?Timer\.(?:scheduledTi
             '\bnotify::(?:recommended_watcher|Watcher)\b', '\b(?:Recommended|Poll|Fsevent|FsEvent|Kqueue|Inotify)Watcher\b',
             '\bTask\.sleep\b', '\b\w*[Cc]lock(?:\(\s*\))?\.sleep\s*\(', '\bthread::sleep\b',
             '(?<![\w.:])(?:u|nano)?sleep\s*\(', '\b(?:setitimer|timer_create|timer_settime|timer_delete)\s*\(',
-            '(?<![\w.:])alarm\s*\(', '\bthis_thread\s*::\s*sleep_(?:for|until)\b']
+            '(?<![\w.:])alarm\s*\(', '\bthis_thread\s*::\s*sleep_(?:for|until)\b',
+            '\b(?:tokio|async_std|smol|async_io|futures_timer)\s*::\s*(?:time\b|task\s*::\s*sleep\b|Timer\b|Delay\b)']
 allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/event_loop.rs",
            "crates/sb-host/src/event_loop.rs", "crates/sb-vt-worker/src/event_loop.rs"]
 control = "let poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }"
@@ -38,7 +39,7 @@ id = "network-outside-update"
 enforces = "network-capable code lives only in the update module"
 suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".cppm", ".ixx", ".i", ".ii", ".modulemap", ".xcconfig", ".pbxproj"]
 patterns = ['\b(?:NS)?URLSession\b', '@?"https?://', '\b(?:Data|String|NSString|NSData)\s*\(\s*contentsOf\s*:',
-            '\bInputStream\s*\(\s*url\s*:', '\b(?:dataWithContentsOfURL|stringWithContentsOfURL|initWithContentsOfURL|inputStreamWithURL)\b', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
+            '\bInputStream\s*\(\s*url\s*:', '\b(?:dataWithContentsOfURL|stringWithContentsOfURL|initWithContentsOfURL|inputStreamWithURL)\b', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as\b', '\buse\s+(?:::)?std\s*::\s*\{[^;]*\bself\s+as\b', '\buse\s+(?:::)?\{[^;]*\bstd\s+as\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
             '\b(?:tokio|mio|async_std|smol|socket2)\s*::\s*net\b', '\bgetaddrinfo\b',
             '\b(?:gethostbyname2?|gethostbyaddr|getnameinfo|res_n?query|res_n?search|DNSServiceQueryRecord|DNSServiceGetAddrInfo)\b',
             '\b(?:AF|PF)_INET6?\b', '\bsockaddr_in6?\b', '\bINADDR_(?:ANY|LOOPBACK|BROADCAST|NONE)\b', '\bin6?addr_\w+',
@@ -50,10 +51,10 @@ patterns = ['\b(?:NS)?URLSession\b', '@?"https?://', '\b(?:Data|String|NSString|
             '\blink\s+framework\s+"(?:Network|CFNetwork)"', '\.linkedFramework\s*\(\s*"(?:Network|CFNetwork)"', '-(?:weak_|reexport_|lazy_|needed_)?framework\W+(?:Network|CFNetwork)\b',
             '\b(?:Network|CFNetwork)\.framework\b']
 ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}"\x27;]*(?:\{[^{}"\x27;]*\}[^{}"\x27;]*)*\}|net\b)']  # Unix domain sockets, however grouped
-spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
+spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b', '\buse\s+(?:::)?std\s*::\s*\{[^;]*?\bself\s+as\b', '\buse\s+(?:::)?\{[^;]*?\bstd\s+as\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
 allowed = ["apple/Sources/Update/"]
 control = "let s = URLSession.shared"
-spanning_control = "use std::{\n    io::{Read, Write},\n    net::TcpStream,\n};"
+spanning_control = "use std::{\n    io::{Read, Write},\n    net::TcpStream,\n};\nuse std::{\n    io,\n    self as s,\n};\nuse {\n    std as t,\n};"
 
 [[rule]]
 id = "engine-outside-adapter"
@@ -130,7 +131,9 @@ patterns = ['\bconstraint\w*(?:Constant|EqualTo\w*):\s*-?\d', '\b(?:CGRectMake|N
             '\.frame\([^)]*\b(?:width|height|minWidth|minHeight|maxWidth|maxHeight|idealWidth|idealHeight):\s*(?:CGFloat\(\s*)?[-+]?\d',
             '\b(?:let|var)\s+\w*(?:[Ss]pacing|[Pp]adding|[Ii]nset|[Gg]ap|[Mm]argin|[Gg]utter)\w*\s*(?::\s*\w+)?\s*=\s*(?:CGFloat\(\s*)?-?\d',
             '\b(?:let|var)\s+\w+\s*:\s*CGFloat\s*=\s*-?\d',
-            '\b(?:let|var)\s+\w+\s*(?::\s*\w+)?\s*=\s*CGFloat\(\s*[-+]?\d']
+            '\b(?:let|var)\s+\w+\s*(?::\s*\w+)?\s*=\s*CGFloat\(\s*[-+]?\d',
+            '\b(?:CG|NS)(?:Rect|Size|Point)\s*\([^)]*?\b(?:x|y|width|height):\s*(?:CGFloat\(\s*)?[-+]?\d',
+            '\.insetBy\(\s*d[xy]:\s*(?:CGFloat\(\s*)?[-+]?\d']
 allowed = ["apple/Sources/DesignSystem/"]
 control = "Text(name).padding(12)"
 
@@ -146,6 +149,32 @@ patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|Co
             '(?<![\w.])(?<!struct )(?<!class )(?<!enum )(?<!extension )(?<!protocol )(?<!actor )(?<!typealias )(?:SwiftUI\.)?(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*(?:<[^>\n]*>)?\s*(?:\.init)?\s*[({]']
 allowed = ["apple/Sources/DesignSystem/"]
 control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
+
+# Waits and locks (plan step P0.10.5). These read spelling only and cannot tell which thread or actor runs a line.
+# A blocking wait is refused in all Swift, since any thread may be one of the cooperative pool's.
+[[rule]]
+id = "wait-on-cooperative-thread"
+enforces = "no Swift code blocks a thread on a semaphore, group or condition wait, or a thread sleep"
+suffixes = [".swift"]
+patterns = ['\.\s*wait\s*\(', '\bdispatch_(?:semaphore|group)_wait\b', '\bpthread_cond_(?:timed)?wait\b',
+            '\bThread\s*\.\s*sleep\b']
+allowed = []
+control = "DispatchSemaphore(value: 0).wait()"
+
+# A lock or a synchronous queue hop is refused in main-isolated Swift: every file under the within folders, and any
+# other Swift file that names @MainActor anywhere (within_marker).
+[[rule]]
+id = "lock-on-main-isolated-code"
+enforces = "main-isolated Swift takes no lock and makes no synchronous queue hop"
+suffixes = [".swift"]
+patterns = ['\bNS(?:Recursive)?Lock\b', '\bos_unfair_lock\w*', '\bOSAllocatedUnfairLock\b', '\bMutex\b',
+            '\bpthread_mutex_(?:lock|trylock)\b', '\bobjc_sync_enter\b', '@synchronized\b', '\.\s*withLock\w*',
+            '\.\s*sync\s*[({]']
+allowed = []
+within = ["apple/Sources/PlatformShell/", "apple/Sources/TerminalView/", "apple/Sources/DesignSystem/",
+          "apple/Sources/FeaturePlaceholder/"]
+within_marker = '@MainActor\b'
+control = "@MainActor final class Box { let lock = NSLock() }"
 
 # Native source the rules above cannot read. A tracked file in one of these languages is refused outside the
 # engine adapter, where the pinned engine's own source may be vendored, so no rule is passed by changing language.
