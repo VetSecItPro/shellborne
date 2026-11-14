@@ -33,7 +33,7 @@ import tomllib
 
 TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
 FIELDS = {"id", "enforces", "suffixes", "patterns", "allowed", "control"}
-OPTIONAL = {"reason", "spanning", "spanning_control"}
+OPTIONAL = {"reason", "spanning", "spanning_control", "ignore"}
 SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
 PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
 MAX_FILES = 20000
@@ -48,6 +48,7 @@ class Broken(Exception):
 
 
 LANGUAGE_RULE = "source-language-unread"
+SCRIPT_RULE = "script-outside-tooling"
 
 
 def load_table(path=None):
@@ -60,23 +61,30 @@ def load_table(path=None):
     return rules, load_languages(path, data, rules)
 
 
+LANGUAGE_TABLES = (("languages", LANGUAGE_RULE), ("scripts", SCRIPT_RULE))
+
+
 def load_languages(path, data, rules):
-    """The [languages] table: native suffixes the rules cannot read, each refused outside its allowed paths."""
-    languages = data.get("languages")
-    if not isinstance(languages, dict) or set(languages) != {"enforces", "unread", "allowed"}:
-        raise Broken(f"{path.name}: the [languages] table lacks or adds fields")
-    unread, allowed = languages["unread"], languages["allowed"]
-    ok = (isinstance(languages["enforces"], str) and languages["enforces"].strip()
-          and isinstance(unread, list) and unread and all(isinstance(v, str) and SUFFIX.fullmatch(v) for v in unread)
-          and isinstance(allowed, list) and all(isinstance(v, str) and PREFIX.fullmatch(v) for v in allowed)
-          and not any(".." in v.split("/") for v in allowed))
-    if not ok:
-        raise Broken(f"{path.name}: the [languages] table is malformed")
-    lowered = [v.lower() for v in unread]
-    read = {s.lower() for rule in rules for s in rule["suffixes"]}
-    if len(set(lowered)) != len(lowered) or read & set(lowered):
-        raise Broken(f"{path.name}: a [languages] suffix repeats or is one a rule already reads")
-    return {"enforces": languages["enforces"], "unread": tuple(lowered), "allowed": allowed}
+    """The [languages] and [scripts] tables: suffixes the rules cannot read, each refused outside its allowed paths.
+    A suffix may appear in one table only, and never in a rule's suffixes."""
+    tables, seen = [], {s.lower() for rule in rules for s in rule["suffixes"]}
+    for section, rule_id in LANGUAGE_TABLES:
+        table = data.get(section)
+        if not isinstance(table, dict) or set(table) != {"enforces", "unread", "allowed"}:
+            raise Broken(f"{path.name}: the [{section}] table lacks or adds fields")
+        unread, allowed = table["unread"], table["allowed"]
+        ok = (isinstance(table["enforces"], str) and table["enforces"].strip()
+              and isinstance(unread, list) and unread and all(isinstance(v, str) and SUFFIX.fullmatch(v) for v in unread)
+              and isinstance(allowed, list) and all(isinstance(v, str) and PREFIX.fullmatch(v) for v in allowed)
+              and not any(".." in v.split("/") for v in allowed))
+        if not ok:
+            raise Broken(f"{path.name}: the [{section}] table is malformed")
+        lowered = [v.lower() for v in unread]
+        if len(set(lowered)) != len(lowered) or seen & set(lowered):
+            raise Broken(f"{path.name}: a [{section}] suffix repeats or is one another table or rule already reads")
+        seen |= set(lowered)
+        tables.append({"id": rule_id, "enforces": table["enforces"], "unread": tuple(lowered), "allowed": allowed})
+    return tables
 
 
 def load_rules(path, data):
@@ -94,13 +102,14 @@ def load_rules(path, data):
         try:
             compiled = [re.compile(p) for p in rule["patterns"]]
             spanning = [re.compile(p, re.MULTILINE) for p in rule.get("spanning", [])]
+            ignore = [re.compile(p) for p in rule.get("ignore", [])]
         except (re.error, TypeError) as error:
             raise Broken(f"{path.name}: rule {rule['id']} has a bad pattern: {error}")
         if not compiled or not any(p.search(rule["control"]) for p in compiled):
             raise Broken(f"{path.name}: rule {rule['id']}: its patterns do not match its own control, so it cannot fail")
         if spanning and not all(p.search(rule["spanning_control"]) for p in spanning):
             raise Broken(f"{path.name}: rule {rule['id']}: a spanning pattern does not match its own control, so it cannot fail")
-        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning,
+        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning, ignore_compiled=ignore,
                         suffixes=[s.lower() for s in rule["suffixes"]]))
     return out
 
@@ -123,6 +132,7 @@ def typed(path, rule):
                                                 and isinstance(rule.get("spanning_control"), str)
                                                 and "\n" in rule["spanning_control"])),
         ("spanning_control", "spanning_control" not in rule or "spanning" in rule),
+        ("ignore", "ignore" not in rule or strings(rule["ignore"])),
     ) if not ok]
     if problems:
         raise Broken(f"{path.name}: rule {rule.get('id')!r} has a malformed {', '.join(problems)}")
@@ -218,6 +228,14 @@ def reason_given(lines, index, marker):
     return False
 
 
+def blanked(text, patterns):
+    """The text with every match of the ignore patterns blanked out, newlines kept, so positions and line
+    numbers stay true."""
+    for pattern in patterns:
+        text = pattern.sub(lambda m: "".join("\n" if c == "\n" else " " for c in m.group(0)), text)
+    return text
+
+
 def allowed_at(name, allowed):
     """A folder entry (ending in /) allows everything under it; any other entry allows that one file only."""
     return any(name.startswith(entry) if entry.endswith("/") else name == entry for entry in allowed)
@@ -268,8 +286,10 @@ def findings(repo, rules, languages):
     suffixes = tuple({s for rule in rules for s in rule["suffixes"]})
     for name in tracked(repo):
         lowered = name.lower()
-        if lowered.endswith(languages["unread"]) and not allowed_at(name, languages["allowed"]):
-            found.add((LANGUAGE_RULE, f"{shown(name)}:1"))
+        table = next((t for t in languages if lowered.endswith(t["unread"])), None)
+        if table:
+            if not allowed_at(name, table["allowed"]):
+                found.add((table["id"], f"{shown(name)}:1"))
             continue
         if not lowered.endswith(suffixes):
             continue
@@ -279,13 +299,15 @@ def findings(repo, rules, languages):
             if not lowered.endswith(tuple(rule["suffixes"])) or allowed_at(name, rule["allowed"]):
                 continue
             hits = set()
-            for index, line in enumerate(lines):
+            view = blanked(text, rule["ignore_compiled"]) if rule["ignore_compiled"] else text
+            view_lines = view.splitlines() if rule["ignore_compiled"] else lines
+            for index, line in enumerate(view_lines):
                 if any(p.search(line) for p in rule["compiled"]):
                     if "reason" in rule and reason_given(lines, index, rule["reason"]):
                         continue
                     hits.add(index + 1)
             for pattern in rule["spanning_compiled"]:
-                hits.update(text.count("\n", 0, m.start()) + 1 for m in pattern.finditer(text))
+                hits.update(view.count("\n", 0, m.start()) + 1 for m in pattern.finditer(view))
             for line in sorted(hits):
                 found.add((rule["id"], f"{shown(name)}:{line}"))
     return found.kept, found.total
@@ -297,7 +319,8 @@ def main(argv):
         if argv[1:] == ["--list"]:
             for rule in rules:
                 print(f"{rule['id']}  {rule['enforces']}")
-            print(f"{LANGUAGE_RULE}  {languages['enforces']}")
+            for table in languages:
+                print(f"{table['id']}  {table['enforces']}")
             return 0
         if len(argv) != 2:
             raise Broken("usage: repo-rules <repo> | repo-rules --list")

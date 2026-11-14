@@ -7,7 +7,9 @@ Usage: link-check <binary folder>
 Reads the [link] table in repo-rules.toml beside this file and the symbol table (nm -P) of each named binary in
 the folder. A daemon binary (supervisor, session host, attach client, CLI) with any engine symbol, defined or
 referenced, is refused as engine-in-daemon; the GUI with an engine symbol outside the key-encoder prefixes is
-refused as engine-in-gui. A folder with none of the named binaries is not run, and a missing daemon binary is
+refused as engine-in-gui. Every Mach-O a named binary loads from inside the folder, at any depth, is judged the
+same way as the binary, and a daemon binary that loads a library named for the engine is refused even with no
+engine symbol in use. A folder with none of the named binaries is not run, and a missing daemon binary is
 broken, so the gate never passes on what it did not read. With --network, every Mach-O in the folder except
 the update module's binary is refused as network-in-binary for a getaddrinfo symbol or a link to CFNetwork or the
 Network framework; a folder with no Mach-O is not run.
@@ -197,10 +199,10 @@ def network(folder):
         if not stat.S_ISREG(os.lstat(path).st_mode) or not is_mach_o(path):
             continue
         regular(path)
-        read += 1
         rel = path.relative_to(folder).as_posix()
         if rel in net["update_binaries"]:  # the update module only at its exact path, never by a name found elsewhere
             continue
+        read += 1  # only a binary the scan judges counts, so an update binary alone is not a clean scan
         for s in sorted(symbols(path)):
             if s in net["forbidden_symbols"]:
                 found.add(("network-in-binary", f"{shown(rel)} {s}"))
@@ -209,8 +211,74 @@ def network(folder):
             if f"/{f}/" in libraries:
                 found.add(("network-in-binary", f"{shown(rel)} {f}"))
     if not read:
-        raise Broken(f"not run: no Mach-O in {shown(str(folder))}")
+        raise Broken(f"not run: no Mach-O outside the update module in {shown(str(folder))}")
     return found.kept, found.total
+
+
+def load_commands(path):
+    """The libraries a Mach-O loads (otool -L, the first line is the file itself) and its run paths (otool -l)."""
+    names = [line.strip().split(" (")[0] for line in linked(path).splitlines()[1:] if line.strip()]
+    code, out = run(["otool", "-l", str(path)])
+    if code != 0:
+        raise Broken(f"otool cannot read the load commands of {shown(path.name)}")
+    rpaths, lines = [], out.splitlines()
+    for at, line in enumerate(lines):
+        if line.strip() == "cmd LC_RPATH":
+            for following in lines[at + 1:at + 4]:
+                parts = following.strip().split(" ", 1)
+                if parts[0] == "path" and len(parts) == 2:
+                    rpaths.append(parts[1].split(" (offset")[0])
+    return names, rpaths
+
+
+def resolve(name, loader, executable, rpaths, folder, index):
+    """Where a loaded library lives inside the build folder, or None for a system library outside it."""
+    def expand(text):
+        return (text.replace("@executable_path", str(executable.parent)).replace("@loader_path", str(loader.parent)))
+    tries = []
+    if name.startswith("@rpath/"):
+        tries = [pathlib.Path(expand(r)) / name[len("@rpath/"):] for r in rpaths]
+    elif name.startswith(("@executable_path/", "@loader_path/")):
+        tries = [pathlib.Path(expand(name))]
+    else:
+        tries = [pathlib.Path(name)]
+    root = folder.resolve()
+    for candidate in tries:
+        try:
+            real = candidate.resolve()
+        except OSError:
+            continue
+        if real.is_relative_to(root) and real.is_file():
+            return real
+    if name.startswith("@rpath/"):  # an install name the run paths miss: a library of the same name in the folder
+        return index.get(pathlib.PurePosixPath(name).name)
+    return None
+
+
+def process_images(binary, folder, engine_names):
+    """The binary and every Mach-O it loads from inside the build folder, at any depth, plus each load of a library
+    named for the engine. Yields ("image", path) and ("engine-load", library name)."""
+    index = {}
+    for path in candidates(folder):
+        if stat.S_ISREG(os.lstat(path).st_mode):
+            index.setdefault(path.name, path.resolve())
+    queue, seen = [binary.resolve()], set()
+    while queue:
+        image = queue.pop()
+        if image in seen:
+            continue
+        seen.add(image)
+        if len(seen) > MAX_FILES:
+            raise Broken(f"{shown(binary.name)} loads over the {MAX_FILES}-image cap")
+        yield "image", image
+        names, rpaths = load_commands(image)
+        for name in names:
+            base = pathlib.PurePosixPath(name).name.lower()
+            if any(base.startswith(e) for e in engine_names):
+                yield "engine-load", name
+            found = resolve(name, image, binary, rpaths, folder, index)
+            if found and found not in seen and is_mach_o(found):
+                queue.append(found)
 
 
 def symbols(path):
@@ -243,15 +311,23 @@ def main(argv):
         if missing:
             raise Broken(f"daemon binaries missing from {shown(str(folder))}: {', '.join(missing)}")
         found = Collected()
+        engine_names = ("lib" + link["engine_prefix"].rstrip("_").lower(), link["engine_prefix"].rstrip("_").lower())
         for name in present:
-            engine = sorted(s for s in symbols(regular(folder / name)) if s.startswith(link["engine_prefix"]))
-            if name in link["daemon_binaries"]:
-                for s in engine:
-                    found.add(("engine-in-daemon", f"{name} {s}"))
-            else:
-                for s in engine:
-                    if not s.startswith(tuple(link["gui_allowed_prefixes"])):
-                        found.add(("engine-in-gui", f"{name} {s}"))
+            root = regular(folder / name).resolve()
+            daemon = name in link["daemon_binaries"]
+            for kind, item in process_images(root, folder, engine_names):
+                if kind == "engine-load":
+                    if daemon:  # the GUI loads the engine library for its key encoder; a daemon never loads it
+                        found.add(("engine-in-daemon", f"{name} loads {shown(pathlib.PurePosixPath(item).name)}"))
+                    continue
+                if not daemon and any(item.name.lower().startswith(e) for e in engine_names):
+                    continue  # the engine library itself; what the GUI's own images use from it is judged below
+                where = name if item == root else f"{name} via {shown(item.relative_to(folder.resolve()).as_posix())}"
+                for s in sorted(s for s in symbols(item) if s.startswith(link["engine_prefix"])):
+                    if daemon:
+                        found.add(("engine-in-daemon", f"{where} {s}"))
+                    elif not s.startswith(tuple(link["gui_allowed_prefixes"])):
+                        found.add(("engine-in-gui", f"{where} {s}"))
     except Broken as error:
         print(f"link-check: broken: {error}", file=sys.stderr)
         return 2

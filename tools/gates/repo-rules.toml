@@ -43,7 +43,8 @@ patterns = ['\b(?:NS)?URLSession\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[
             '\bnw_(?:connection|listener|browser|endpoint|parameters|path_monitor)_\w+',
             '\bCF(?:Stream\w*SocketToHost|Host\w*|SocketCreate\w*)\b',
             '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
-            '#\s*(?:include|import)\s*<(?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b']
+            '#\s*(?:include|import)\s*[<"](?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b']
+ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|net\b)']  # Unix domain sockets, however grouped
 spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
 allowed = ["apple/Sources/Update/"]
 control = "let s = URLSession.shared"
@@ -78,8 +79,9 @@ control = "ghostty_surface_new(app, cfg)"
 [[rule]]
 id = "x86-without-reason"
 enforces = "no x86-specific code path without a stated correctness reason"
-suffixes = [".swift", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
-patterns = ['target_arch\s*=\s*"x86(?:_64)?"', '#if\s+arch\(\s*(?:x86_64|i386)\s*\)', '__x86_64__']
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
+patterns = ['target_arch\s*=\s*"x86(?:_64)?"', '#if\s+arch\(\s*(?:x86_64|i386)\s*\)', '__(?:x86_64|i386|amd64)__',
+            '\bTARGET_CPU_X86(?:_64)?\b', '\b_M_(?:X64|IX86|AMD64)\b']
 allowed = []
 reason = "x86-only:"
 control = '#[cfg(target_arch = "x86_64")]'
@@ -89,7 +91,7 @@ id = "color-outside-design-system"
 enforces = "colors are design-system tokens, defined in DesignSystem only"
 suffixes = [".swift"]
 patterns = ['"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?"',
-            '\b(?:NS|UI|CG)?Color\(\s*(?:\.\w+\s*,\s*)?(?:\w*[Rr]ed|\w*[Ww]hite|\w*[Hh]ue|hex|\w*[Gg]ray)\s*:',
+            '(?:\b(?:NS|UI|CG)?Color|(?<![\w])\.init)\(\s*(?:\.\w+\s*,\s*)?(?:\w*[Rr]ed|\w*[Ww]hite|\w*[Hh]ue|hex|\w*[Gg]ray)\s*:',
             '\b(?:Color|NSColor|UIColor|CGColor)\.(?:red|orange|yellow|green|mint|teal|cyan|blue|indigo|purple|pink|brown|white|gray|black|clear|magenta|darkGray|lightGray|label|secondaryLabel|tertiaryLabel|quaternaryLabel|system\w+)\b',
             '\.(?:foregroundStyle|foregroundColor|tint|background|fill|stroke|border|accentColor|shadow|overlay)\(\s*(?:\w+\s*:\s*)?\.(?:red|orange|yellow|green|mint|teal|cyan|blue|indigo|purple|pink|brown|white|gray|black|clear)\b']
 allowed = ["apple/Sources/DesignSystem/"]
@@ -104,7 +106,9 @@ patterns = ['\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?\d', '\bspacing:\s*
             '\b(?:NS|NSDirectional|UI)?EdgeInsets\(\s*top:\s*-?\d', '\.(?:offset|position)\(\s*(?:x|y):\s*-?(?:CGFloat\(\s*)?\d',
             '\b(?:equalToConstant|greaterThanOrEqualToConstant|lessThanOrEqualToConstant|constant|minLength):\s*-?(?:CGFloat\(\s*)?\d',
             '\.(?:cornerRadius|lineSpacing|kerning|tracking)\(\s*(?:CGFloat\(\s*)?\d',
-            '\.(?:spacing|constant|edgeInsets|cornerRadius|lineSpacing)\s*=\s*-?\d']
+            '\.(?:spacing|constant|edgeInsets|cornerRadius|lineSpacing)\s*=\s*-?\d',
+            '\b(?:let|var)\s+\w*(?:[Ss]pacing|[Pp]adding|[Ii]nset|[Gg]ap|[Mm]argin|[Gg]utter)\w*\s*(?::\s*\w+)?\s*=\s*(?:CGFloat\(\s*)?-?\d',
+            '\b(?:let|var)\s+\w+\s*:\s*CGFloat\s*=\s*-?\d']
 allowed = ["apple/Sources/DesignSystem/"]
 control = "Text(name).padding(12)"
 
@@ -114,7 +118,7 @@ enforces = "controls come from the design system, never built raw"
 suffixes = [".swift"]
 patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox|TextField|SecureTextField|SearchField|TokenField|ColorWell|DatePicker|PathControl|LevelIndicator|Matrix|TextView)\s*(?:\.init)?\s*\(',
             '\bNSButton\.(?:checkbox|radioButton)WithTitle\b', '\bNSTextField\.(?:label|wrappingLabel)WithString\b',
-            '(?<![\w.])(?<!struct )(?<!class )(?<!enum )(?<!extension )(?<!protocol )(?<!actor )(?<!typealias )(?:SwiftUI\.)?(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*[({]']
+            '(?<![\w.])(?<!struct )(?<!class )(?<!enum )(?<!extension )(?<!protocol )(?<!actor )(?<!typealias )(?:SwiftUI\.)?(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*(?:\.init)?\s*[({]']
 allowed = ["apple/Sources/DesignSystem/"]
 control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
 
@@ -125,6 +129,12 @@ control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
 enforces = "native code is written only in languages the source rules read"
 unread = [".zig", ".go", ".java", ".kt", ".kts", ".cs", ".d", ".nim", ".odin", ".s", ".asm", ".f90", ".pas", ".ada"]
 allowed = ["crates/sb-engine-vt/"]
+
+# Scripts are tooling: they live with the tools, the CI and the site, never where they could ship.
+[scripts]
+enforces = "scripts live in tools, CI and the site, never in shipped code"
+unread = [".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".lua"]
+allowed = ["tools/", ".github/", "docs/"]
 
 # The link gate (P0.9.4). libghostty-vt runs only in the per-session vt worker: the supervisor, session
 # host, attach client and CLI binaries carry no engine symbol. The GUI's one input view encodes keys with
