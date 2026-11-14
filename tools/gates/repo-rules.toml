@@ -37,7 +37,7 @@ control = 'let _ = std::process::Command::new("ls");'
 id = "network-outside-update"
 enforces = "network-capable code lives only in the update module"
 suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch", ".modulemap", ".xcconfig", ".pbxproj"]
-patterns = ['\b(?:NS)?URLSession\b', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
+patterns = ['\b(?:NS)?URLSession\b', '@?"https?://', '\b(?:extern\s+crate|use)\s+(?:::)?std\s+as\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
             '\b(?:tokio|mio|async_std|smol|socket2)\s*::\s*net\b', '\bgetaddrinfo\b',
             '\b(?:gethostbyname2?|gethostbyaddr|getnameinfo|res_n?query|res_n?search|DNSServiceQueryRecord|DNSServiceGetAddrInfo)\b',
             '\b(?:AF|PF)_INET6?\b', '\bsockaddr_in6?\b', '\bINADDR_(?:ANY|LOOPBACK|BROADCAST|NONE)\b', '\bin6?addr_\w+',
@@ -80,6 +80,14 @@ suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".h
 patterns = ['\b(?i:ghostty_surface)_\w+']
 allowed = ["apple/Sources/TerminalView/"]
 control = "ghostty_surface_new(app, cfg)"
+
+[[rule]]
+id = "include-without-suffix"
+enforces = "a local include names a file with a suffix the source rules read"
+suffixes = [".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp", ".pch"]
+patterns = ['#\s*(?:include|import)\s*"[^".]+"']
+allowed = []
+control = '#include "network_impl"'
 
 [[rule]]
 id = "x86-without-reason"

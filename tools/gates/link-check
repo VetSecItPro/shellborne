@@ -190,7 +190,10 @@ def candidates(folder):
         for name in files:
             path = pathlib.Path(top) / name
             if os.path.islink(path):
-                continue  # a symlink in a bundle points at a file the walk reaches directly, or out of the folder
+                target = path.resolve()
+                if not target.is_relative_to(pathlib.Path(folder).resolve()):
+                    raise Broken(f"{shown(str(path.relative_to(folder)))} is a symlink out of the build folder")
+                continue  # a symlink inside the folder: its target is scanned where it lives
             found.append(path)
             if len(found) > MAX_FILES:
                 raise Broken(f"{shown(str(folder))} holds over the {MAX_FILES}-file cap")

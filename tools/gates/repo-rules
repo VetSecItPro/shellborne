@@ -271,7 +271,8 @@ def starts_with_shebang(repo, name):
         raise Broken(f"cannot read {shown(name)}: {error.strerror}")
 
 
-CONTINUES = ("::", ".", "(")  # a line ending in an open parenthesis continues its call
+CONTINUES = ("::", ".", "(", ":", ",")  # a line ending in an open call, a label or a comma continues it
+INLINE_COMMENT = re.compile(r"/\*.*?\*/")
 OPENS = ("::", ".", "(")
 
 
@@ -290,6 +291,7 @@ def joined_lines(lines):
                 text = text[:-1] + lines[index]  # a preprocessor splice: no space, the name continues
             else:
                 text = text.rstrip() + lines[index].strip()
+        text = INLINE_COMMENT.sub(" ", text)
         if index > start:
             yield start, text
         index += 1
@@ -372,7 +374,8 @@ def findings(repo, rules, languages):
             view = blanked(text, rule["ignore_compiled"]) if rule["ignore_compiled"] else text
             view_lines = view.splitlines() if rule["ignore_compiled"] else lines
             for index, line in enumerate(view_lines):
-                if any(p.search(line) for p in rule["compiled"]):
+                forms = (line, INLINE_COMMENT.sub(" ", line)) if "/*" in line else (line,)
+                if any(p.search(form) for p in rule["compiled"] for form in forms):
                     if "reason" in rule and reason_given(lines, index, rule["reason"]):
                         continue
                     hits.add(index + 1)
