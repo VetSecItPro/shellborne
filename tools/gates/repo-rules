@@ -2,7 +2,7 @@
 """Source gate: each rule that reading the source can decide fails the build (plan steps P0.9.1 and P0.9.2).
 
 Usage: repo-rules <repo>        check the tracked source of <repo>
-       repo-rules --list        list each rule with the build rule it enforces
+       repo-rules --list        list each rule, and the language rule, with the build rule each enforces
 
 Reads repo-rules.toml beside this file. A rule names the patterns it matches line by line, optional spanning
 patterns matched across lines of the whole file, the file suffixes it reads, the paths where a match is allowed (a
@@ -10,6 +10,10 @@ folder ends in /, anything else is one exact file), the build rule it enforces a
 first checks that each rule's patterns match its own controls, so a rule that cannot fail stops the check. A rule
 with a reason marker allows a match whose line, or the line above it, carries that marker inside a // or /*
 comment followed by a real reason, never a placeholder.
+
+Suffixes are compared without case. The [languages] table names native languages the rules cannot read; a tracked
+file in one is refused as source-language-unread outside the paths that table allows, so no rule is passed by
+changing language.
 
 Only tracked regular files are read (git ls-files), as text, at most 20000 of them and 2 MiB each, opened without
 following a symlink; a tracked symlink or special file is broken, never followed. The gate never imports, builds or
@@ -40,11 +44,38 @@ class Broken(Exception):
     pass
 
 
-def load_rules(path=TABLE):
+LANGUAGE_RULE = "source-language-unread"
+
+
+def load_table(path=TABLE):
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise Broken(f"cannot read {path.name}: {error}")
+    rules = load_rules(path, data)
+    return rules, load_languages(path, data, rules)
+
+
+def load_languages(path, data, rules):
+    """The [languages] table: native suffixes the rules cannot read, each refused outside its allowed paths."""
+    languages = data.get("languages")
+    if not isinstance(languages, dict) or set(languages) != {"enforces", "unread", "allowed"}:
+        raise Broken(f"{path.name}: the [languages] table lacks or adds fields")
+    unread, allowed = languages["unread"], languages["allowed"]
+    ok = (isinstance(languages["enforces"], str) and languages["enforces"].strip()
+          and isinstance(unread, list) and unread and all(isinstance(v, str) and SUFFIX.fullmatch(v) for v in unread)
+          and isinstance(allowed, list) and all(isinstance(v, str) and PREFIX.fullmatch(v) for v in allowed)
+          and not any(".." in v.split("/") for v in allowed))
+    if not ok:
+        raise Broken(f"{path.name}: the [languages] table is malformed")
+    lowered = [v.lower() for v in unread]
+    read = {s.lower() for rule in rules for s in rule["suffixes"]}
+    if len(set(lowered)) != len(lowered) or read & set(lowered):
+        raise Broken(f"{path.name}: a [languages] suffix repeats or is one a rule already reads")
+    return {"enforces": languages["enforces"], "unread": tuple(lowered), "allowed": allowed}
+
+
+def load_rules(path, data):
     rules = data.get("rule")
     if not isinstance(rules, list) or not rules:
         raise Broken(f"{path.name} has no rules")
@@ -65,7 +96,8 @@ def load_rules(path=TABLE):
             raise Broken(f"{path.name}: rule {rule['id']}: its patterns do not match its own control, so it cannot fail")
         if spanning and not all(p.search(rule["spanning_control"]) for p in spanning):
             raise Broken(f"{path.name}: rule {rule['id']}: a spanning pattern does not match its own control, so it cannot fail")
-        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning))
+        out.append(dict(rule, compiled=compiled, spanning_compiled=spanning,
+                        suffixes=[s.lower() for s in rule["suffixes"]]))
     return out
 
 
@@ -131,7 +163,9 @@ def reason_given(lines, index, marker):
         at = line.find(marker, start) if start >= 0 else -1
         if at < 0:
             continue
-        reason = line[at + len(marker):].replace("*/", " ").strip()
+        reason = line[at + len(marker):]
+        if line.startswith("/*", start):
+            reason = reason.split("*/", 1)[0]  # a block comment's reason ends where the comment does
         words = re.findall(r"[A-Za-z]{2,}", reason)
         if words and words[0].lower() not in PLACEHOLDERS:
             return True
@@ -156,7 +190,14 @@ def read_source(repo, name):
         try:
             if not stat.S_ISREG(os.fstat(handle).st_mode):
                 raise Broken(f"{shown(name)} is not a regular file (a symlink or special file is never read)")
-            data = os.read(handle, MAX_BYTES + 1)
+            chunks, size = [], 0
+            while size <= MAX_BYTES:  # os.read may return fewer bytes than asked; read to the end or past the cap
+                chunk = os.read(handle, MAX_BYTES + 1 - size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            data = b"".join(chunks)
         finally:
             os.close(handle)
     except OSError as error:
@@ -175,16 +216,20 @@ def shown(name):
                    for c in name)
 
 
-def findings(repo, rules):
+def findings(repo, rules, languages):
     found = []
     suffixes = tuple({s for rule in rules for s in rule["suffixes"]})
     for name in tracked(repo):
-        if not name.endswith(suffixes):
+        lowered = name.lower()
+        if lowered.endswith(languages["unread"]) and not allowed_at(name, languages["allowed"]):
+            found.append((LANGUAGE_RULE, f"{shown(name)}:1"))
+            continue
+        if not lowered.endswith(suffixes):
             continue
         text = read_source(repo, name)
         lines = text.splitlines()
         for rule in rules:
-            if not name.endswith(tuple(rule["suffixes"])) or allowed_at(name, rule["allowed"]):
+            if not lowered.endswith(tuple(rule["suffixes"])) or allowed_at(name, rule["allowed"]):
                 continue
             hits = set()
             for index, line in enumerate(lines):
@@ -200,14 +245,15 @@ def findings(repo, rules):
 
 def main(argv):
     try:
-        rules = load_rules()
+        rules, languages = load_table()
         if argv[1:] == ["--list"]:
             for rule in rules:
                 print(f"{rule['id']}  {rule['enforces']}")
+            print(f"{LANGUAGE_RULE}  {languages['enforces']}")
             return 0
         if len(argv) != 2:
             raise Broken("usage: repo-rules <repo> | repo-rules --list")
-        found = findings(argv[1], rules)
+        found = findings(argv[1], rules, languages)
     except Broken as error:
         print(f"repo-rules: broken: {error}", file=sys.stderr)
         return 2
