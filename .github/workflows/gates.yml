@@ -1,9 +1,11 @@
 # Public cleanliness gates on every pull request and every push to main: the leak guard, the secrets
 # gate and the workflow gate, each over the whole history, with every tool pinned by checksum; the
-# legal files and code owners on every run; DCO sign-off on each pull request's own commits.
+# legal files and code owners on every run; DCO sign-off on each pull request's own commits; the Rust
+# half of the language strictness gate on every run (its Swift half needs macOS and says not run here).
 # Plan-Step: P0.21.3
 # Plan-Step: P0.2.4
 # Plan-Step: P0.5.9
+# Plan-Step: P0.10.2
 name: gates
 
 on:
@@ -22,6 +24,8 @@ jobs:
   gates:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,8 +52,15 @@ jobs:
       - name: Secrets over the whole history
         run: tools/gates/secrets commits . HEAD
 
-      - name: Workflow rules
-        run: tools/gates/workflows .
+      - name: Workflow rules, with the rules table from the base commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/workflows.toml" 2>/dev/null; then
+            tools/gates/workflows --tables-from "$BASE" .
+          else
+            tools/gates/workflows .
+          fi
 
       - name: Legal files
         run: tools/gates/legal-files .
@@ -62,6 +73,25 @@ jobs:
 
       - name: Source rules
         run: tools/gates/repo-rules .
+
+      - name: Language strictness, Rust half
+        run: tools/gates/unsafe-code --rust .
+
+      - name: Who frees at the C seam
+        run: tools/gates/who-frees .
+
+      - name: Hidden characters, dashes, copy and pins, with their tables from the base commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          for pair in hidden-chars:hidden-chars.toml copy-lint:copy-lint.toml pins:pins.toml; do
+            gate="${pair%%:*}"; table="${pair#*:}"
+            if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/$table" 2>/dev/null; then
+              "tools/gates/$gate" --tables-from "$BASE" .
+            else
+              "tools/gates/$gate" .
+            fi
+          done
 
       - name: Layer boundaries
         env:

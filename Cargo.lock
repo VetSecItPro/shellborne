@@ -7,6 +7,10 @@ name = "sb-attach"
 version = "0.0.0"
 
 [[package]]
+name = "sb-bounds"
+version = "0.0.0"
+
+[[package]]
 name = "sb-cli"
 version = "0.0.0"
 
