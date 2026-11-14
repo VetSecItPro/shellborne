@@ -18,12 +18,14 @@ changing language.
 Only tracked regular files are read (git ls-files), as text, at most 20000 of them and 2 MiB each, opened without
 following a symlink; a tracked symlink or special file is broken, never followed. The gate never imports, builds or
 runs repository code and never uses the network. A refusal names the rule and file:line, never the source, with
-control and non-ASCII characters in the name escaped, and at most 1000 refusals are listed. An unreadable or
+control and non-ASCII characters in the name escaped; at most 1000 refusals are kept and listed, the rest
+counted, and git's list of names is read as a stream under a byte and an entry cap. An unreadable or
 non-UTF-8 file, a file over the cap, a malformed table or a failed git is broken. Exit 0 clean, 1 refused, 2 broken.
 """
 import os
 import pathlib
 import re
+import selectors
 import stat
 import subprocess
 import sys
@@ -37,7 +39,8 @@ PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
 MAX_FILES = 20000
 MAX_BYTES = 2 * 1024 * 1024
 MAX_FINDINGS = 1000
-PLACEHOLDERS = {"placeholder", "todo", "tbd", "fixme", "xxx", "wip", "na"}  # a reason may not start with one
+MAX_LISTING_BYTES = 16 * 1024 * 1024  # git's list of tracked names, read as a stream
+PLACEHOLDERS = {"placeholder", "todo", "tbd", "fixme", "xxx", "wip", "na"}  # a reason may not contain one
 
 
 class Broken(Exception):
@@ -47,7 +50,8 @@ class Broken(Exception):
 LANGUAGE_RULE = "source-language-unread"
 
 
-def load_table(path=TABLE):
+def load_table(path=None):
+    path = path or TABLE
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
@@ -124,22 +128,58 @@ def typed(path, rule):
         raise Broken(f"{path.name}: rule {rule.get('id')!r} has a malformed {', '.join(problems)}")
 
 
+class Collected:
+    """The first MAX_FINDINGS refusals, kept; every refusal, counted."""
+    def __init__(self):
+        self.kept, self.total = [], 0
+
+    def add(self, item):
+        self.total += 1
+        if len(self.kept) < MAX_FINDINGS:
+            self.kept.append(item)
+
+
 def tracked(repo):
+    """git's tracked names, streamed under a byte cap and an entry cap, with a time limit."""
     try:
-        listed = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise Broken(f"git could not list the tree: {error}")
-    if listed.returncode != 0:
-        raise Broken(f"git cannot list the tree at {repo}")
-    names = [n.decode("utf-8", "surrogateescape") for n in listed.stdout.split(b"\0") if n]
-    if len(names) > MAX_FILES:
-        raise Broken(f"the tree lists {len(names)} files, over the cap of {MAX_FILES}")
-    return names
+        child = subprocess.Popen(["git", "-C", str(repo), "ls-files", "-z"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except OSError as error:
+        raise Broken(f"git could not list the tree: {error.strerror}")
+    chunks, size, count = [], 0, 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                if not selector.select(timeout=120):
+                    raise Broken("git did not list the tree in time")
+                chunk = os.read(child.stdout.fileno(), 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                count += chunk.count(b"\0")
+                if size > MAX_LISTING_BYTES:
+                    raise Broken(f"git's list of tracked names passed its {MAX_LISTING_BYTES}-byte cap")
+                if count > MAX_FILES:
+                    raise Broken(f"the tree lists over the cap of {MAX_FILES} files")
+                chunks.append(chunk)
+        code = child.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        raise Broken("git did not list the tree in time")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()
+    if code != 0:
+        raise Broken(f"git cannot list the tree at {shown(str(repo))}")
+    return [n.decode("utf-8", "surrogateescape") for n in b"".join(chunks).split(b"\0") if n]
 
 
-def comment_start(line):
-    """Where a // or /* comment starts on the line, outside any double-quoted string, or -1. A quote the scan
-    cannot pair hides the rest of the line, so a doubtful marker never exempts (fail closed)."""
+def comment_bodies(line):
+    """The text inside each // or /* comment on the line, outside any double-quoted string. A block comment's body
+    ends at its own */. A quote the scan cannot pair hides the rest of the line, so a doubtful marker never exempts
+    (fail closed)."""
     quote, index = None, 0
     while index < len(line):
         char = line[index]
@@ -150,25 +190,31 @@ def comment_start(line):
                 quote = None
         elif char == '"':
             quote = char
-        elif line.startswith(("//", "/*"), index):
-            return index
+        elif line.startswith("//", index):
+            yield line[index + 2:]
+            return
+        elif line.startswith("/*", index):
+            close = line.find("*/", index + 2)
+            if close < 0:
+                yield line[index + 2:]
+                return
+            yield line[index + 2:close]
+            index = close + 2
+            continue
         index += 1
-    return -1
 
 
 def reason_given(lines, index, marker):
-    """The marker sits in a comment on the matched line or the line above, followed by a real reason."""
+    """The marker sits inside a comment on the matched line or the line above, followed by a real reason: some
+    words, none of them a placeholder."""
     for line in lines[max(0, index - 1):index + 1]:
-        start = comment_start(line)
-        at = line.find(marker, start) if start >= 0 else -1
-        if at < 0:
-            continue
-        reason = line[at + len(marker):]
-        if line.startswith("/*", start):
-            reason = reason.split("*/", 1)[0]  # a block comment's reason ends where the comment does
-        words = re.findall(r"[A-Za-z]{2,}", reason)
-        if words and words[0].lower() not in PLACEHOLDERS:
-            return True
+        for body in comment_bodies(line):
+            at = body.find(marker)
+            if at < 0:
+                continue
+            words = re.findall(r"[A-Za-z]{2,}", body[at + len(marker):])
+            if words and not any(word.lower() in PLACEHOLDERS for word in words):
+                return True
     return False
 
 
@@ -217,12 +263,13 @@ def shown(name):
 
 
 def findings(repo, rules, languages):
-    found = []
+    """The refusals for the tree: the first MAX_FINDINGS kept, and the total count."""
+    found = Collected()
     suffixes = tuple({s for rule in rules for s in rule["suffixes"]})
     for name in tracked(repo):
         lowered = name.lower()
         if lowered.endswith(languages["unread"]) and not allowed_at(name, languages["allowed"]):
-            found.append((LANGUAGE_RULE, f"{shown(name)}:1"))
+            found.add((LANGUAGE_RULE, f"{shown(name)}:1"))
             continue
         if not lowered.endswith(suffixes):
             continue
@@ -239,8 +286,9 @@ def findings(repo, rules, languages):
                     hits.add(index + 1)
             for pattern in rule["spanning_compiled"]:
                 hits.update(text.count("\n", 0, m.start()) + 1 for m in pattern.finditer(text))
-            found += [(rule["id"], f"{shown(name)}:{line}") for line in sorted(hits)]
-    return found
+            for line in sorted(hits):
+                found.add((rule["id"], f"{shown(name)}:{line}"))
+    return found.kept, found.total
 
 
 def main(argv):
@@ -253,15 +301,15 @@ def main(argv):
             return 0
         if len(argv) != 2:
             raise Broken("usage: repo-rules <repo> | repo-rules --list")
-        found = findings(argv[1], rules, languages)
+        found, total = findings(argv[1], rules, languages)
     except Broken as error:
         print(f"repo-rules: broken: {error}", file=sys.stderr)
         return 2
-    for rule, where in found[:MAX_FINDINGS]:
+    for rule, where in found:
         print(f"repo-rules: refused {rule}: {where}")
-    if len(found) > MAX_FINDINGS:
-        print(f"repo-rules: refused: {len(found) - MAX_FINDINGS} more refusals not listed")
-    return 1 if found else 0
+    if total > len(found):
+        print(f"repo-rules: refused: {total - len(found)} more refusals not listed")
+    return 1 if total else 0
 
 
 if __name__ == "__main__":

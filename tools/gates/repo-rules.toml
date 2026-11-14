@@ -9,7 +9,7 @@
 [[rule]]
 id = "timer-or-watcher-outside-core"
 enforces = "timers and file watching go through the scheduler and the one event stream"
-suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"]
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
 patterns = ['\b(?:NS)?Timer\s*(?:\.init)?\s*\(', '\b(?:NS)?Timer\.(?:scheduledTimer|publish)\w*\b',
             '\bNSTimer\s+(?:scheduledTimer|timer)\w*', '\bDispatchSource\.make(?:Timer|FileSystemObject)Source\b',
             '\bDispatchSourceTimer\b', '\bdispatch_source_create\b', '\bDISPATCH_SOURCE_TYPE_(?:TIMER|VNODE)\b',
@@ -25,7 +25,7 @@ control = "let poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) {
 [[rule]]
 id = "spawn-outside-scheduler"
 enforces = "one scheduler starts every process; the daemon alone spawns session hosts and their PTY"
-suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"]
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
 patterns = ['\bCommand::new\b', '\bposix_spawnp?\b', '\bv?fork\s*\(', '\bforkpty\s*\(', '\bexec[lv]p?e?\s*\(',
             '\b(?:system|popen)\s*\(', '\bProcess\s*(?:\.init)?\s*\(\s*\)', '\bProcess\.run\b', '\bNSTask\b']
 allowed = ["crates/sb-core/src/scheduler/", "apple/Sources/CoreClient/Scheduler/", "crates/sb-supervisor/src/spawn_host.rs",
@@ -35,11 +35,16 @@ control = 'let _ = std::process::Command::new("ls");'
 [[rule]]
 id = "network-outside-update"
 enforces = "network-capable code lives only in the update module"
-suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"]
-patterns = ['\bURLSession\b', '\bstd\s*::\s*(?:\{[^}]*\bnet\b|net\b)', '\bgetaddrinfo\b',
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
+patterns = ['\b(?:NS)?URLSession\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[^}]*(?<!unix::)\bnet\b|net\b)',
+            '\b(?:tokio|mio|async_std|smol|socket2)\s*::\s*net\b', '\bgetaddrinfo\b',
+            '\b(?:gethostbyname2?|gethostbyaddr|getnameinfo|res_n?query|res_n?search|DNSServiceQueryRecord|DNSServiceGetAddrInfo)\b',
+            '\bsocket\s*\(\s*(?:AF|PF)_INET6?\b', '\bNW(?:Connection|Listener|Browser|PathMonitor|Endpoint|Parameters)\b',
+            '\bnw_(?:connection|listener|browser|endpoint|parameters|path_monitor)_\w+',
+            '\bCF(?:Stream\w*SocketToHost|Host\w*|SocketCreate\w*)\b',
             '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
             '#\s*(?:include|import)\s*<(?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b']
-spanning = ['\bstd\s*::\s*\{[^;]*?\bnet\b']  # a grouped std import split over lines, up to its semicolon
+spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
 allowed = ["apple/Sources/Update/"]
 control = "let s = URLSession.shared"
 spanning_control = "use std::{\n    io::{Read, Write},\n    net::TcpStream,\n};"
@@ -47,23 +52,33 @@ spanning_control = "use std::{\n    io::{Read, Write},\n    net::TcpStream,\n};"
 [[rule]]
 id = "engine-outside-adapter"
 enforces = "engine symbols appear only in the engine adapter"
-suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"]
-patterns = ['\bghostty_(?!surface_)\w+']
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
+patterns = ['\b(?i:ghostty)_(?!(?i:surface)_)\w+']  # upper-case constants and a name looked up at run time count too
 allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/"]
 control = "unsafe { ghostty_terminal_new(); }"
 
 [[rule]]
+id = "engine-module-outside-adapter"
+enforces = "only the engine adapter, the surface bridge and TerminalView bring in the engine's module, crate or header"
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
+patterns = ['^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?i:ghostty)\w*\b',
+            '@import\s+(?i:ghostty)\w*\b', '#\s*(?:include|import)\s*[<"](?i:(?:lib)?ghostty)',
+            '\b(?:use|extern\s+crate)\s+(?:::)?(?:lib)?ghostty\w*\b', '\b(?:lib)?ghostty(?:_vt|_sys)?\s*::']
+allowed = ["crates/sb-engine-vt/", "apple/Sources/EngineSurface/", "apple/Sources/TerminalView/"]
+control = "import GhosttyKit"
+
+[[rule]]
 id = "surface-outside-terminalview"
 enforces = "the surface API appears only in TerminalView"
-suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"]
-patterns = ['\bghostty_surface_\w+']
+suffixes = [".swift", ".rs", ".c", ".h", ".m", ".mm", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
+patterns = ['\b(?i:ghostty_surface)_\w+']
 allowed = ["apple/Sources/TerminalView/"]
 control = "ghostty_surface_new(app, cfg)"
 
 [[rule]]
 id = "x86-without-reason"
 enforces = "no x86-specific code path without a stated correctness reason"
-suffixes = [".swift", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"]
+suffixes = [".swift", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inc", ".def", ".inl", ".ipp", ".tpp"]
 patterns = ['target_arch\s*=\s*"x86(?:_64)?"', '#if\s+arch\(\s*(?:x86_64|i386)\s*\)', '__x86_64__']
 allowed = []
 reason = "x86-only:"
@@ -86,7 +101,10 @@ enforces = "spacing values are design-system tokens, defined in DesignSystem onl
 suffixes = [".swift"]
 patterns = ['\.padding\(\s*(?:\.\w+\s*,\s*)?(?:CGFloat\(\s*)?\d', '\bspacing:\s*(?:CGFloat\(\s*)?\d',
             '\.frame\(\s*(?:width|height|minWidth|minHeight|maxWidth|maxHeight):\s*(?:CGFloat\(\s*)?\d',
-            '\bNSEdgeInsets\(\s*top:\s*\d']
+            '\b(?:NS|NSDirectional|UI)?EdgeInsets\(\s*top:\s*-?\d', '\.(?:offset|position)\(\s*(?:x|y):\s*-?(?:CGFloat\(\s*)?\d',
+            '\b(?:equalToConstant|greaterThanOrEqualToConstant|lessThanOrEqualToConstant|constant|minLength):\s*-?(?:CGFloat\(\s*)?\d',
+            '\.(?:cornerRadius|lineSpacing|kerning|tracking)\(\s*(?:CGFloat\(\s*)?\d',
+            '\.(?:spacing|constant|edgeInsets|cornerRadius|lineSpacing)\s*=\s*-?\d']
 allowed = ["apple/Sources/DesignSystem/"]
 control = "Text(name).padding(12)"
 
@@ -96,7 +114,7 @@ enforces = "controls come from the design system, never built raw"
 suffixes = [".swift"]
 patterns = ['\bNS(?:Button|Slider|Switch|PopUpButton|SegmentedControl|Stepper|ComboBox|TextField|SecureTextField|SearchField|TokenField|ColorWell|DatePicker|PathControl|LevelIndicator|Matrix|TextView)\s*(?:\.init)?\s*\(',
             '\bNSButton\.(?:checkbox|radioButton)WithTitle\b', '\bNSTextField\.(?:label|wrappingLabel)WithString\b',
-            '(?<![\w.])(?<!struct )(?<!class )(?<!enum )(?<!extension )(?<!protocol )(?<!actor )(?<!typealias )(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*[({]']
+            '(?<![\w.])(?<!struct )(?<!class )(?<!enum )(?<!extension )(?<!protocol )(?<!actor )(?<!typealias )(?:SwiftUI\.)?(?:Button|Toggle|Slider|Stepper|Picker|TextField|SecureField|Menu|ColorPicker|DatePicker|MultiDatePicker|TextEditor|Link|ShareLink|PasteButton|EditButton|RenameButton)\s*[({]']
 allowed = ["apple/Sources/DesignSystem/"]
 control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
 

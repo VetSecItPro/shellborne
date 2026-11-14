@@ -15,7 +15,7 @@ Network framework; a folder with no Mach-O is not run.
 Both tables are typed exactly: a malformed, duplicate or unknown field is broken, never read loosely. Only regular
 files are read: a named binary that is a symlink is broken, and the network scan never follows a symlink out of the
 folder. Every scan is bounded: at most MAX_FILES files, MAX_BINARY_BYTES per binary, MAX_OUTPUT bytes from one nm or
-otool run, MAX_SECONDS for the whole run, and at most MAX_FINDINGS refusals listed; past a cap the run is broken.
+otool run, MAX_SECONDS for the whole run, and at most MAX_FINDINGS refusals kept and listed, the rest counted; past any other cap the run is broken.
 File names are printed with control and non-ASCII characters escaped. Exit 0 clean, 1 refused, 2 broken or not run.
 """
 import os
@@ -42,6 +42,17 @@ START = time.monotonic()
 
 class Broken(Exception):
     pass
+
+
+class Collected:
+    """The first MAX_FINDINGS refusals, kept; every refusal, counted."""
+    def __init__(self):
+        self.kept, self.total = [], 0
+
+    def add(self, item):
+        self.total += 1
+        if len(self.kept) < MAX_FINDINGS:
+            self.kept.append(item)
 
 
 def shown(name):
@@ -181,7 +192,7 @@ def candidates(folder):
 def network(folder):
     """P0.9.6: getaddrinfo or a network framework in any Mach-O outside the update module."""
     net = table("network")
-    found, read = [], 0
+    found, read = Collected(), 0
     for path in candidates(folder):
         if not stat.S_ISREG(os.lstat(path).st_mode) or not is_mach_o(path):
             continue
@@ -190,12 +201,16 @@ def network(folder):
         rel = path.relative_to(folder).as_posix()
         if rel in net["update_binaries"]:  # the update module only at its exact path, never by a name found elsewhere
             continue
-        found += [("network-in-binary", f"{shown(rel)} {s}") for s in sorted(symbols(path)) if s in net["forbidden_symbols"]]
+        for s in sorted(symbols(path)):
+            if s in net["forbidden_symbols"]:
+                found.add(("network-in-binary", f"{shown(rel)} {s}"))
         libraries = linked(path)
-        found += [("network-in-binary", f"{shown(rel)} {f}") for f in net["forbidden_frameworks"] if f"/{f}/" in libraries]
+        for f in net["forbidden_frameworks"]:
+            if f"/{f}/" in libraries:
+                found.add(("network-in-binary", f"{shown(rel)} {f}"))
     if not read:
         raise Broken(f"not run: no Mach-O in {shown(str(folder))}")
-    return found
+    return found.kept, found.total
 
 
 def symbols(path):
@@ -217,8 +232,7 @@ def main(argv):
     try:
         remaining()
         if len(argv) == 3 and argv[1] == "--network":
-            found = network(pathlib.Path(argv[2]))
-            return report(found)
+            return report(*network(pathlib.Path(argv[2])))
         if len(argv) != 2:
             raise Broken("usage: link-check [--network] <binary folder>")
         link, folder = table("link"), pathlib.Path(argv[1])
@@ -228,26 +242,28 @@ def main(argv):
         missing = [n for n in link["daemon_binaries"] if not exists(folder / n)]
         if missing:
             raise Broken(f"daemon binaries missing from {shown(str(folder))}: {', '.join(missing)}")
-        found = []
+        found = Collected()
         for name in present:
             engine = sorted(s for s in symbols(regular(folder / name)) if s.startswith(link["engine_prefix"]))
             if name in link["daemon_binaries"]:
-                found += [("engine-in-daemon", f"{name} {s}") for s in engine]
+                for s in engine:
+                    found.add(("engine-in-daemon", f"{name} {s}"))
             else:
-                found += [("engine-in-gui", f"{name} {s}") for s in engine
-                          if not s.startswith(tuple(link["gui_allowed_prefixes"]))]
+                for s in engine:
+                    if not s.startswith(tuple(link["gui_allowed_prefixes"])):
+                        found.add(("engine-in-gui", f"{name} {s}"))
     except Broken as error:
         print(f"link-check: broken: {error}", file=sys.stderr)
         return 2
-    return report(found)
+    return report(found.kept, found.total)
 
 
-def report(found):
-    for reason, where in found[:MAX_FINDINGS]:
+def report(kept, total):
+    for reason, where in kept:
         print(f"link-check: refused {reason}: {where}")
-    if len(found) > MAX_FINDINGS:
-        print(f"link-check: refused: {len(found) - MAX_FINDINGS} more refusals not listed")
-    return 1 if found else 0
+    if total > len(kept):
+        print(f"link-check: refused: {total - len(kept)} more refusals not listed")
+    return 1 if total else 0
 
 
 if __name__ == "__main__":
