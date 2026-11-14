@@ -81,7 +81,8 @@ SHAPES = {
              "engine_prefix": lambda v: isinstance(v, str) and SYMBOL_PREFIX.fullmatch(v),
              "daemon_binaries": lambda v: strings(v, BINARY_PATH),
              "gui_binaries": lambda v: strings(v, BINARY_PATH),
-             "gui_allowed_prefixes": lambda v: strings(v, SYMBOL_PREFIX)},
+             "gui_allowed_prefixes": lambda v: strings(v, SYMBOL_PREFIX),
+             "engine_libraries": lambda v: strings(v, BINARY_PATH) and not any("/" in x for x in v)},
     "network": {"enforces": lambda v: isinstance(v, str) and v.strip(),
                 "update_binaries": lambda v: strings(v, BINARY_PATH),
                 "forbidden_symbols": lambda v: strings(v, SYMBOL_PREFIX),
@@ -326,8 +327,8 @@ def main(argv):
                     if daemon:  # the GUI loads the engine library for its key encoder; a daemon never loads it
                         found.add(("engine-in-daemon", f"{name} loads {shown(pathlib.PurePosixPath(item).name)}"))
                     continue
-                if not daemon and any(item.name.lower().startswith(e) for e in engine_names):
-                    continue  # the engine library itself; what the GUI's own images use from it is judged below
+                if not daemon and item.name in link["engine_libraries"]:
+                    continue  # the engine library itself, by exact name; what the GUI's own images use from it is judged
                 where = name if item == root else f"{name} via {shown(item.relative_to(folder.resolve()).as_posix())}"
                 for s in sorted(s for s in symbols(item) if s.startswith(link["engine_prefix"])):
                     if daemon:

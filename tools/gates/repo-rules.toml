@@ -45,7 +45,8 @@ patterns = ['\b(?:NS)?URLSession\b', '\bNSURLConnection\b', '\bstd\s*::\s*(?:\{[
             '\bCF(?:Stream\w*SocketToHost|Host\w*|SocketCreate\w*)\b',
             '^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?(?:Network|CFNetwork)\b',
             '#\s*(?:include|import)\s*[<"](?:Network|CFNetwork)/', '@import\s+(?:Network|CFNetwork)\b',
-            '\blink\s+framework\s+"(?:Network|CFNetwork)"', '-framework\W+(?:Network|CFNetwork)\b']
+            '\blink\s+framework\s+"(?:Network|CFNetwork)"', '-(?:weak_|reexport_|lazy_|needed_)?framework\W+(?:Network|CFNetwork)\b',
+            '\b(?:Network|CFNetwork)\.framework\b']
 ignore = ['\bos\s*::\s*unix\s*::\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|net\b)']  # Unix domain sockets, however grouped
 spanning = ['\bstd\s*::\s*\{[^;]*?(?<!unix::)\bnet\b']  # a grouped std import split over lines, up to its semicolon; a Unix domain socket (os::unix::net) is never the network
 allowed = ["apple/Sources/Update/"]
@@ -133,11 +134,12 @@ enforces = "native code is written only in languages the source rules read"
 unread = [".zig", ".go", ".java", ".kt", ".kts", ".cs", ".d", ".nim", ".odin", ".s", ".asm", ".f90", ".pas", ".ada"]
 allowed = ["crates/sb-engine-vt/"]
 
-# Scripts are tooling: they live with the tools, the CI and the site, never where they could ship.
+# Scripts are tooling: they live with the tools, the CI, the git hooks and the site, never where they could ship.
+# A tracked file with no known suffix that starts with #! counts as a script too.
 [scripts]
 enforces = "scripts live in tools, CI and the site, never in shipped code"
 unread = [".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".lua"]
-allowed = ["tools/", ".github/", "docs/"]
+allowed = ["tools/", ".github/", ".githooks/", "docs/"]
 
 # The link gate (P0.9.4). libghostty-vt runs only in the per-session vt worker: the supervisor, session
 # host, attach client and CLI binaries carry no engine symbol. The GUI's one input view encodes keys with
@@ -149,6 +151,7 @@ engine_prefix = "ghostty_"
 daemon_binaries = ["sb-supervisor", "sb-host", "sb-attach", "sb-cli"]
 gui_binaries = ["Shellborne"]
 gui_allowed_prefixes = ["ghostty_key_encoder_", "ghostty_key_event_"]
+engine_libraries = ["libghostty-vt.dylib", "GhosttyKit"]  # the engine's own images by exact file name: the GUI skips only these
 
 # The network scan (P0.9.6). Every Mach-O in the build folder except the update module's binary is read for a
 # getaddrinfo symbol and for a link to CFNetwork or the Network framework.

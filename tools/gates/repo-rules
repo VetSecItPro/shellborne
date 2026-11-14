@@ -228,6 +228,28 @@ def reason_given(lines, index, marker):
     return False
 
 
+def kind_check(repo, name):
+    """Every tracked path must be a regular file: a symlink or special file is broken, never followed or skipped."""
+    try:
+        info = os.lstat(pathlib.Path(repo) / name)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(name)}: {error.strerror}")
+    if not stat.S_ISREG(info.st_mode):
+        raise Broken(f"{shown(name)} is not a regular file (a symlink or special file is never read)")
+
+
+def starts_with_shebang(repo, name):
+    """The first two bytes of a regular tracked file, read without following a link."""
+    try:
+        handle = os.open(pathlib.Path(repo) / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            return os.read(handle, 2) == b"#!"
+        finally:
+            os.close(handle)
+    except OSError as error:
+        raise Broken(f"cannot read {shown(name)}: {error.strerror}")
+
+
 def blanked(text, patterns):
     """The text with every match of the ignore patterns blanked out, newlines kept, so positions and line
     numbers stay true."""
@@ -286,7 +308,10 @@ def findings(repo, rules, languages):
     suffixes = tuple({s for rule in rules for s in rule["suffixes"]})
     for name in tracked(repo):
         lowered = name.lower()
+        kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
         table = next((t for t in languages if lowered.endswith(t["unread"])), None)
+        if not table and not lowered.endswith(suffixes) and starts_with_shebang(repo, name):
+            table = next(t for t in languages if t["id"] == SCRIPT_RULE)  # a script known by its first line
         if table:
             if not allowed_at(name, table["allowed"]):
                 found.add((table["id"], f"{shown(name)}:1"))
