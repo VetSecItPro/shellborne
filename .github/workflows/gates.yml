@@ -58,8 +58,12 @@ jobs:
           elif git cat-file -e "$BASE:tools/gates/gitleaks.toml" 2>/dev/null; then
             tools/gates/secrets --tables-from "$BASE" commits . HEAD
           elif git cat-file -e "$BASE:tools/gates/secrets" 2>/dev/null; then
-            echo "The base commit has the secrets gate but not its table, tools/gates/gitleaks.toml. A change may not remove or rename a table, because the changed table would judge itself." >&2
-            exit 1
+            # The base scanner predates its table (a removed table would still be in the base), so this change
+            # brings the table: the base scanner's own code scans first, and the new table cannot loosen it.
+            git show "$BASE:tools/gates/secrets" > "$RUNNER_TEMP/base-secrets"
+            chmod +x "$RUNNER_TEMP/base-secrets"
+            "$RUNNER_TEMP/base-secrets" commits . HEAD
+            tools/gates/secrets commits . HEAD
           else
             tools/gates/secrets commits . HEAD
           fi
@@ -73,8 +77,12 @@ jobs:
           elif git cat-file -e "$BASE:tools/gates/workflows.toml" 2>/dev/null; then
             tools/gates/workflows --tables-from "$BASE" .
           elif git cat-file -e "$BASE:tools/gates/workflows" 2>/dev/null; then
-            echo "The base commit has the workflows gate but not its table, tools/gates/workflows.toml. A change may not remove or rename a table, because the changed table would judge itself." >&2
-            exit 1
+            # The base gate predates its table (a removed table would still be in the base), so this change brings
+            # the table: the base gate's own code judges the tree first, and the new table cannot loosen it.
+            git show "$BASE:tools/gates/workflows" > "$RUNNER_TEMP/base-workflows"
+            chmod +x "$RUNNER_TEMP/base-workflows"
+            "$RUNNER_TEMP/base-workflows" .
+            tools/gates/workflows .
           else
             tools/gates/workflows .
           fi
@@ -115,8 +123,12 @@ jobs:
             elif git cat-file -e "$BASE:tools/gates/$table" 2>/dev/null; then
               "tools/gates/$gate" --tables-from "$BASE" .
             elif git cat-file -e "$BASE:tools/gates/$gate" 2>/dev/null; then
-              echo "The base commit has the $gate gate but not its table, tools/gates/$table. A change may not remove or rename a table, because the changed table would judge itself." >&2
-              exit 1
+              # The base gate predates its table (a removed table would still be in the base), so this change
+              # brings the table: the base gate's own code judges the tree first, and the new table cannot loosen it.
+              git show "$BASE:tools/gates/$gate" > "$RUNNER_TEMP/base-$gate"
+              chmod +x "$RUNNER_TEMP/base-$gate"
+              "$RUNNER_TEMP/base-$gate" .
+              "tools/gates/$gate" .
             else
               "tools/gates/$gate" .
             fi
