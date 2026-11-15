@@ -16,7 +16,12 @@ flags with codesign -d and refuses:
   - helper-without-sandbox: a helper whose built or committed entitlements do not turn App Sandbox on;
   - app-with-sandbox: an app whose built or committed entitlements turn App Sandbox on;
   - no-hardened-runtime: a binary signed without the hardened runtime flag;
-  - denied-entitlement: an always-denied key in a binary or its plist, reason or not.
+  - denied-entitlement: an always-denied key in a binary or its plist, reason or not;
+  - unlisted-binary: a Mach-O in the built folder that has no [[binary]] entry, whatever its entitlements.
+The built folder is walked with the shared Mach-O reader in mach-o-reader beside this file, the one lipo uses: a
+Mach-O is known by its first four bytes, never by name, so helpers, XPC services, login items and framework
+binaries are all found, and the table must match what is built one to one. A file that is not a Mach-O is ignored; a
+symlink inside the folder is skipped and one out of it is broken, never followed.
 No listed binary built is not run, never clean; some built and some missing is broken, and so is a table with no
 [[binary]], a binary that is not a regular file or not signed, a committed plist that is missing, untracked or does
 not parse, and codesign output that does not parse or passes its cap.
@@ -50,6 +55,10 @@ MAX_TABLE_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_BINARIES = 200
 REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
+MACH_O = HERE / "mach-o-reader"
+MAX_FILES = 200000
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_SECONDS = 1800
 PATH = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+")
 KEY = re.compile(r"[A-Za-z0-9._-]+")
 ROLES = ("app", "daemon", "attach", "helper")
@@ -66,6 +75,38 @@ def reader():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def mach_o_reader():
+    """The shared Mach-O reader module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("mach_o_reader", str(MACH_O))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def unlisted(rr, built, binaries):
+    """Every Mach-O in the built folder, by its magic bytes, that the table does not list, as paths under it."""
+    try:
+        mo = mach_o_reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        raise rr.Broken(f"cannot load the Mach-O reader: {type(error).__name__}")
+    listed, extra = {entry["path"] for entry in binaries}, []
+    try:
+        read = mo.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT_BYTES, MAX_SECONDS, place="bundle")
+        for path in read.candidates(built):
+            read.remaining()
+            if not read.is_mach_o(path):
+                continue
+            read.regular(path)
+            rel = path.relative_to(built).as_posix()
+            if rel not in listed:
+                extra.append(rel)
+    except mo.Broken as error:
+        raise rr.Broken(str(error))
+    return extra
 
 
 def table_bytes(rr, repo, ref):
@@ -253,6 +294,8 @@ def main(argv):
             raise rr.Broken(f"a partial build: {rr.shown(missing['path'])} is listed but not built")
         tracked = set(rr.tracked(repo))
         found = rr.Collected()
+        for rel in unlisted(rr, built, binaries):
+            found.add(f"unlisted-binary: {rr.shown(rel)}")
         for entry in binaries:
             if entry["plist"] not in tracked:
                 raise rr.Broken(f"the committed plist {rr.shown(entry['plist'])} is not tracked")

@@ -106,11 +106,75 @@ def literal_assignments(line):
     return [m.group("v") for m in ASSIGNED.finditer(line) if m.group("v")[:1].isdigit()]
 
 
+LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"  # what str.splitlines splits on
+
+
+def blank_swift_text(text):
+    """The Swift source with every comment and string literal replaced by spaces, newlines kept, so a platform
+    declaration written inside one is not read as a setting and line numbers stay put. Handles line comments,
+    nested block comments, plain strings, triple-quoted strings and raw strings with any number of # marks."""
+    out = list(text)
+    size = len(text)
+    i = 0
+
+    def blank(start, end):
+        for k in range(start, min(end, size)):
+            if out[k] not in LINE_BREAKS:
+                out[k] = " "
+
+    while i < size:
+        if text.startswith("//", i):
+            end = i
+            while end < size and text[end] not in "\n\r":
+                end += 1
+            blank(i, end)
+            i = end
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < size and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif text[i] in '#"':
+            j = i
+            while j < size and text[j] == "#":
+                j += 1
+            if j >= size or text[j] != '"':
+                i = j if j > i else i + 1
+                continue
+            hashes = text[i:j]
+            multi = text.startswith('"""', j)
+            quote = '"""' if multi else '"'
+            closer = quote + hashes
+            k = j + len(quote)
+            while k < size:
+                if text.startswith("\\" + hashes, k):
+                    k += len(hashes) + 2
+                elif text.startswith(closer, k):
+                    k += len(closer)
+                    break
+                elif text[k] in "\n\r" and not multi:
+                    break
+                else:
+                    k += 1
+            blank(i, k)
+            i = max(k, i + 1)
+        else:
+            i += 1
+    return "".join(out)
+
+
 def judge_package(name, text, found):
     platforms = 0
+    visible = blank_swift_text(text).splitlines()
     for number, line in enumerate(text.splitlines(), 1):
         where = f"{RR.shown(name)}:{number}"
-        for match in PLATFORM.finditer(line):
+        for match in PLATFORM.finditer(visible[number - 1] if number <= len(visible) else ""):
             platforms += 1
             form = PLATFORM_FORM.match(line, match.start())
             if not form:
