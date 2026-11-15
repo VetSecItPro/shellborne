@@ -1,0 +1,19 @@
+# The document and exported types a built bundle may declare (plan step P0.11.7). tools/gates/bundle-check refuses
+# any URL scheme, and any document or exported type not listed here. Each entry is one exact identifier, never a
+# wildcard, with its kind and a real reason:
+#
+#   [[allow]]
+#   kind = "document"            # or "exported"
+#   identifier = "dev.example.type"
+#   reason = "why the bundle must declare this type"
+#
+# The list starts empty. In CI the gate reads this file from the base commit, so a branch cannot allow its own type.
+#
+# A key the gate refuses unless allowed by path (NSServices, OSAScriptingDefinition, NSAppleScriptEnabled set true,
+# NSExtension) is allowed one plist at a time, by that plist's exact path under the built folder:
+#
+#   [[allow]]
+#   kind = "key"
+#   key = "NSExtension"
+#   path = "Shellborne.app/Contents/PlugIns/Share.appex/Contents/Info.plist"
+#   reason = "why this plug-in must declare the key"

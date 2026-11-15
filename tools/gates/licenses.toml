@@ -1,0 +1,20 @@
+# The license table for the dependency gate (tools/gates/deps). Crates are judged by cargo-deny with deny.toml;
+# this table covers what cargo-deny does not see. Every license here is judged against deny.toml's allow list,
+# except OFL-1.1, which passes only for font files in a vendored folder. In CI the gate reads this file from the
+# base commit, so a pull request cannot list its own dependency.
+# Plan-Step: P0.11.3
+#
+# [[pin]]: one per SwiftPM, Zig or Ghostty pin, by exact revision. A pin that moves is a new dependency until it
+# is listed again here.
+#   kind = "swiftpm", "zig" or "ghostty"
+#   name = the Package.resolved identity, the build.zig.zon dependency name, or "ghostty"
+#   revision = the 40-hex commit, or the Zig package hash
+#   license = an SPDX id
+#
+# [[vendored]]: one per vendored folder, fonts included. The gate reads the license file itself.
+
+# The Silkscreen font and its license.
+[[vendored]]
+path = "docs/assets/fonts"
+license = "OFL-1.1"
+license-file = "docs/assets/fonts/OFL-Silkscreen.txt"

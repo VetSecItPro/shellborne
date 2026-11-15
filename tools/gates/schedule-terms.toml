@@ -1,0 +1,148 @@
+# Schedule phrase table (plan steps P0.5.8 and P0.12.5). One table, read by two lints: tools/gates/term-lint for the
+# published Intel support policy, and the plan's own schedule lint. Neither keeps a second list.
+#
+# Each [[term]] is a regular expression with a name. A "plan" term binds both lints: a calendar date, a week or
+# month count, a quarter with its year, a deadline or a timebox. A "policy" term binds only the policy page, which
+# may hold no date, month, year, quarter or duration at all. A length of time that measures something, such as a
+# 24-hour soak, is not a schedule, so hours are not listed. {months} and {number} expand from [words] before a
+# pattern compiles. A missing, malformed or empty table is a broken run, never a clean one.
+
+[words]
+months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+          "November", "December"]
+number = ['\d+', "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "twelve", "a few",
+          "several"]
+
+[[term]]
+name = "iso-date"
+scope = "plan"
+ignore_case = true
+pattern = '\b\d{4}-\d{2}-\d{2}\b'
+
+[[term]]
+name = "month-and-day"
+scope = "plan"
+ignore_case = true
+pattern = '\b(?:{months})\s+\d{1,2}\b'
+
+[[term]]
+name = "count-after-a-verb"
+scope = "plan"
+ignore_case = true
+pattern = '\b(?:within|in|for|allow|take|takes|after)\s+(?:{number})\s+(?:weeks?|months?|sprints?)\b'
+
+[[term]]
+name = "week-or-month-count"
+scope = "plan"
+ignore_case = true
+pattern = '\b(?:{number})\s+(?:weeks?|months?|sprints?)\b(?!\s+(?:of\s+)?(?:soak|data|history|logs?))'
+
+[[term]]
+name = "quarter-and-year"
+scope = "plan"
+ignore_case = true
+pattern = '\bQ[1-4]\s*\d{4}\b'
+
+[[term]]
+name = "deadline"
+scope = "plan"
+ignore_case = true
+pattern = '\bdeadlines?\b'
+
+[[term]]
+name = "timebox"
+scope = "plan"
+ignore_case = true
+pattern = '\btime-?box(?:es|ed|ing)?\b'
+
+[[term]]
+name = "due"
+scope = "plan"
+ignore_case = true
+pattern = '\bdue\s+(?:by|on|in)\b'
+
+[[term]]
+name = "month-name"
+scope = "policy"
+ignore_case = false
+pattern = '\b(?:{months}|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b'
+
+# Every month name but May in any case; May stays case-sensitive above so the verb is not refused.
+[[term]]
+name = "month-name-any-case"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:January|February|March|April|June|July|August|September|October|November|December)\b'
+
+[[term]]
+name = "year-and-month"
+scope = "policy"
+ignore_case = false
+pattern = '(?<![\w.-])(?:19|20)\d{2}-(?:0[1-9]|1[0-2])(?![\w-])'
+
+[[term]]
+name = "fiscal-year"
+scope = "policy"
+ignore_case = true
+pattern = '(?<![A-Za-z])FY\s*-?\s*\d{2,4}\b'
+
+[[term]]
+name = "year"
+scope = "policy"
+ignore_case = false
+pattern = '(?<![\w.-])(?:19|20)\d{2}(?![\w-])'
+
+[[term]]
+name = "quarter"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:Q[1-4]|H[12]|quarters?|half-year)\b'
+
+[[term]]
+name = "numeric-date"
+scope = "policy"
+ignore_case = false
+pattern = '\b\d{1,2}/\d{1,2}/\d{2,4}\b'
+
+[[term]]
+name = "dotted-date"
+scope = "policy"
+ignore_case = false
+pattern = '\b\d{1,2}\.\d{1,2}\.(?:19|20)\d{2}\b'
+
+[[term]]
+name = "duration-in-digits"
+scope = "policy"
+ignore_case = true
+pattern = '\b\d+(?:\.\d+)?\s*-?\s*(?:days?|weeks?|wks?|months?|mos?|years?|yrs?|quarters?|decades?|fortnights?)\b'
+
+# A count of hours in the hundreds or more is a calendar span (8760 hours is a year); a 24-hour soak is not.
+[[term]]
+name = "long-hour-count"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:\d{3,}|\d{1,3}(?:,\d{3})+|hundreds?|thousands?)\s*-?\s*hours?\b'
+
+[[term]]
+name = "duration-in-words"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:{number}|a|an|eleven|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|dozen|half|a couple of|couple|many)[\s-]+(?:days?|weeks?|wks?|months?|mos?|years?|yrs?|quarters?|decades?|fortnights?)\b'
+
+[[term]]
+name = "relative-period"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:next|this|last|coming|following|current|calendar|fiscal)\s+(?:days?|weeks?|months?|years?|quarters?|spring|summer|fall|autumn|winter)\b'
+
+[[term]]
+name = "season"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:spring|summer|autumn|winter)\b'
+
+[[term]]
+name = "period-word"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:annual(?:ly)?|yearly|monthly|weekly|biannual(?:ly)?|end of (?:the )?(?:year|month|quarter)|year-?end|EOY|EOQ|EOM|fortnights?|biweekly|semiannual(?:ly)?|target date|sunset date|end date|cutoff date)\b'

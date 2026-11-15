@@ -1,0 +1,2 @@
+Shellborne key-reach-check signing fixture. This file holds no secret; signing it proves only that a key can be used.
+Plan-Step: P0.11.12

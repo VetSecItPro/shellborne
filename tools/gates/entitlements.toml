@@ -1,0 +1,48 @@
+# The entitlements each built binary may carry (plan step P0.11.9). tools/gates/entitlements reads each binary's
+# signed entitlements with codesign and refuses any difference from its committed plist, keys and values, a key with
+# no real reason here, a helper without App Sandbox, an app with it, a binary without the hardened runtime, and any
+# always-denied key. Paths are exact and relative to the built folder; plists are tracked files of the repository.
+# The session host starts the person's agent, and a sandbox would pass to that agent, so only helpers are sandboxed.
+# In CI the gate reads this file from the base commit, so a branch cannot give its own new key a reason.
+
+# Keys no binary may carry, whatever the reason: a system extension and an endpoint security client.
+always_denied = [
+    "com.apple.developer.system-extension.install",
+    "com.apple.developer.endpoint-security.client",
+]
+
+[[binary]]
+path = "Shellborne"
+role = "app"
+plist = "apple/Shellborne.entitlements"
+reasons = {}
+
+[[binary]]
+path = "sb-supervisor"
+role = "daemon"
+plist = "crates/sb-supervisor/sb-supervisor.entitlements"
+reasons = {}
+
+[[binary]]
+path = "sb-host"
+role = "daemon"
+plist = "crates/sb-host/sb-host.entitlements"
+reasons = {}
+
+[[binary]]
+path = "sb-vt-worker"
+role = "daemon"
+plist = "crates/sb-vt-worker/sb-vt-worker.entitlements"
+reasons = {}
+
+[[binary]]
+path = "sb-attach"
+role = "attach"
+plist = "crates/sb-attach/sb-attach.entitlements"
+reasons = {}
+
+[[binary]]
+path = "sb-cli"
+role = "attach"
+plist = "crates/sb-cli/sb-cli.entitlements"
+reasons = {}

@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Ownership gate: every function that crosses a language boundary says who frees what it hands over (plan steps
+P0.10.4 and P0.10.5).
+
+Usage: who-frees <repo>        check the tracked Rust and Swift source of <repo>
+
+What it looks at, in tracked .rs and .swift files only:
+  - Rust functions defined with an extern ABI other than "Rust" (a bare extern means C), exported or not;
+  - every function declared inside a Rust extern block;
+  - Swift functions marked @_cdecl or @c.
+Each one needs a plain // comment that starts with "who-frees:" above it. Attribute lines, doc comments and other
+comment lines may sit between the two; a blank line or any other code ends the search, so one comment explains
+one function only. The reason after the marker must hold real words and no placeholder word, by the same test
+repo-rules applies to its x86-only marker.
+
+This gate reads text; it does not compile or parse. String literals and comments are blanked before it looks for a
+function, and string literals are blanked before it looks for the marker, so neither can be faked from inside a
+string. It cannot see functions a macro generates, a function pointer handed around as a value, or a C header we
+did not write, and it never checks that a comment tells the truth. A string or block comment that never closes is
+a file it cannot read, so the run is broken rather than passed.
+
+Files are listed and read through the repo-rules reader, with its caps: tracked regular files only, opened without
+following a link, a byte cap per file and an entry cap on the listing; a symlink or special file breaks the run.
+At most the first 1000 refusals are printed and the rest are counted. A refusal names the file and line and never
+prints source. Each run first proves the gate still refuses its own seeded functions with no comment; if it does
+not, the gate is broken. Exit 0 clean, 1 refused, 2 broken.
+"""
+import bisect
+import importlib.machinery
+import importlib.util
+import pathlib
+import re
+import sys
+
+READER = pathlib.Path(__file__).resolve().parent / "repo-rules"
+MARKER = "who-frees:"
+
+# Known-bad controls: functions with no who-frees comment that every run must refuse.
+CONTROL = '#[no_mangle]\npub extern "C" fn sb_control_open() -> *mut u8 { std::ptr::null_mut() }\n'
+CONTROL_SWIFT = '@_cdecl("sb_control_close")\npublic func sbControlClose() {}\n'
+
+RUST_DEFINITION = re.compile(r'\bextern\s*("[^"\n]*")?\s*(?P<fn>fn)\s+(?:r#)?[A-Za-z_]')
+RUST_BLOCK = re.compile(r'\bextern\s*(?:"[^"\n]*")?\s*\{')
+RUST_DECLARATION = re.compile(r'\b(?P<fn>fn)\s+(?:r#)?[A-Za-z_]')
+SWIFT_EXPORT = re.compile(
+    r'@(?:_cdecl\s*\([^)]*\)|c\b(?:\s*\([^)]*\))?)'
+    r'(?:\s*(?:@\w+(?:\s*\([^)]*\))?|(?:public|internal|private|fileprivate|package|open|static|final|'
+    r'nonisolated|override|dynamic|class)\b))*\s*(?P<fn>func)\b')
+RUST_RAW = re.compile(r'[bc]?r(#*)"')
+SWIFT_RAW = re.compile(r'(#+)("""|")')
+RUST_ATTRIBUTE = re.compile(r'#!?\[.*\]')
+SWIFT_ATTRIBUTES = re.compile(r'(?:@\w+(?:\s*\([^)]*\))?\s*)+')
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def opened_string(text, index, rust):
+    """Where a string literal starting at index begins its content, the text that closes it, and whether a
+    backslash escapes the next character; None when no string starts here."""
+    if rust:
+        before = text[index - 1] if index else ""
+        if not (before.isalnum() or before == "_"):
+            raw = RUST_RAW.match(text, index)
+            if raw:
+                return raw.end(), '"' + raw.group(1), False
+    else:
+        raw = SWIFT_RAW.match(text, index)
+        if raw:
+            return raw.end(), raw.group(2) + raw.group(1), False
+        if text.startswith('"""', index):
+            return index + 3, '"""', True
+    if text[index] == '"':
+        return index + 1, '"', True
+    return None
+
+
+def views(rr, name, text, rust):
+    """Two copies of the text with every position and newline kept: one with string contents blanked, and one with
+    string contents and comments blanked."""
+    bare, code = list(text), list(text)
+
+    def blank(chars, start, end):
+        for at in range(start, end):
+            if chars[at] != "\n":
+                chars[at] = " "
+
+    index, size = 0, len(text)
+    while index < size:
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            end = size if end < 0 else end
+            blank(code, index, end)
+            index = end
+            continue
+        if text.startswith("/*", index):
+            depth, at = 1, index + 2
+            while at < size and depth:
+                if text.startswith("/*", at):
+                    depth, at = depth + 1, at + 2
+                elif text.startswith("*/", at):
+                    depth, at = depth - 1, at + 2
+                else:
+                    at += 1
+            if depth:
+                raise rr.Broken(f"{rr.shown(name)} has a block comment that never closes, so it cannot be read")
+            blank(code, index, at)
+            index = at
+            continue
+        found = opened_string(text, index, rust)
+        if found:
+            start, close, escapes = found
+            at = start
+            while not text.startswith(close, at):
+                if at >= size:
+                    raise rr.Broken(f"{rr.shown(name)} has a string that never closes, so it cannot be read")
+                at += 2 if escapes and text[at] == "\\" else 1
+            blank(bare, start, at)
+            blank(code, start, at)
+            index = at + len(close)
+            continue
+        if rust and text[index] == "'":  # a character literal, so a quote or brace inside it is not code
+            if text.startswith("\\", index + 1):
+                end = text.find("'", index + 3)
+                if 0 <= end <= index + 12:
+                    blank(bare, index + 1, end)
+                    blank(code, index + 1, end)
+                    index = end + 1
+                    continue
+            elif index + 2 < size and text[index + 2] == "'":
+                blank(bare, index + 1, index + 2)
+                blank(code, index + 1, index + 2)
+                index += 3
+                continue
+        index += 1
+    return "".join(bare), "".join(code)
+
+
+def explained(rr, bare_lines, code_lines, index):
+    """True when the nearest who-frees comment above line index, past attribute lines, doc comments and other
+    comment lines, gives a real reason. A blank line or other code stops the search."""
+    for at in range(index - 1, -1, -1):
+        bare, code = bare_lines[at].strip(), code_lines[at].strip()
+        if not bare:
+            return False
+        if code:
+            if RUST_ATTRIBUTE.fullmatch(code) or SWIFT_ATTRIBUTES.fullmatch(code):
+                continue
+            return False
+        if bare.startswith("//") and not bare.startswith("///") and bare[2:].lstrip().startswith(MARKER):
+            return rr.reason_given([bare], 0, MARKER)
+    return False
+
+
+def unexplained(rr, name, text):
+    """The line numbers of functions in one source that cross a language boundary with no reasoned comment."""
+    rust = name.lower().endswith(".rs")
+    bare, code = views(rr, name, text, rust)
+    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    bare_lines, code_lines = bare.split("\n"), code.split("\n")
+
+    def line_of(position):
+        return bisect.bisect_right(starts, position) - 1
+
+    items = []  # (index of the line the item starts on, index of the line its fn or func keyword is on)
+    if rust:
+        for match in RUST_DEFINITION.finditer(code):
+            abi = text[match.start(1) + 1:match.end(1) - 1].strip() if match.group(1) else "C"
+            if abi != "Rust":
+                items.append((line_of(match.start()), line_of(match.start("fn"))))
+        for block in RUST_BLOCK.finditer(code):
+            depth, at = 1, block.end()
+            while at < len(code) and depth:
+                depth += {"{": 1, "}": -1}.get(code[at], 0)
+                at += 1
+            for match in RUST_DECLARATION.finditer(code, block.end(), at):
+                items.append((line_of(match.start()), line_of(match.start("fn"))))
+    else:
+        for match in SWIFT_EXPORT.finditer(code):
+            items.append((line_of(match.start()), line_of(match.start("fn"))))
+    return sorted({report + 1 for start, report in items if not explained(rr, bare_lines, code_lines, start)})
+
+
+def prove_controls(rr):
+    """The seeded functions with no comment must be refused, or the gate cannot fail and is broken."""
+    for name, text in (("control.rs", CONTROL), ("control.swift", CONTROL_SWIFT)):
+        if not unexplained(rr, name, text):
+            raise rr.Broken(f"the seeded {name} control was not refused, so this gate cannot fail")
+    print("who-frees: control refused as expected")
+
+
+def scan(rr, repo):
+    """The refusals for the tree: the first ones kept up to the reader's cap, and the total count."""
+    found = rr.Collected()
+    for name in rr.tracked(repo):
+        rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
+        if not name.lower().endswith((".rs", ".swift")):
+            continue
+        for line in unexplained(rr, name, rr.read_source(repo, name)):
+            found.add(f"{rr.shown(name)}:{line}")
+    return found.kept, found.total
+
+
+def main(argv):
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"who-frees: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        if len(argv) != 2:
+            raise rr.Broken("usage: who-frees <repo>")
+        prove_controls(rr)
+        kept, total = scan(rr, argv[1])
+    except rr.Broken as error:
+        print(f"who-frees: broken: {error}", file=sys.stderr)
+        return 2
+    for where in kept:
+        print(f"who-frees: refused {where}: a function that crosses a language boundary has no who-frees reason above it")
+    if total > len(kept):
+        print(f"who-frees: refused: {total - len(kept)} more refusals not listed")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

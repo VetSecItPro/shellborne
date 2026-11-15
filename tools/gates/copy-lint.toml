@@ -1,0 +1,163 @@
+# Copy tables for tools/gates/copy-lint (plan step P0.11.10). The long-dash rule lives in hidden-chars.toml, so it
+# is not repeated here, and the binary suffixes are read from hidden-chars.toml.
+
+# Pitches that claim security, a guard, governance or containment, matched as whole words without case. A plain
+# factual word such as "secure" or "sandbox" is not listed; only the pitch is. A factual sentence that trips one is
+# allowed by an [[allow]] entry naming the exact file and phrase, with a reason.
+forbidden = [
+    "security product",
+    "security tool",
+    "security platform",
+    "security layer",
+    "security solution",
+    "governance product",
+    "governance platform",
+    "governance layer",
+    "governance tool",
+    "agent governance",
+    "AI governance",
+    "secure terminal",
+    "secure by default",
+    "secure by design",
+    "military-grade",
+    "bank-grade",
+    "enterprise-grade security",
+    "unhackable",
+    "zero trust",
+    "zero-trust",
+    "keeps you safe",
+    "keeps your agents safe",
+    "keeps agents safe",
+    "keeps your Mac safe",
+    "protects you from",
+    "protects your Mac",
+    "protects your machine",
+    "agent firewall",
+    "agent guardrails",
+    "guardrails for agents",
+    "guardrails for your agents",
+    "contains your agents",
+    "agent containment",
+    "sandboxes your agents",
+    "fully sandboxed",
+    "isolates your agents",
+]
+
+# British spellings and the American form to write instead, matched as whole words without case.
+[spelling]
+colour = "color"
+colours = "colors"
+coloured = "colored"
+colouring = "coloring"
+colourful = "colorful"
+favour = "favor"
+favourite = "favorite"
+favourites = "favorites"
+behaviour = "behavior"
+behaviours = "behaviors"
+honour = "honor"
+labour = "labor"
+neighbour = "neighbor"
+neighbours = "neighbors"
+flavour = "flavor"
+humour = "humor"
+rumour = "rumor"
+harbour = "harbor"
+centre = "center"
+centres = "centers"
+centred = "centered"
+metre = "meter"
+metres = "meters"
+litre = "liter"
+fibre = "fiber"
+theatre = "theater"
+licence = "license"
+licences = "licenses"
+defence = "defense"
+offence = "offense"
+cheque = "check"
+grey = "gray"
+greys = "grays"
+greyed = "grayed"
+catalogue = "catalog"
+catalogues = "catalogs"
+programme = "program"
+programmes = "programs"
+manoeuvre = "maneuver"
+judgement = "judgment"
+aluminium = "aluminum"
+artefact = "artifact"
+artefacts = "artifacts"
+fortnight = "two weeks"
+whilst = "while"
+amongst = "among"
+travelled = "traveled"
+travelling = "traveling"
+traveller = "traveler"
+cancelled = "canceled"
+cancelling = "canceling"
+labelled = "labeled"
+labelling = "labeling"
+modelled = "modeled"
+modelling = "modeling"
+totalled = "totaled"
+signalled = "signaled"
+fuelled = "fueled"
+fulfil = "fulfill"
+enrol = "enroll"
+skilful = "skillful"
+analyse = "analyze"
+analysed = "analyzed"
+analysing = "analyzing"
+organise = "organize"
+organised = "organized"
+organises = "organizes"
+organising = "organizing"
+organisation = "organization"
+organisations = "organizations"
+realise = "realize"
+realised = "realized"
+realises = "realizes"
+realising = "realizing"
+recognise = "recognize"
+recognised = "recognized"
+optimise = "optimize"
+optimised = "optimized"
+optimisation = "optimization"
+prioritise = "prioritize"
+prioritised = "prioritized"
+customise = "customize"
+customised = "customized"
+customisation = "customization"
+initialise = "initialize"
+initialised = "initialized"
+initialisation = "initialization"
+serialise = "serialize"
+serialised = "serialized"
+serialisation = "serialization"
+normalise = "normalize"
+normalised = "normalized"
+minimise = "minimize"
+minimised = "minimized"
+maximise = "maximize"
+maximised = "maximized"
+sanitise = "sanitize"
+sanitised = "sanitized"
+synchronise = "synchronize"
+synchronised = "synchronized"
+authorise = "authorize"
+authorised = "authorized"
+authorisation = "authorization"
+summarise = "summarize"
+summarised = "summarized"
+categorise = "categorize"
+utilise = "utilize"
+visualise = "visualize"
+finalise = "finalize"
+finalised = "finalized"
+standardise = "standardize"
+localise = "localize"
+localised = "localized"
+localisation = "localization"
+emphasise = "emphasize"
+apologise = "apologize"

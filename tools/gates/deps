@@ -1,17 +1,41 @@
 #!/usr/bin/env python3
-"""Dependency gate: known vulnerabilities, disallowed licenses and unpinned packages.
+"""Dependency gate: known vulnerabilities, disallowed licenses and unpinned packages (plan steps P0.21.4 and
+P0.11.3).
 
-Usage: deps <repo>
+Usage: deps [--tables-from <ref>] <repo>
 
   - vulnerable-dependency: cargo-audit on Cargo.lock. SHELLBORNE_ADVISORY_DB names a local advisory
     database (used by tests, so they never depend on the network); otherwise the current RustSec
     database is fetched.
-  - license / banned-source: cargo-deny with this folder's deny.toml, never a config from the tree.
+  - license / banned-source: cargo-deny with this folder's deny.toml, never a config from the tree. A license
+    refusal names the crate's name line in Cargo.lock.
+  - license, for everything cargo-deny does not see, judged against the same allow-list in deny.toml and the
+    committed table licenses.toml beside this file:
+      * every SwiftPM pin in every tracked Package.resolved, every remote dependency in every tracked
+        build.zig.zon and every tracked Ghostty pin (a PIN.toml under a ghostty folder) must be listed in
+        the table by kind, name and exact revision, with an allowed license. A pin that moved is a new
+        dependency until it is listed again. For a pin that is not vendored the declared license is
+        checked, not the upstream file.
+      * every vendored folder in the table that holds a tracked file names its license file. The gate reads
+        that file itself and refuses it when its text is not the declared license (one SPDX id per folder),
+        or when it is any GPL.
+        OFL-1.1 passes only for font files (.ttf, .otf, .woff, .woff2, with a real font signature in
+        their first bytes) and the folder's license file; any other file under an OFL-1.1 folder is
+        refused. BSD-2-Clause is not matched by a text that holds the BSD-3-Clause endorsement clause.
+      * every tracked font file must sit in a vendored folder from the table, and every tracked file under
+        third_party/ must sit in one too, except a PIN.toml, which is a pin record.
+    Every LGPL fails, whatever its kind and however it would be linked.
   - unpinned-package: a Package.resolved pin without an exact 40-hex revision, or pinned to a branch.
-Accepted exceptions live in deny.toml with a written reason. Exit 0 clean, 1 refused, 2 broken; a
-missing tool for a lockfile that exists is broken, never a pass.
-Plan-Step: P0.21.4
+
+--tables-from <ref> reads deny.toml and licenses.toml from tools/gates/ at that commit of the repository with
+git cat-file, so in CI a pull request cannot widen its own allow-list. Tracked text is read through the repo-rules
+reader, with its caps: tracked regular files only, never through a link, 2 MiB each. A refusal names the rule and
+file:line, never the source. Accepted exceptions live in deny.toml with a written reason. Exit 0 clean, 1 refused,
+2 broken; a missing tool for a lockfile that exists, a missing or malformed table, or an unreadable file is
+broken, never a pass.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import pathlib
@@ -19,22 +43,149 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import tomllib
 
-CONFIG = pathlib.Path(__file__).resolve().parent / "deny.toml"
+HERE = pathlib.Path(__file__).resolve().parent
+READER = HERE / "repo-rules"
 REVISION = re.compile(r"^[0-9a-f]{40}$")
+MAX_TABLE_BYTES = 256 * 1024
+FONT_SUFFIXES = (".ttf", ".otf", ".woff", ".woff2")
+OFL = "OFL-1.1"
+PIN_KINDS = {"swiftpm", "zig", "ghostty"}
+
+# What a license file must say for each declared license, matched without case and with runs of white space
+# folded to one space. A file must hold every phrase of its declared license.
+LICENSE_TEXT = {
+    "MIT": ("permission is hereby granted, free of charge",),
+    "BSD-2-Clause": ("redistribution and use in source and binary forms",),
+    "BSD-3-Clause": ("redistribution and use in source and binary forms", "neither the name"),
+    "ISC": ("permission to use, copy, modify, and",),
+    "Apache-2.0": ("apache license", "version 2.0"),
+    "Zlib": ("this software is provided 'as-is'", "altered source versions must be plainly marked"),
+    "Libpng": ("png reference library license",),
+    "FTL": ("the freetype project license",),
+    "Unicode-3.0": ("unicode license v3",),
+    "OFL-1.1": ("sil open font license", "version 1.1"),
+}
+# Text a license file must not hold for its declared license: the BSD 3-clause endorsement clause makes a text
+# BSD-3-Clause, so a file with it is not BSD-2-Clause.
+LICENSE_ABSENT = {
+    "BSD-2-Clause": ("neither the name", "nor the names of its contributors", "to endorse or promote products"),
+}
+# The first bytes of a font container: TrueType, OpenType, a collection, WOFF and WOFF2.
+FONT_SIGNATURES = (b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf", b"wOFF", b"wOF2")
+# Text that marks a license file as one of the GPL family, whatever it was declared as.
+COPYLEFT_TEXT = ("gnu general public license", "gnu lesser general public license", "gnu library general public license",
+                 "gnu affero general public license")
 
 
 class Broken(Exception):
     pass
 
 
-def check_rust(repo, findings):
-    lock = repo / "Cargo.lock"
-    if not lock.exists():
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def table_text(repo, ref, name):
+    """A table's text: from this folder, or from tools/gates/<name> at <ref> of the repository, under a byte cap."""
+    if ref is None:
+        try:
+            with open(HERE / name, "rb") as handle:
+                raw = handle.read(MAX_TABLE_BYTES + 1)
+        except OSError as error:
+            raise Broken(f"cannot read {name}: {error.strerror}")
+    else:
+        if ref.startswith("-") or not ref:
+            raise Broken("--tables-from needs a commit, not an option")
+        try:
+            result = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:tools/gates/{name}"],
+                                    capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            raise Broken(f"git could not read {name} at the named commit")
+        if result.returncode != 0:
+            raise Broken(f"there is no tools/gates/{name} at the named commit")
+        raw = result.stdout
+    if len(raw) > MAX_TABLE_BYTES:
+        raise Broken(f"{name} is over the {MAX_TABLE_BYTES}-byte cap for a table")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Broken(f"{name} is not UTF-8")
+
+
+def load_tables(repo, ref):
+    """The allow-list from deny.toml, its text for cargo-deny, and the pins and vendored folders from licenses.toml."""
+    deny_text = table_text(repo, ref, "deny.toml")
+    try:
+        deny = tomllib.loads(deny_text)
+        table = tomllib.loads(table_text(repo, ref, "licenses.toml"))
+    except tomllib.TOMLDecodeError as error:
+        raise Broken(f"a license table is malformed: {error}")
+    allow = deny.get("licenses", {}).get("allow") if isinstance(deny.get("licenses"), dict) else None
+    if not isinstance(allow, list) or not allow or not all(isinstance(item, str) and item for item in allow):
+        raise Broken("deny.toml names no [licenses] allow list")
+    allow = set(allow)
+    if OFL in allow or any("GPL" in item.upper() for item in allow):
+        raise Broken("deny.toml allows OFL-1.1 or a GPL license, which no crate may carry")
+    unknown = set(table) - {"pin", "vendored"}
+    if unknown:
+        raise Broken("licenses.toml has a section other than [[pin]] and [[vendored]]")
+    pins, vendored = table.get("pin", []), table.get("vendored", [])
+    if not isinstance(pins, list) or not isinstance(vendored, list):
+        raise Broken("licenses.toml: [[pin]] and [[vendored]] must be arrays of tables")
+    for entry in pins:
+        if (not isinstance(entry, dict) or set(entry) != {"kind", "name", "revision", "license"}
+                or not all(isinstance(value, str) and value for value in entry.values())
+                or entry["kind"] not in PIN_KINDS):
+            raise Broken("licenses.toml: each [[pin]] needs exactly kind (swiftpm, zig or ghostty), name, revision "
+                         "and license")
+    for entry in vendored:
+        if (not isinstance(entry, dict) or set(entry) != {"path", "license", "license-file"}
+                or not all(isinstance(value, str) and value for value in entry.values())):
+            raise Broken("licenses.toml: each [[vendored]] needs exactly path, license and license-file")
+    return allow, deny_text, pins, vendored
+
+
+def allowed(license, allow):
+    """An SPDX id, or ids joined by OR (one must pass) or AND (all must pass). Any LGPL or GPL never passes."""
+    expression = license.strip()
+    if "(" in expression or ")" in expression or "WITH" in expression.split():
+        return False
+    if any("GPL" in word.upper() for word in expression.split()):
+        return False
+    alternatives = [part.split(" AND ") for part in expression.split(" OR ")]
+    return any(all(item.strip() in allow for item in group) for group in alternatives)
+
+
+def lock_line(lock_text, name, version):
+    """The line of a crate's name in Cargo.lock, preferring the entry with the version cargo-deny named."""
+    lines = lock_text.splitlines()
+    first = None
+    for index, line in enumerate(lines):
+        if line.strip() == f'name = "{name}"':
+            first = first or index + 1
+            following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+            if following == f'version = "{version}"':
+                return index + 1
+    return first
+
+
+def check_rust(rr, repo, names, deny_text, findings):
+    if "Cargo.lock" not in names:
         return
     cargo = shutil.which("cargo")
     if not cargo:
         raise Broken("cargo is not installed, and this repository has a Cargo.lock")
+    lock = repo / "Cargo.lock"
+    lock_text = rr.read_source(repo, "Cargo.lock")
     audit = [cargo, "audit", "--json", "--file", str(lock)]
     db = os.environ.get("SHELLBORNE_ADVISORY_DB")
     if db:
@@ -44,52 +195,263 @@ def check_rust(repo, findings):
         report = json.loads(result.stdout)
     except ValueError:
         raise Broken(f"cargo audit failed: {result.stderr.strip()[-300:]}")
+    audited = len(findings)
     for item in report.get("vulnerabilities", {}).get("list", []):
         package = item.get("package", {})
         advisory = item.get("advisory", {}).get("id", "advisory")
         findings.append(("vulnerable-dependency", f"Cargo.lock ({package.get('name')} {package.get('version')}, {advisory})"))
-    if findings:
+    if len(findings) > audited:
         return  # the lock is already refused; cargo-deny would only repeat it
-    deny = [cargo, "deny", "--manifest-path", str(repo / "Cargo.toml"), "--config", str(CONFIG), "--offline",
-            "check", "licenses", "bans", "sources"]
-    result = subprocess.run(deny, capture_output=True, text=True, cwd=repo)
-    if result.returncode != 0:
-        errors = [line for line in result.stderr.splitlines() if line.startswith("error[")]
-        if not errors:
-            raise Broken(f"cargo deny failed: {result.stderr.strip()[-300:]}")
-        for line in errors:
-            kind = "license" if "license" in line else "banned-source"
-            findings.append((kind, f"Cargo.toml ({line[:120]})"))
+    with tempfile.TemporaryDirectory(prefix="deps-gate-") as folder:
+        config = pathlib.Path(folder) / "deny.toml"
+        config.write_text(deny_text)
+        for checks, kind in ((["licenses"], "license"), (["bans", "sources"], "banned-source")):
+            deny = [cargo, "deny", "--format", "json", "--manifest-path", str(repo / "Cargo.toml"),
+                    "--config", str(config), "--offline", "check", *checks]
+            result = subprocess.run(deny, capture_output=True, text=True, cwd=repo)
+            errors = []
+            for line in result.stderr.splitlines():
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                fields = record.get("fields", {}) if isinstance(record, dict) else {}
+                if record.get("type") == "diagnostic" and fields.get("severity") == "error":
+                    errors.append(fields)
+            if result.returncode != 0 and not errors:
+                raise Broken(f"cargo deny failed: {result.stderr.strip()[-300:]}")
+            for fields in errors:
+                places = []
+                for graph in fields.get("graphs") or []:
+                    krate = graph.get("Krate", {}) if isinstance(graph, dict) else {}
+                    number = lock_line(lock_text, krate.get("name"), krate.get("version"))
+                    if number:
+                        places.append(f"Cargo.lock:{number}")
+                code = str(fields.get("code", "error"))[:40]
+                for place in places or ["Cargo.toml"]:
+                    findings.append((kind, f"{place} (cargo-deny {code})"))
 
 
-def check_swift(repo, findings):
-    resolved = repo / "Package.resolved"
-    if not resolved.exists():
-        return
+def line_holding(text, pattern):
+    """The 1-based line of the first match of pattern, or 1 when nothing matches."""
+    for number, line in enumerate(text.splitlines(), 1):
+        if re.search(pattern, line):
+            return number
+    return 1
+
+
+def judge_pin(kind, name, revision, where, pins, allow, findings):
+    listed = [entry for entry in pins if (entry["kind"], entry["name"], entry["revision"]) == (kind, name, revision)]
+    if not listed:
+        findings.append(("license", f"{where} (a {kind} pin licenses.toml does not list at this revision)"))
+    elif not all(allowed(entry["license"], allow) for entry in listed):
+        findings.append(("license", f"{where} (a {kind} pin whose declared license is not on the allow-list)"))
+
+
+def check_swift(rr, repo, names, pins, allow, findings):
+    for name in names:
+        if pathlib.PurePosixPath(name).name != "Package.resolved":
+            continue
+        text = rr.read_source(repo, name)
+        try:
+            data = json.loads(text)
+        except ValueError:
+            raise Broken(f"{rr.shown(name)} is not valid JSON")
+        if not isinstance(data, dict):
+            raise Broken(f"{rr.shown(name)} is not a Package.resolved")
+        listing = data.get("pins", data.get("object", {}).get("pins", []) if isinstance(data.get("object"), dict) else [])
+        if not isinstance(listing, list):
+            raise Broken(f"{rr.shown(name)} has no list of pins")
+        for pin in listing:
+            if not isinstance(pin, dict):
+                raise Broken(f"{rr.shown(name)} has a pin that is not an object")
+            identity = str(pin.get("identity", pin.get("package", "")))
+            key = "identity" if "identity" in pin else "package"
+            number = line_holding(text, r'"' + key + r'"\s*:\s*"' + re.escape(identity) + r'"')
+            where = f"{rr.shown(name)}:{number}"
+            state = pin.get("state", {}) if isinstance(pin.get("state"), dict) else {}
+            revision = state.get("revision", "")
+            if "branch" in state and state.get("branch") or not REVISION.match(str(revision)):
+                findings.append(("unpinned-package", f"{where} (no exact 40-hex revision)"))
+            judge_pin("swiftpm", identity, str(revision), where, pins, allow, findings)
+
+
+ZON_NAME = re.compile(r'\.(?:([A-Za-z_][\w]*)|@"([^"\\]*)")\s*=\s*\.\{')
+ZON_FIELD = re.compile(r'\.([A-Za-z_]\w*)\s*=\s*"([^"\\]*)"')
+
+
+def zon_blank(text):
+    """The text with // comments blanked and string contents kept, so braces inside a string or comment never
+    count; newlines stay, so line numbers stay true."""
+    out, index, quote = [], 0, False
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and index + 1 < len(text):
+                out.append("  " if text[index + 1] != "\n" else " \n")
+                index += 2
+                continue
+            if char == '"' or char == "\n":
+                quote = False
+            out.append(char if char in '"\n' else ("x" if char in "{}" else char))
+        elif char == '"':
+            quote = True
+            out.append(char)
+        elif text.startswith("//", index):
+            end = text.find("\n", index)
+            end = len(text) if end < 0 else end
+            out.append(" " * (end - index))
+            index = end
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def zon_dependencies(text):
+    """Each dependency in a build.zig.zon: (name, 1-based line, {field: string value}). Raises ValueError when the
+    dependencies block cannot be read."""
+    clean = zon_blank(text)
+    start = re.search(r"\.dependencies\s*=\s*\.\{", clean)
+    if not start:
+        return []
+    depth, index, entries = 1, start.end(), []
+    while index < len(clean) and depth:
+        if depth == 1:
+            match = ZON_NAME.match(clean, index)
+            if match:
+                body_start, inner, cursor = match.end(), 1, match.end()
+                while cursor < len(clean) and inner:
+                    inner += {"{": 1, "}": -1}.get(clean[cursor], 0)
+                    cursor += 1
+                if inner:
+                    raise ValueError("a dependency never closes")
+                fields = {field.group(1): field.group(2) for field in ZON_FIELD.finditer(clean, body_start, cursor - 1)}
+                entries.append((match.group(1) or match.group(2), clean.count("\n", 0, match.start()) + 1, fields))
+                index = cursor
+                continue
+        depth += {"{": 1, "}": -1}.get(clean[index], 0)
+        index += 1
+    if depth:
+        raise ValueError("the dependencies block never closes")
+    return entries
+
+
+def check_zig(rr, repo, names, pins, allow, findings):
+    for name in names:
+        if pathlib.PurePosixPath(name).name != "build.zig.zon":
+            continue
+        try:
+            entries = zon_dependencies(rr.read_source(repo, name))
+        except ValueError as error:
+            raise Broken(f"cannot read {rr.shown(name)}: {error}")
+        for dependency, number, fields in entries:
+            if "path" in fields and "url" not in fields:
+                continue  # a dependency inside the tree, judged as tracked files
+            judge_pin("zig", dependency, fields.get("hash", ""), f"{rr.shown(name)}:{number}", pins, allow, findings)
+
+
+def ghostty_pin(name):
+    parts = pathlib.PurePosixPath(name).parts
+    return parts[-1] == "PIN.toml" and any(part.lower() == "ghostty" for part in parts[:-1])
+
+
+def check_ghostty(rr, repo, names, pins, allow, findings):
+    for name in filter(ghostty_pin, names):
+        text = rr.read_source(repo, name)
+        try:
+            commit = tomllib.loads(text).get("commit", "")
+        except tomllib.TOMLDecodeError:
+            raise Broken(f"{rr.shown(name)} is not valid TOML")
+        number = line_holding(text, r"^\s*commit\s*=")
+        judge_pin("ghostty", "ghostty", str(commit), f"{rr.shown(name)}:{number}", pins, allow, findings)
+
+
+def has_font_signature(rr, repo, name):
+    """True when a regular tracked file starts with a font container signature, read without following a link."""
     try:
-        pins = json.loads(resolved.read_text()).get("pins", [])
-    except ValueError:
-        raise Broken("Package.resolved is not valid JSON")
-    for pin in pins:
-        state = pin.get("state", {})
-        if "branch" in state or not REVISION.match(state.get("revision", "")):
-            findings.append(("unpinned-package", f"Package.resolved ({pin.get('identity', '?')})"))
+        handle = os.open(pathlib.Path(repo) / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            return os.read(handle, 4) in FONT_SIGNATURES
+        finally:
+            os.close(handle)
+    except OSError as error:
+        raise Broken(f"cannot read {rr.shown(name)}: {error.strerror}")
+
+
+def folded(text):
+    return " ".join(text.lower().split())
+
+
+def under(name, folder):
+    return name.startswith(folder.rstrip("/") + "/")
+
+
+def check_vendored(rr, repo, names, vendored, allow, findings):
+    known = set(names)
+    for entry in vendored:
+        folder, license, license_file = entry["path"].rstrip("/"), entry["license"].strip(), entry["license-file"]
+        inside = [name for name in names if under(name, folder)]
+        if not inside:
+            continue  # nothing is vendored there in this tree, so there is nothing to judge
+        if license != OFL and not allowed(license, allow):
+            findings.append(("license", f"{rr.shown(folder)} (a vendored folder whose declared license is not on "
+                                        "the allow-list)"))
+            continue
+        if license_file not in known or not under(license_file, folder):
+            findings.append(("license", f"{rr.shown(folder)} (its license file is not a tracked file in the folder)"))
+            continue
+        text = folded(rr.read_source(repo, license_file))
+        phrases = LICENSE_TEXT.get(license)  # one SPDX id per vendored folder, so its one file can be checked
+        absent = LICENSE_ABSENT.get(license, ())
+        if (not phrases or not all(phrase in text for phrase in phrases) or any(mark in text for mark in absent)
+                or any(mark in text for mark in COPYLEFT_TEXT)):
+            findings.append(("license", f"{rr.shown(license_file)} (the license file is not the declared license)"))
+        if license == OFL:
+            for name in inside:
+                if name == license_file:
+                    continue
+                if not name.lower().endswith(FONT_SUFFIXES) or not has_font_signature(rr, repo, name):
+                    findings.append(("license", f"{rr.shown(name)} (OFL-1.1 covers font files only)"))
+    covered = [entry["path"].rstrip("/") for entry in vendored]
+    for name in names:
+        is_font = name.lower().endswith(FONT_SUFFIXES)
+        is_third_party = name.startswith("third_party/") and pathlib.PurePosixPath(name).name != "PIN.toml"
+        if (is_font or is_third_party) and not any(under(name, folder) for folder in covered):
+            what = "a font file" if is_font else "a vendored file"
+            findings.append(("license", f"{rr.shown(name)} ({what} no vendored entry in licenses.toml covers)"))
 
 
 def main(argv):
-    if len(argv) != 1:
-        print("deps: broken: usage: deps <repo>", file=sys.stderr)
+    ref = None
+    if len(argv) == 3 and argv[0] == "--tables-from":
+        ref, argv = argv[1], argv[2:]
+    if len(argv) != 1 or argv[0].startswith("-"):
+        print("deps: broken: usage: deps [--tables-from <ref>] <repo>", file=sys.stderr)
         return 2
     repo = pathlib.Path(argv[0]).resolve()
     findings = []
     try:
-        check_rust(repo, findings)
-        check_swift(repo, findings)
-    except Broken as error:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"deps: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        allow, deny_text, pins, vendored = load_tables(repo, ref)
+        names = rr.tracked(repo)
+        check_rust(rr, repo, names, deny_text, findings)
+        check_swift(rr, repo, names, pins, allow, findings)
+        check_zig(rr, repo, names, pins, allow, findings)
+        check_ghostty(rr, repo, names, pins, allow, findings)
+        check_vendored(rr, repo, names, vendored, allow, findings)
+    except (Broken, rr.Broken) as error:
         print(f"deps: broken: {error}", file=sys.stderr)
         return 2
-    for kind, where in findings:
+    for kind, where in findings[:1000]:
         print(f"deps: refused {kind} {where}", file=sys.stderr)
+    if len(findings) > 1000:
+        print(f"deps: refused: {len(findings) - 1000} more refusals not listed", file=sys.stderr)
     return 1 if findings else 0
 
 

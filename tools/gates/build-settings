@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Build settings gate: while Intel is supported, every build targets macOS 26 for both slices (plan step P0.12.4).
+
+Usage: build-settings <repo> [--stub <bundle>]
+
+Reads the tracked settings text of <repo> (git ls-files, through the bounded reader in repo-rules beside this file):
+apple/Package.swift and any other tracked Package.swift, every .xcconfig and .pbxproj, .cargo/config.toml, and every
+tracked script and workflow (a script suffix, a build file name, or a first line starting with #!). Every occurrence
+is judged, not only the project-level one, so an override in one target or one configuration is caught:
+    deployment-target          a deployment target that is not exactly macOS 26: a Package.swift platform, an
+                               xcconfig or project setting, an environment assignment, or a raw minimum-version or
+                               target-triple flag in unsafeFlags, a rustflag, a script or a workflow
+    missing-deployment-target  apple/Package.swift untracked, or with no macOS platform
+    archs                      an ARCHS that does not name exactly arm64 and x86_64 ($(ARCHS_STANDARD) included)
+    missing-archs              a tracked xcconfig that sets no ARCHS, itself or through an #include of a tracked
+                               xcconfig that does; or a project configuration name (Debug, Release and so on) for
+                               which no XCBuildConfiguration of that name sets ARCHS or takes a base xcconfig. A
+                               target configuration inherits the project one of the same name, so the name is the
+                               unit; the limit is that a target-only ARCHS also covers a sibling target of that
+                               name. A tree with no xcconfig and no project file (SwiftPM only) is left to --stub,
+                               which judges the slices it builds
+    excluded-archs             an EXCLUDED_ARCHS naming either slice, conditional or not
+    only-active-arch           ONLY_ACTIVE_ARCH = YES outside a Debug configuration
+In an xcconfig or project file the value must be the literal 26; in a script or workflow only a literal value is
+judged, since a value computed when the build runs is out of reach. That is what --stub is for: it walks the built
+bundle with the Mach-O reader in mach-o-reader (the one lipo and link-check use), and every slice of every Mach-O
+must carry a macOS build version with a minimum of exactly 26, or is refused as slice-minimum, naming the slice. A
+bundle with no Mach-O is not run, never clean.
+
+A refusal reads "build-settings: refused <rule>: <file>[:<line>]" and never quotes the source, with control and
+non-ASCII characters in the name escaped. Every read is bounded: repo-rules' caps on tracked names and bytes per
+file, MAX_DEPTH nested braces in a project file, MAX_FILES entries walked, MAX_BINARY_BYTES per binary, MAX_OUTPUT
+bytes from one tool run, MAX_SECONDS for the stub read, and at most MAX_FINDINGS refusals kept, the rest counted.
+Exit 0 clean, 1 refused, 2 broken or not run.
+
+Known limit (scheduled): a deployment target spelled as -platform_version, -macos_version_min or an -apple-darwinN
+triple, or set with the fish form `set -gx`, is not read. A project file is read whole, comments removed, split on
+braces and semicolons outside quoted strings, so an object written on one line is judged like one split over lines.
+A minimum-version flag in a Swift file is judged only on code (comments and string literals blanked) and inside the
+string literals of an unsafeFlags call.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import posixpath
+import re
+import stat
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+SOURCE_READER = HERE / "repo-rules"
+SHARED = HERE / "mach-o-reader"
+GATE = "build-settings"
+PACKAGE = "apple/Package.swift"
+SLICES = {"arm64", "x86_64"}
+MAX_DEPTH = 64
+MAX_FILES = 200000
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_OUTPUT = 16 * 1024 * 1024
+MAX_SECONDS = 1800
+MAX_FINDINGS = 1000
+SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".fish", ".command", ".py", ".rb", ".pl", ".mk", ".yml", ".yaml")
+SCRIPT_NAMES = ("Makefile", "GNUmakefile", "justfile", "build.rs", ".envrc")
+NAME = "MACOSX_DEPLOYMENT" + "_TARGET"  # split so this file's own text never reads as an assignment
+ASSIGNED = re.compile(NAME + r"(?:\[[^\]\n]*\])*[\"'\]]*\s*[:=]\s*(?:\{[^}\n]*?\bvalue\s*=\s*)?[\"']?(?P<v>[^\s\"';,}]*)")
+MIN_FLAG = re.compile(r"-m(?:macosx|macos)-version-min=[\"']?(?P<v>[^\s\"',)\]]*)")
+TRIPLE = re.compile(r"\b(?:arm64e?|arm64_32|aarch64|x86_64h?|i386)-apple-macos(?:x)?(?P<v>[0-9][0-9.]*)")
+PLATFORM = re.compile(r"\.macOS\(")
+PLATFORM_FORM = re.compile(r"\.macOS\(\s*(?:\"(?P<s>[^\"\n]*)\"|\.v(?P<v>[0-9]+)(?:_(?P<m>[0-9]+))?)\s*\)")
+INCLUDE = re.compile(r"^\s*#include\??\s+\"(?P<path>[^\"\n]+)\"")
+SETTING = re.compile(r"^\s*\"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P<cond>(?:\[[^\]\n]*\])*)\"?\s*=\s*(?P<value>.*?)\s*;?\s*$")
+
+
+def load(name, path):
+    """A module beside this file, loaded without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    try:
+        loader = importlib.machinery.SourceFileLoader(name, str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"{GATE}: broken: cannot load {path.name}: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+RR = load("repo_rules", SOURCE_READER)
+MO = load("mach_o_reader", SHARED)
+BROKEN = (RR.Broken, MO.Broken)
+
+
+def exact_26(value):
+    """True for 26, 26.0 or 26.0.0 and nothing else."""
+    parts = value.split(".")
+    return 1 <= len(parts) <= 3 and parts[0] == "26" and all(p == "0" for p in parts[1:])
+
+
+def tokens(value):
+    return [t for t in re.split(r"[\s,()\"']+", value) if t]
+
+
+def flag_findings(line):
+    """A raw minimum-version flag or versioned target triple on a line, wherever it appears, whose literal version is
+    not 26. A flag that takes its version from a setting is skipped, since the setting itself is judged."""
+    return any(not exact_26(m.group("v").rstrip(".")) for pattern in (MIN_FLAG, TRIPLE) for m in pattern.finditer(line)
+               if m.group("v")[:1].isdigit())
+
+
+def literal_assignments(line):
+    """Each literal value assigned to the deployment target on a script or workflow line; a reference is skipped."""
+    return [m.group("v") for m in ASSIGNED.finditer(line) if m.group("v")[:1].isdigit()]
+
+
+LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"  # what str.splitlines splits on
+
+
+def blank_swift_text(text):
+    """The Swift source with every comment and string literal replaced by spaces, newlines kept, so a platform
+    declaration written inside one is not read as a setting and line numbers stay put. Handles line comments,
+    nested block comments, plain strings, triple-quoted strings and raw strings with any number of # marks."""
+    out = list(text)
+    size = len(text)
+    i = 0
+
+    def blank(start, end):
+        for k in range(start, min(end, size)):
+            if out[k] not in LINE_BREAKS:
+                out[k] = " "
+
+    while i < size:
+        if text.startswith("//", i):
+            end = i
+            while end < size and text[end] not in "\n\r":
+                end += 1
+            blank(i, end)
+            i = end
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < size and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif text[i] in '#"':
+            j = i
+            while j < size and text[j] == "#":
+                j += 1
+            if j >= size or text[j] != '"':
+                i = j if j > i else i + 1
+                continue
+            hashes = text[i:j]
+            multi = text.startswith('"""', j)
+            quote = '"""' if multi else '"'
+            closer = quote + hashes
+            k = j + len(quote)
+            while k < size:
+                if text.startswith("\\" + hashes, k):
+                    k += len(hashes) + 2
+                elif text.startswith(closer, k):
+                    k += len(closer)
+                    break
+                elif text[k] in "\n\r" and not multi:
+                    break
+                else:
+                    k += 1
+            blank(i, k)
+            i = max(k, i + 1)
+        else:
+            i += 1
+    return "".join(out)
+
+
+UNSAFE_FLAGS = re.compile(r"\.unsafeFlags\s*\(")
+STRING_LITERAL = re.compile(r'#*"(?:[^"\\\n]|\\.)*"')
+
+
+def unsafe_flag_lines(text, visible):
+    """The line numbers of string literals inside .unsafeFlags(...) calls that carry a minimum-version flag. visible is
+    the blanked text, same length as text, so a parenthesis inside a comment or string does not close a call."""
+    lines = []
+    for call in UNSAFE_FLAGS.finditer(visible):
+        depth, at = 1, call.end()
+        while at < len(visible) and depth:
+            depth += {"(": 1, ")": -1}.get(visible[at], 0)
+            at += 1
+        for literal in STRING_LITERAL.finditer(text, call.end(), at):
+            if flag_findings(literal.group()):
+                lines.append(text.count("\n", 0, literal.start()) + 1)
+    return lines
+
+
+def judge_package(name, text, found):
+    platforms = 0
+    visible = blank_swift_text(text).splitlines()
+    for number, line in enumerate(text.splitlines(), 1):
+        where = f"{RR.shown(name)}:{number}"
+        for match in PLATFORM.finditer(visible[number - 1] if number <= len(visible) else ""):
+            platforms += 1
+            form = PLATFORM_FORM.match(line, match.start())
+            if not form:
+                found.add(("deployment-target", where))
+            elif form.group("s") is not None:
+                if not exact_26(form.group("s")):
+                    found.add(("deployment-target", where))
+            elif form.group("v") != "26" or form.group("m") not in (None, "0"):
+                found.add(("deployment-target", where))
+        if flag_findings(visible[number - 1] if number <= len(visible) else ""):
+            found.add(("deployment-target", where))
+    for number in unsafe_flag_lines(text, blank_swift_text(text)):
+        found.add(("deployment-target", f"{RR.shown(name)}:{number}"))
+    if name == PACKAGE and not platforms:
+        found.add(("missing-deployment-target", RR.shown(name)))
+
+
+def judge_setting(key, value, debug, where, found):
+    """One xcconfig or project setting. The deployment target must be the literal 26 here."""
+    if key == NAME and not exact_26(value.strip("\"'")):
+        found.add(("deployment-target", where))
+    elif key == "ARCHS" and sorted(tokens(value)) != sorted(SLICES):
+        found.add(("archs", where))
+    elif key == "EXCLUDED_ARCHS" and SLICES & set(tokens(value)):
+        found.add(("excluded-archs", where))
+    elif key == "ONLY_ACTIVE_ARCH" and value.strip("\"'").upper() == "YES" and not debug:
+        found.add(("only-active-arch", where))
+    if flag_findings(value):
+        found.add(("deployment-target", where))
+
+
+def judge_xcconfig(name, text, found):
+    """Judges each setting. Returns (sets ARCHS, the tracked-name paths it includes)."""
+    file_debug = pathlib.PurePosixPath(name).name.lower().startswith("debug")
+    sets_archs, includes = False, []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("//", 1)[0]
+        included = INCLUDE.match(line)
+        if included:
+            includes.append(posixpath.normpath(posixpath.join(posixpath.dirname(name), included.group("path"))))
+            continue
+        setting = SETTING.match(line)
+        if not setting or line.lstrip().startswith("#"):
+            continue
+        cond = setting.group("cond").lower()
+        debug = file_debug or "config=debug" in cond
+        if setting.group("key") == "ARCHS":
+            sets_archs = True
+        judge_setting(setting.group("key"), setting.group("value"), debug, f"{RR.shown(name)}:{number}", found)
+    return sets_archs, includes
+
+
+def judge_xcconfig_archs(configs, found):
+    """configs maps each tracked xcconfig to (sets ARCHS, includes). One without ARCHS, itself or through a chain of
+    tracked includes, is refused as missing-archs."""
+    def covered(name, seen):
+        if name in seen or name not in configs:
+            return False
+        seen.add(name)
+        sets_archs, includes = configs[name]
+        return sets_archs or any(covered(child, seen) for child in includes)
+    for name in configs:
+        if not covered(name, set()):
+            found.add(("missing-archs", RR.shown(name)))
+
+
+def pbx_tokens(text):
+    """The project file as (token, line) pairs with comments removed. Punctuation { } ( ) = ; , is a token each, a
+    quoted string is one token with its quotes, and anything else runs to whitespace or punctuation ($( ) kept whole)."""
+    out, at, line, size = [], 0, 1, len(text)
+    while at < size:
+        char = text[at]
+        if char == "\n":
+            line, at = line + 1, at + 1
+        elif char.isspace():
+            at += 1
+        elif text.startswith("/*", at):
+            end = text.find("*/", at + 2)
+            end = size if end < 0 else end + 2
+            line += text.count("\n", at, end)
+            at = end
+        elif text.startswith("//", at):
+            while at < size and text[at] != "\n":
+                at += 1
+        elif char in "{}();=,":
+            out.append((char, line))
+            at += 1
+        elif char == '"':
+            end = at + 1
+            while end < size and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            end = min(end + 1, size)
+            out.append((text[at:end], line))
+            line += text.count("\n", at, end)
+            at = end
+        else:
+            end = at
+            while end < size and not text[end].isspace() and text[end] not in "{}();=,\"":
+                if text[end] == "$" and text.startswith("(", end + 1):
+                    close = text.find(")", end)
+                    end = size if close < 0 else close
+                end += 1
+            end = max(end, at + 1)
+            out.append((text[at:end], line))
+            at = end
+    return out
+
+
+class PbxReader:
+    """Reads the tokens into nested entries: a dictionary is a list of (key, value, line), a list value a list of
+    values, anything else its text."""
+
+    def __init__(self, name, tokens):
+        self.name, self.tokens, self.at = name, tokens, 0
+
+    def peek(self):
+        return self.tokens[self.at][0] if self.at < len(self.tokens) else None
+
+    def take(self):
+        token = self.tokens[self.at]
+        self.at += 1
+        return token
+
+    def too_deep(self):
+        return RR.Broken(f"{RR.shown(self.name)} nests over the {MAX_DEPTH}-brace cap")
+
+    def value(self, depth):
+        if depth > MAX_DEPTH:
+            raise self.too_deep()
+        token = self.peek()
+        if token == "{":
+            return self.dictionary(depth)
+        if token == "(":
+            self.take()
+            items = []
+            while self.peek() not in (")", None):
+                if self.peek() == ",":
+                    self.take()
+                else:
+                    items.append(self.value(depth + 1))
+            if self.peek() is None:
+                raise RR.Broken(f"{RR.shown(self.name)} ends inside a list")
+            self.take()
+            return items
+        return self.take()[0]
+
+    def dictionary(self, depth):
+        opened = self.take()[1]
+        entries = []
+        while self.peek() not in ("}", None):
+            key, line = self.take()
+            if self.peek() != "=":
+                continue
+            self.take()
+            if self.peek() in (None, "}", ";"):
+                raise RR.Broken(f"{RR.shown(self.name)}:{line} has a key with no value")
+            entries.append((key, self.value(depth + 1), line))
+            if self.peek() == ";":
+                self.take()
+        if self.peek() is None:
+            raise RR.Broken(f"{RR.shown(self.name)}:{opened} has a brace that never closes")
+        self.take()
+        return {"line": opened, "entries": entries}
+
+
+def pbx_text(value):
+    """A value as one string of its words, so a list is judged as the settings text it spells."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(f"{key} = {pbx_text(item)};" for key, item, _ in value["entries"])
+    return "( " + " ".join(pbx_text(item) for item in value) + " )"
+
+
+def pbx_dicts(value):
+    """Every dictionary in the tree, outermost first."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            yield item
+            stack.extend(child for _, child, _ in reversed(item["entries"]))
+        elif isinstance(item, list):
+            stack.extend(reversed(item))
+
+
+def judge_pbxproj(name, text, found):
+    """Every setting in every XCBuildConfiguration, with that configuration's name deciding Debug. A configuration
+    name that no XCBuildConfiguration of that name gives an ARCHS or a base xcconfig is refused as missing-archs."""
+    reader = PbxReader(name, pbx_tokens(text))
+    if reader.peek() != "{":
+        return
+    names = {}
+    for table in pbx_dicts(reader.value(1)):
+        fields = {key: value for key, value, _ in table["entries"]}
+        if fields.get("isa") != "XCBuildConfiguration":
+            continue
+        label = str(fields.get("name", "")).strip('"')
+        settings = fields.get("buildSettings")
+        settings = [(key.strip('"').split("[", 1)[0], pbx_text(value), line)
+                    for key, value, line in settings["entries"]] if isinstance(settings, dict) else []
+        debug = label.lower().startswith("debug")
+        for key, value, line in settings:
+            judge_setting(key, value, debug, f"{RR.shown(name)}:{line}", found)
+        first, covered = names.get(label, (table["line"], False))
+        names[label] = (first, covered or "baseConfigurationReference" in fields
+                        or any(key == "ARCHS" for key, _, _ in settings))
+    for first, covered in names.values():
+        if not covered:
+            found.add(("missing-archs", f"{RR.shown(name)}:{first}"))
+
+
+def judge_script(name, text, found):
+    for number, line in enumerate(text.splitlines(), 1):
+        if any(not exact_26(v.rstrip(".")) for v in literal_assignments(line)) or flag_findings(line):
+            found.add(("deployment-target", f"{RR.shown(name)}:{number}"))
+
+
+def is_script(repo, name):
+    base = pathlib.PurePosixPath(name).name
+    if name.startswith(".github/workflows/") or base.endswith(SCRIPT_SUFFIXES) or base in SCRIPT_NAMES:
+        return True
+    if name.endswith((".cargo/config.toml", ".cargo/config")):
+        return True
+    try:
+        info = os.lstat(pathlib.Path(repo) / name)
+    except OSError as error:
+        raise RR.Broken(f"cannot read {RR.shown(name)}: {error.strerror}")
+    return stat.S_ISREG(info.st_mode) and RR.starts_with_shebang(repo, name)
+
+
+def judge_repo(repo, found):
+    names = RR.tracked(repo)
+    if PACKAGE not in names:
+        found.add(("missing-deployment-target", PACKAGE))
+    xcconfigs = {}
+    for name in names:
+        base = pathlib.PurePosixPath(name).name
+        if base == "Package.swift":
+            judge_package(name, RR.read_source(repo, name), found)
+        elif base.endswith(".xcconfig"):
+            xcconfigs[name] = judge_xcconfig(name, RR.read_source(repo, name), found)
+        elif base.endswith(".pbxproj"):
+            judge_pbxproj(name, RR.read_source(repo, name), found)
+        elif is_script(repo, name):
+            judge_script(name, RR.read_source(repo, name), found)
+    judge_xcconfig_archs(xcconfigs, found)
+
+
+def slice_minimums(read, path, arch):
+    """The macOS minimums one slice declares: each LC_BUILD_VERSION for macOS, and any older LC_VERSION_MIN_MACOSX."""
+    code, out = read.run(["otool", "-arch", arch, "-l", str(path)])
+    if code != 0:
+        raise MO.Broken(f"otool cannot read the {MO.shown(arch)} slice of {MO.shown(path.name)}")
+    lines, minimums = [line.split() for line in out.splitlines()], []
+    for at, words in enumerate(lines):
+        if words == ["cmd", "LC_BUILD_VERSION"]:
+            fields = dict(w[:2] for w in lines[at + 1:at + 6] if len(w) >= 2)
+            if fields.get("platform", "").upper() in ("1", "MACOS"):
+                minimums.append(fields.get("minos", ""))
+        elif words == ["cmd", "LC_VERSION_MIN_MACOSX"]:
+            fields = dict(w[:2] for w in lines[at + 1:at + 4] if len(w) >= 2)
+            minimums.append(fields.get("version", ""))
+    return minimums
+
+
+def judge_stub(bundle, found):
+    read = MO.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT, MAX_SECONDS, place="bundle")
+    try:
+        info = os.lstat(bundle)
+    except OSError as error:
+        raise MO.Broken(f"cannot read {MO.shown(str(bundle))}: {error.strerror}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise MO.Broken(f"{MO.shown(str(bundle))} is not a bundle folder (a symlink is never followed)")
+    judged = 0
+    for path in read.candidates(bundle):
+        read.remaining()
+        if not read.is_mach_o(path):
+            continue
+        read.regular(path)
+        judged += 1
+        rel = MO.shown(path.relative_to(bundle).as_posix())
+        for arch in read.archs(path):
+            minimums = slice_minimums(read, path, arch)
+            if not minimums or not all(exact_26(m) for m in minimums):
+                found.add(("slice-minimum", f"{rel} {MO.shown(arch)}"))
+    if not judged:
+        raise MO.Broken(f"not run: no Mach-O in {MO.shown(str(bundle))}")
+
+
+def main(argv):
+    try:
+        args = argv[1:]
+        stub = None
+        if len(args) == 3 and args[1] == "--stub":
+            stub = pathlib.Path(args[2])
+        elif len(args) != 1 or args[0].startswith("-"):
+            raise MO.Broken("usage: build-settings <repo> [--stub <bundle>]")
+        found = MO.Collected(MAX_FINDINGS)
+        judge_repo(args[0], found)
+        if stub is not None:
+            judge_stub(stub, found)
+    except BROKEN as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    for rule, where in found.kept:
+        print(f"{GATE}: refused {rule}: {where}")
+    if found.total > len(found.kept):
+        print(f"{GATE}: {found.total} refusals in all, {found.total - len(found.kept)} not listed")
+    return 1 if found.total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

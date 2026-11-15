@@ -23,6 +23,10 @@ deps = []
 layer = 2
 deps = []
 
+[rust.sb-bounds]
+layer = 2
+deps = []
+
 [rust.sb-host]
 layer = 2
 deps = ["sb-wire", "sb-redact"]

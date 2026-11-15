@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Entitlements gate: every built binary's entitlements equal its committed plist exactly, with a written reason per
+key (plan step P0.11.9).
+
+Usage: entitlements [--tables-from <ref>] <repo> <built-folder>
+
+Reads entitlements.toml beside this file, or with --tables-from from tools/gates/ at that commit of the repository
+(git cat-file blob <ref>:tools/gates/entitlements.toml), so a branch cannot give its own new key a reason. The table
+holds always_denied, the keys no binary may carry with any reason, and one [[binary]] entry per binary: its exact
+path under the built folder, its role (app, daemon, attach or helper), its committed plist (a tracked file of the
+repository) and a reason for each key. For each listed binary it reads the signed entitlements and code directory
+flags with codesign -d, once per slice of a universal binary with -a, and refuses (a refusal for a universal binary
+names the slice's architecture after the path):
+  - entitlement-mismatch: a key or value that differs from the committed plist in any way, type included;
+  - missing-reason: a committed key with no reason, an empty one, or one holding a placeholder word as repo-rules
+    defines them, named at the key's line in the plist;
+  - helper-without-sandbox: a helper whose built or committed entitlements do not turn App Sandbox on;
+  - app-with-sandbox: an app whose built or committed entitlements turn App Sandbox on;
+  - no-hardened-runtime: a binary signed without the hardened runtime flag;
+  - denied-entitlement: an always-denied key in a binary or its plist, reason or not;
+  - unlisted-binary: a Mach-O in the built folder that has no [[binary]] entry, whatever its entitlements.
+The built folder is walked with the shared Mach-O reader in mach-o-reader beside this file, the one lipo uses: a
+Mach-O is known by its first four bytes, never by name, so helpers, XPC services, login items and framework
+binaries are all found, and the table must match what is built one to one. A file that is not a Mach-O is ignored; a
+symlink inside the folder is skipped and one out of it is broken, never followed.
+No listed binary built is not run, never clean; some built and some missing is broken, and so is a table with no
+[[binary]], a binary that is not a regular file or not signed, a committed plist that is missing, untracked or does
+not parse, and codesign output that does not parse or passes its cap.
+
+The committed plists are read through the repo-rules reader, with its caps. A refusal names the rule and the binary
+or plist and never prints a reason or a value. Each run first proves the gate refuses its own seeded binary with an
+extra key; if it does not, the gate is broken. Limit: a global event tap is a privacy grant, not an entitlement, so a
+source rule in repo-rules refuses it instead. Exit 0 clean, 1 refused, 2 broken or not run.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import plistlib
+import re
+import stat
+import subprocess
+import sys
+import tomllib
+
+# Known-bad control: a daemon whose signed entitlements carry one key its committed plist does not.
+CONTROL = ('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+           '<key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>\n')
+
+HERE = pathlib.Path(__file__).resolve().parent
+READER = HERE / "repo-rules"
+TABLE_NAME = "entitlements.toml"
+GATE = "entitlements"
+CODESIGN = "/usr/bin/codesign"
+MAX_TABLE_BYTES = 256 * 1024
+MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_BINARIES = 200
+REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
+MACH_O = HERE / "mach-o-reader"
+MAX_FILES = 200000
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_SECONDS = 1800
+PATH = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+")
+KEY = re.compile(r"[A-Za-z0-9._-]+")
+ROLES = ("app", "daemon", "attach", "helper")
+SANDBOX = "com.apple.security.app-sandbox"
+RUNTIME_FLAG = 0x10000
+FLAGS = re.compile(r"^CodeDirectory\b.*?\bflags=0x([0-9a-fA-F]+)", re.MULTILINE)
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def mach_o_reader():
+    """The shared Mach-O reader module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("mach_o_reader", str(MACH_O))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def unlisted(rr, built, binaries):
+    """Every Mach-O in the built folder, by its magic bytes, that the table does not list, as paths under it."""
+    try:
+        mo = mach_o_reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        raise rr.Broken(f"cannot load the Mach-O reader: {type(error).__name__}")
+    listed, extra = {entry["path"] for entry in binaries}, []
+    try:
+        read = mo.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT_BYTES, MAX_SECONDS, place="bundle")
+        for path in read.candidates(built):
+            read.remaining()
+            if not read.is_mach_o(path):
+                continue
+            read.regular(path)
+            rel = path.relative_to(built).as_posix()
+            if rel not in listed:
+                extra.append(rel)
+    except mo.Broken as error:
+        raise rr.Broken(str(error))
+    return extra
+
+
+def table_bytes(rr, repo, ref):
+    """The table's bytes, from beside this file or, with a ref, from that commit."""
+    if ref is None:
+        try:
+            with open(HERE / TABLE_NAME, "rb") as handle:
+                raw = handle.read(MAX_TABLE_BYTES + 1)
+        except OSError as error:
+            raise rr.Broken(f"cannot read {TABLE_NAME}: {error.strerror}")
+    else:
+        if not REF.fullmatch(ref) or ref.startswith("-"):
+            raise rr.Broken(f"--tables-from needs a plain commit name, not {rr.shown(ref)}")
+        try:
+            done = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:tools/gates/{TABLE_NAME}"],
+                                  capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            raise rr.Broken(f"git could not read {TABLE_NAME} from {rr.shown(ref)}")
+        if done.returncode != 0:
+            raise rr.Broken(f"{rr.shown(ref)} has no readable tools/gates/{TABLE_NAME}")
+        raw = done.stdout
+    if len(raw) > MAX_TABLE_BYTES:
+        raise rr.Broken(f"{TABLE_NAME} is over the {MAX_TABLE_BYTES}-byte cap")
+    return raw
+
+
+def relative(value):
+    return isinstance(value, str) and PATH.fullmatch(value) and ".." not in value.split("/")
+
+
+def load_table(rr, raw):
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise rr.Broken(f"{TABLE_NAME} is malformed: {type(error).__name__}")
+    if set(data) != {"always_denied", "binary"}:
+        raise rr.Broken(f"{TABLE_NAME} must hold exactly always_denied and at least one [[binary]]")
+    denied, binaries = data["always_denied"], data["binary"]
+    if not isinstance(denied, list) or not denied or not all(isinstance(k, str) and KEY.fullmatch(k) for k in denied):
+        raise rr.Broken(f"{TABLE_NAME}: always_denied must be a non-empty list of entitlement keys")
+    if not isinstance(binaries, list) or not binaries or len(binaries) > MAX_BINARIES:
+        raise rr.Broken(f"{TABLE_NAME} must list between 1 and {MAX_BINARIES} [[binary]] entries")
+    seen = set()
+    for entry in binaries:
+        if (not isinstance(entry, dict) or set(entry) != {"path", "role", "plist", "reasons"}
+                or not relative(entry["path"]) or entry["role"] not in ROLES or not relative(entry["plist"])
+                or not isinstance(entry["reasons"], dict)
+                or not all(isinstance(k, str) and isinstance(v, str) for k, v in entry["reasons"].items())):
+            raise rr.Broken(f"{TABLE_NAME}: a [[binary]] entry needs exactly a relative path, a role (app, daemon, "
+                            "attach or helper), a relative plist and a table of reasons")
+        if entry["path"] in seen:
+            raise rr.Broken(f"{TABLE_NAME}: the binary {rr.shown(entry['path'])} is listed twice")
+        seen.add(entry["path"])
+    return set(denied), binaries
+
+
+def real_reason(rr, text):
+    """Some words, none of them a placeholder, by the test repo-rules applies to its reason markers."""
+    words = re.findall(r"[A-Za-z]{2,}", text) if isinstance(text, str) else []
+    return bool(words) and not any(word.lower() in rr.PLACEHOLDERS for word in words)
+
+
+def same(left, right):
+    """Exact equality of two property list values: the same type at every level, so true is never 1."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return set(left) == set(right) and all(same(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def key_line(text, key):
+    """The 1-based line of the key in the committed plist, or None when the text does not show it plainly."""
+    for number, line in enumerate(text.splitlines(), 1):
+        if f"<key>{key}</key>" in line:
+            return number
+    return None
+
+
+def judge(rr, entry, built, committed, committed_text, runtime, denied):
+    """(rule, where) for one binary; where is the binary's path, or the plist with a line for a missing reason."""
+    found, binary, plist = [], rr.shown(entry["path"]), rr.shown(entry["plist"])
+    if (set(built) | set(committed)) & denied:
+        found.append(("denied-entitlement", binary))
+    if not same(built, committed):
+        found.append(("entitlement-mismatch", binary))
+    for key in committed:
+        if not real_reason(rr, entry["reasons"].get(key)):
+            line = key_line(committed_text, key)
+            found.append(("missing-reason", f"{plist}:{line}" if line else plist))
+    if entry["role"] == "helper" and not (built.get(SANDBOX) is True and committed.get(SANDBOX) is True):
+        found.append(("helper-without-sandbox", binary))
+    if entry["role"] == "app" and (built.get(SANDBOX) is True or committed.get(SANDBOX) is True):
+        found.append(("app-with-sandbox", binary))
+    if not runtime:
+        found.append(("no-hardened-runtime", binary))
+    return found
+
+
+def entitlements_of(rr, raw, where):
+    """The entitlements dictionary from plist bytes; nothing at all is an empty dictionary."""
+    if not raw.strip():
+        return {}
+    try:
+        data = plistlib.loads(raw)
+    except Exception as error:  # plistlib raises several kinds; any of them is output the gate cannot read
+        raise rr.Broken(f"the entitlements of {rr.shown(where)} do not parse as a property list "
+                        f"({type(error).__name__})")
+    if not isinstance(data, dict):
+        raise rr.Broken(f"the entitlements of {rr.shown(where)} are not a dictionary")
+    return data
+
+
+def prove_controls(rr, denied):
+    """The seeded daemon with an extra key must be refused as a mismatch, or the gate cannot fail and is broken."""
+    if not isinstance(CONTROL, str):
+        raise rr.Broken("the seeded control is not an entitlements plist, so this gate cannot fail")
+    entry = {"path": "control-daemon", "role": "daemon", "plist": "control.entitlements", "reasons": {}}
+    built = entitlements_of(rr, CONTROL.encode("utf-8"), "the seeded control")
+    found = judge(rr, entry, built, {}, "", True, denied)
+    if ("entitlement-mismatch", "control-daemon") not in found:
+        raise rr.Broken("the seeded entitlement-mismatch control was not refused, so this gate cannot fail")
+    print(f"{GATE}: control entitlement-mismatch refused as expected")
+
+
+def slices(rr, path, where):
+    """The architectures a Mach-O holds, from the shared reader's lipo read; each slice is signed on its own."""
+    try:
+        mo = mach_o_reader()
+        return mo.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT_BYTES, MAX_SECONDS, place="bundle").archs(path)
+    except Exception as error:  # a reader that cannot load or a file lipo cannot read is broken, never a pass
+        raise rr.Broken(f"cannot list the slices of {rr.shown(where)}: {type(error).__name__}")
+
+
+def signed(rr, path, where, arch):
+    """One slice's entitlements and whether its code directory carries the hardened runtime flag."""
+    try:
+        done = subprocess.run([CODESIGN, "-a", arch, "-d", "--verbose=2", "--entitlements", "-", "--xml", str(path)],
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        raise rr.Broken(f"codesign could not read {rr.shown(where)}")
+    if len(done.stdout) > MAX_OUTPUT_BYTES or len(done.stderr) > MAX_OUTPUT_BYTES:
+        raise rr.Broken(f"codesign output for {rr.shown(where)} passed its {MAX_OUTPUT_BYTES}-byte cap")
+    if done.returncode != 0:
+        raise rr.Broken(f"codesign cannot read a signature on {rr.shown(where)}")
+    flags = FLAGS.search(done.stderr.decode("utf-8", "replace"))
+    if not flags:
+        raise rr.Broken(f"codesign printed no code directory flags for {rr.shown(where)}")
+    return entitlements_of(rr, done.stdout, where), bool(int(flags.group(1), 16) & RUNTIME_FLAG)
+
+
+def present(rr, built, entry):
+    """True when the listed binary is built; a link or anything but a regular file is broken."""
+    path = built / entry["path"]
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise rr.Broken(f"cannot read {rr.shown(entry['path'])}: {error.strerror}")
+    if not stat.S_ISREG(info.st_mode):
+        raise rr.Broken(f"{rr.shown(entry['path'])} is not a regular file (a symlink or special file is never read)")
+    return True
+
+
+def main(argv):
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"{GATE}: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        ref, args = None, list(argv)
+        if len(args) == 4 and args[0] == "--tables-from":
+            ref, args = args[1], args[2:]
+        if len(args) != 2 or any(arg.startswith("-") for arg in args):
+            raise rr.Broken(f"usage: {GATE} [--tables-from <ref>] <repo> <built-folder>")
+        repo, built = args[0], pathlib.Path(args[1])
+        denied, binaries = load_table(rr, table_bytes(rr, repo, ref))
+        prove_controls(rr, denied)
+        try:
+            if not stat.S_ISDIR(os.lstat(built).st_mode):
+                raise rr.Broken(f"{rr.shown(str(built))} is not a folder")
+        except OSError as error:
+            raise rr.Broken(f"cannot read the built folder {rr.shown(str(built))}: {error.strerror}")
+        built_now = [entry for entry in binaries if present(rr, built, entry)]
+        if not built_now:
+            print(f"{GATE}: not run: no listed binary is built, so nothing was judged", file=sys.stderr)
+            return 2
+        if len(built_now) != len(binaries):
+            missing = next(entry for entry in binaries if entry not in built_now)
+            raise rr.Broken(f"a partial build: {rr.shown(missing['path'])} is listed but not built")
+        tracked = set(rr.tracked(repo))
+        found = rr.Collected()
+        for rel in unlisted(rr, built, binaries):
+            found.add(f"unlisted-binary: {rr.shown(rel)}")
+        for entry in binaries:
+            if entry["plist"] not in tracked:
+                raise rr.Broken(f"the committed plist {rr.shown(entry['plist'])} is not tracked")
+            text = rr.read_source(repo, entry["plist"])
+            committed = entitlements_of(rr, text.encode("utf-8"), entry["plist"])
+            archs = slices(rr, built / entry["path"], entry["path"])
+            for arch in archs:  # each slice carries its own entitlements and flags, so each is judged
+                ents, runtime = signed(rr, built / entry["path"], entry["path"], arch)
+                for rule, where in judge(rr, entry, ents, committed, text, runtime, denied):
+                    found.add(f"{rule}: {where} ({arch})" if len(archs) > 1 else f"{rule}: {where}")
+    except rr.Broken as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    for where in found.kept:
+        print(f"{GATE}: refused {where}")
+    if found.total > len(found.kept):
+        print(f"{GATE}: refused: {found.total - len(found.kept)} more refusals not listed")
+    return 1 if found.total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

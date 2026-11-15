@@ -1,10 +1,13 @@
 # cargo-deny rules for the dependency gate. The gate always passes this file explicitly.
-# The license allow-list matches the build rules; OFL-1.1 is for fonts only.
+# The license allow-list matches the build rules. OFL-1.1 is not here: cargo-deny judges crates, and a
+# crate is never a font. Fonts are judged through licenses.toml. No LGPL, however it is linked.
+# With --tables-from, the gate reads this file from the base commit instead (P0.11.3).
 # An exception needs a written reason on the line above it.
 # Plan-Step: P0.21.4
+# Plan-Step: P0.11.3
 
 [licenses]
-allow = ["MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Apache-2.0", "Zlib", "Libpng", "FTL", "Unicode-3.0", "OFL-1.1"]
+allow = ["MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Apache-2.0", "Zlib", "Libpng", "FTL", "Unicode-3.0"]
 confidence-threshold = 0.9
 
 [bans]

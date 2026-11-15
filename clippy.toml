@@ -1,0 +1,15 @@
+# The one Clippy configuration for the workspace (plan step P0.10.2). A clippy.toml in a crate folder would replace
+# this one for that crate, so tools/gates/unsafe-code refuses any other.
+# The std collections and the unbounded channel can grow without a cap; use the bounded types in crates/sb-bounds.
+disallowed-types = [
+    { path = "std::collections::VecDeque", reason = "unbounded; use a bounded type from sb-bounds" },
+    { path = "std::collections::HashMap", reason = "unbounded; use a bounded type from sb-bounds" },
+    { path = "std::collections::HashSet", reason = "unbounded; use a bounded type from sb-bounds" },
+    { path = "std::collections::BTreeMap", reason = "unbounded; use a bounded type from sb-bounds" },
+    { path = "std::collections::BTreeSet", reason = "unbounded; use a bounded type from sb-bounds" },
+    { path = "std::collections::BinaryHeap", reason = "unbounded; use a bounded type from sb-bounds" },
+    { path = "std::collections::LinkedList", reason = "unbounded; use a bounded type from sb-bounds" },
+]
+disallowed-methods = [
+    { path = "std::sync::mpsc::channel", reason = "unbounded; use std::sync::mpsc::sync_channel with a cap" },
+]

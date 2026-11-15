@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Universal gate: every Mach-O in a bundle carries exactly the arm64 and x86_64 slices (plan steps P0.12.2, P0.12.3).
+
+Usage: lipo <bundle>
+
+Walks the bundle with the Mach-O reader in mach-o-reader beside this file, the one link-check uses: a Mach-O is known
+by its first four bytes, never by name, suffix or execute bit; a symlink inside the bundle is skipped, since its
+target is judged where it lives; a symlink out of the bundle or a directory that cannot be read is broken. Each
+Mach-O must report exactly arm64 and x86_64 from lipo -archs:
+    missing-slice   a universal file without one of the two slices, naming the slice
+    thin            a file that is not universal, whichever slice it holds
+    extra-slice     a slice beyond the two, arm64e included, naming the slice
+A file that is not a Mach-O is counted, not judged. A file with Mach-O magic that lipo cannot read is broken, and a
+bundle with no Mach-O is not run, never clean. The gate proves the slices exist, not that they work, and it never
+builds, runs or launches anything.
+
+Every scan is bounded: at most MAX_FILES entries walked, MAX_BINARY_BYTES per binary, MAX_OUTPUT bytes from one lipo
+run, MAX_SECONDS for the whole run, and at most MAX_FINDINGS refusals kept and listed, the rest counted. A refusal
+reads "lipo: refused <rule>: <file> <slice>", with control and non-ASCII characters in the name escaped.
+Exit 0 clean, 1 refused, 2 broken or not run.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import stat
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+SHARED = HERE / "mach-o-reader"
+REQUIRED = ("arm64", "x86_64")
+MAX_FILES = 200000
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_OUTPUT = 64 * 1024
+MAX_SECONDS = 1800
+MAX_FINDINGS = 1000
+
+
+def shared_reader():
+    """The shared Mach-O reader, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    try:
+        loader = importlib.machinery.SourceFileLoader("mach_o_reader", str(SHARED))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"lipo: broken: cannot load {SHARED.name}: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+MO = shared_reader()
+
+
+def judge(bundle):
+    """(kept refusals, total refusals) for every Mach-O in the bundle."""
+    read = MO.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT, MAX_SECONDS, place="bundle")
+    read.remaining()
+    try:
+        info = os.lstat(bundle)
+    except OSError as error:
+        raise MO.Broken(f"cannot read {MO.shown(str(bundle))}: {error.strerror}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise MO.Broken(f"{MO.shown(str(bundle))} is not a bundle folder (a symlink is never followed)")
+    found, judged = MO.Collected(MAX_FINDINGS), 0
+    for path in read.candidates(bundle):
+        read.remaining()
+        if not read.is_mach_o(path):
+            continue
+        read.regular(path)
+        judged += 1
+        rel = MO.shown(path.relative_to(bundle).as_posix())
+        slices = read.archs(path)
+        if not read.is_universal(path):
+            found.add(("thin", f"{rel} {' '.join(MO.shown(s) for s in slices)}"))
+            continue
+        for arch in REQUIRED:
+            if arch not in slices:
+                found.add(("missing-slice", f"{rel} {arch}"))
+        for arch in sorted(set(slices) - set(REQUIRED)):
+            found.add(("extra-slice", f"{rel} {MO.shown(arch)}"))
+    if not judged:
+        raise MO.Broken(f"not run: no Mach-O in {MO.shown(str(bundle))}")
+    return found.kept, found.total
+
+
+def main(argv):
+    try:
+        if len(argv) != 2:
+            raise MO.Broken("usage: lipo <bundle>")
+        kept, total = judge(pathlib.Path(argv[1]))
+    except MO.Broken as error:
+        print(f"lipo: broken: {error}", file=sys.stderr)
+        return 2
+    for rule, where in kept:
+        print(f"lipo: refused {rule}: {where}")
+    if total > len(kept):
+        print(f"lipo: {total} refusals in all, {total - len(kept)} not listed")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

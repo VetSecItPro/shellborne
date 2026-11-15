@@ -1,0 +1,48 @@
+# Characters tools/gates/hidden-chars refuses (plan step P0.11.2). One table serves this gate now and the
+# renderer later. Each range is [first, last] as code points, both included.
+
+# Invisible and bidi characters: zero width and direction marks, bidi embeddings and overrides, invisible
+# operators, bidi isolates, the byte order mark, the soft hyphen, the Mongolian vowel separator, variation
+# selectors, tag characters and the supplementary variation selectors, plus the Arabic letter mark, the combining
+# grapheme joiner, the Hangul and Halfwidth fillers, the Khmer inherent vowels, the interlinear annotation marks, the
+# line and paragraph separators, the musical formatting controls and the shorthand format controls.
+ranges = [
+    [0x200B, 0x200F],
+    [0x202A, 0x202E],
+    [0x2060, 0x2064],
+    [0x2066, 0x2069],
+    [0xFEFF, 0xFEFF],
+    [0x00AD, 0x00AD],
+    [0x180E, 0x180E],
+    [0xFE00, 0xFE0F],
+    [0xE0000, 0xE007F],
+    [0xE0100, 0xE01EF],
+    [0x061C, 0x061C],
+    [0x034F, 0x034F],
+    [0x115F, 0x1160],
+    [0x3164, 0x3164],
+    [0xFFA0, 0xFFA0],
+    [0x17B4, 0x17B5],
+    [0xFFF9, 0xFFFB],
+    [0x2028, 0x2029],
+    [0x1D173, 0x1D17A],
+    [0x1BCA0, 0x1BCA3],
+]
+
+# Long dashes: the hyphen and non-breaking hyphen forms, figure dash, en dash, em dash, horizontal bar, the two- and
+# three-em dashes, the vertical and presentation-form dashes and the fullwidth hyphen-minus. Write a hyphen or rewrite the sentence.
+dashes = [
+    [0x2010, 0x2015],
+    [0x2E3A, 0x2E3B],
+    [0xFE31, 0xFE32],
+    [0xFE58, 0xFE58],
+    [0xFF0D, 0xFF0D],
+]
+
+# Suffixes read as binary and never decoded, compared without case. Every other tracked file must be UTF-8.
+binary = [".png", ".jpg", ".jpeg", ".gif", ".ico", ".icns", ".tiff", ".webp", ".pdf", ".ttf", ".otf", ".woff",
+          ".woff2", ".zip", ".gz", ".car", ".a", ".dylib", ".mov", ".mp4"]
+
+# Fixture files that must hold a listed character, each as an [[allow]] entry with a path and a reason. The path is
+# one exact tracked file from the repository root; a folder, a pattern, a wildcard or a file that is not tracked is
+# broken, so an entry covers one real file only. There are none yet.

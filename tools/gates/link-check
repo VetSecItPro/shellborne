@@ -5,7 +5,8 @@ Usage: link-check <binary folder>
        link-check --network <binary folder>   (plan step P0.9.6)
 
 Reads the [link] table in repo-rules.toml beside this file and the symbol table (nm -P) of each named binary in
-the folder. A daemon binary (supervisor, session host, attach client, CLI) with any engine symbol, defined or
+the folder. Every tool runs once per slice of a universal binary with -arch, since Apple's tools otherwise read only
+the host's slice; a refusal for a universal binary names the slice's architecture. A daemon binary (supervisor, session host, attach client, CLI) with any engine symbol, defined or
 referenced, is refused as engine-in-daemon; the GUI with an engine symbol outside the key-encoder prefixes is
 refused as engine-in-gui. Every Mach-O a named binary loads from inside the folder, at any depth, is judged the
 same way as the binary, and a daemon binary that loads a library named for the engine is refused even with no
@@ -19,18 +20,21 @@ files are read: a named binary that is a symlink is broken, and the network scan
 folder. Every scan is bounded: at most MAX_FILES files, MAX_BINARY_BYTES per binary, MAX_OUTPUT bytes from one nm or
 otool run, MAX_SECONDS for the whole run, and at most MAX_FINDINGS refusals kept and listed, the rest counted; past any other cap the run is broken.
 File names are printed with control and non-ASCII characters escaped. Exit 0 clean, 1 refused, 2 broken or not run.
+The Mach-O reader, the walk and the bounded tool runner live in mach-o-reader beside this file, shared with lipo
+(plan step P0.12.3); the caps stay here and are handed to it.
 """
+import importlib.machinery
+import importlib.util
 import os
 import pathlib
 import re
-import selectors
 import stat
-import subprocess
 import sys
-import time
 import tomllib
 
-TABLE = pathlib.Path(__file__).resolve().parent / "repo-rules.toml"
+HERE = pathlib.Path(__file__).resolve().parent
+TABLE = HERE / "repo-rules.toml"
+SHARED = HERE / "mach-o-reader"  # the Mach-O reader and walker this gate shares with lipo, so the two cannot drift
 MAX_FILES = 20000
 MAX_BINARY_BYTES = 1024 * 1024 * 1024
 MAX_OUTPUT = 256 * 1024 * 1024
@@ -40,35 +44,30 @@ MAX_TABLE_BYTES = 256 * 1024
 SYMBOL_PREFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 BINARY_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
 FRAMEWORK = re.compile(r"[A-Za-z0-9_]+\.framework")
-START = time.monotonic()
 
 
-class Broken(Exception):
-    pass
+def shared_reader():
+    """The shared Mach-O reader, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    try:
+        loader = importlib.machinery.SourceFileLoader("mach_o_reader", str(SHARED))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"link-check: broken: cannot load {SHARED.name}: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
 
 
-class Collected:
-    """The first MAX_FINDINGS refusals, kept; every refusal, counted."""
-    def __init__(self):
-        self.kept, self.total = [], 0
-
-    def add(self, item):
-        self.total += 1
-        if len(self.kept) < MAX_FINDINGS:
-            self.kept.append(item)
+MO = shared_reader()
+Broken, shown = MO.Broken, MO.shown
+READ = MO.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT, MAX_SECONDS, place="build folder")
+remaining, regular, is_mach_o, run, candidates = READ.remaining, READ.regular, READ.is_mach_o, READ.run, READ.candidates
 
 
-def shown(name):
-    """A name safe to print: control, backslash and non-ASCII characters escaped, so a name cannot forge a line."""
-    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape", "backslashreplace").decode("ascii")
-                   for c in name)
-
-
-def remaining():
-    left = START + MAX_SECONDS - time.monotonic()
-    if left <= 0:
-        raise Broken(f"the run passed its cap of {MAX_SECONDS} seconds")
-    return left
+def collected():
+    """The first MAX_FINDINGS refusals, kept; every refusal, counted. The cap is read when a run starts."""
+    return MO.Collected(MAX_FINDINGS)
 
 
 def strings(value, form):
@@ -116,109 +115,29 @@ def table(name):
     return data[name]
 
 
-def regular(path):
-    """A regular file under the cap, never a symlink."""
-    try:
-        info = os.lstat(path)
-    except OSError as error:
-        raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
-    if not stat.S_ISREG(info.st_mode):
-        raise Broken(f"{shown(path.name)} is not a regular file (a symlink is never followed)")
-    if info.st_size > MAX_BINARY_BYTES:
-        raise Broken(f"{shown(path.name)} is over the {MAX_BINARY_BYTES}-byte cap for a binary")
-    return path
+def slices(path):
+    """The architectures a Mach-O holds, and the label a refusal carries: the architecture name for a universal
+    binary, so the bad slice is named, and nothing for a thin one. Each tool is run once per slice with -arch, since
+    Apple's tools read only the host's slice of a universal binary when none is named."""
+    found = READ.archs(path)
+    return found, len(found) > 1
 
 
-MACH_O = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # thin, both byte orders
-          b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}  # universal, 32 and 64-bit
+def tagged(text, arch, universal):
+    return f"{text} ({arch})" if universal else text
 
 
-def is_mach_o(path):
-    try:
-        handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            return os.read(handle, 4) in MACH_O
-        finally:
-            os.close(handle)
-    except OSError as error:
-        raise Broken(f"cannot read {shown(path.name)}: {error.strerror}")  # an unreadable candidate is never skipped
-
-
-def run(command):
-    """Run a tool with its output capped at MAX_OUTPUT bytes and its time capped by the run's deadline."""
-    try:
-        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-    except OSError as error:
-        raise Broken(f"{command[0]} could not run: {error.strerror}")
-    chunks, size = [], 0
-    try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(child.stdout, selectors.EVENT_READ)
-            while True:
-                if not selector.select(timeout=min(remaining(), 120)):
-                    raise Broken(f"{command[0]} did not finish in time")
-                chunk = os.read(child.stdout.fileno(), 1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_OUTPUT:
-                    raise Broken(f"{command[0]} printed over the {MAX_OUTPUT}-byte cap")
-                chunks.append(chunk)
-        code = child.wait(timeout=min(remaining(), 120))
-    except subprocess.TimeoutExpired:
-        raise Broken(f"{command[0]} did not finish in time")
-    finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait()
-        child.stdout.close()
-    return code, b"".join(chunks).decode("utf-8", "replace")
-
-
-def linked(path):
-    code, out = run(["otool", "-L", str(path)])
+def linked(path, arch):
+    code, out = run(["otool", "-arch", arch, "-L", str(path)])
     if code != 0:
-        raise Broken(f"otool cannot read {shown(path.name)}")
+        raise Broken(f"otool cannot read the {arch} slice of {shown(path.name)}")
     return out
-
-
-def candidates(folder):
-    """Every regular file under the folder, read as a stream with no symlink followed, at most MAX_FILES entries
-    seen. A symlink that leaves the folder, or a directory that cannot be read, is broken; a symlink inside the
-    folder is skipped, since its target is reached where it lives."""
-    root = pathlib.Path(folder).resolve()
-    found, seen, stack = [], 0, [pathlib.Path(folder)]
-    while stack:
-        remaining()
-        top = stack.pop()
-        try:
-            entries = os.scandir(top)
-        except OSError as error:
-            raise Broken(f"cannot read {shown(str(top))}: {error.strerror}")
-        with entries:
-            for entry in entries:
-                seen += 1
-                if seen > MAX_FILES:
-                    raise Broken(f"{shown(str(folder))} holds over the {MAX_FILES}-file cap")
-                path = pathlib.Path(entry.path)
-                try:
-                    if entry.is_symlink():
-                        if not path.resolve().is_relative_to(root):
-                            raise Broken(f"{shown(str(path.relative_to(folder)))} is a symlink out of the build folder")
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(path)
-                    elif entry.is_file(follow_symlinks=False):
-                        found.append(path)
-                except OSError as error:
-                    raise Broken(f"cannot read {shown(str(path))}: {error.strerror}")
-    return sorted(found)
 
 
 def network(folder):
     """P0.9.6: getaddrinfo or a network framework in any Mach-O outside the update module."""
     net = table("network")
-    found, read = Collected(), 0
+    found, read = collected(), 0
     for path in candidates(folder):
         if not stat.S_ISREG(os.lstat(path).st_mode) or not is_mach_o(path):
             continue
@@ -227,31 +146,42 @@ def network(folder):
         if rel in net["update_binaries"]:  # the update module only at its exact path, never by a name found elsewhere
             continue
         read += 1  # only a binary the scan judges counts, so an update binary alone is not a clean scan
-        for s in sorted(symbols(path)):
-            if s in net["forbidden_symbols"]:
-                found.add(("network-in-binary", f"{shown(rel)} {s}"))
-        libraries = linked(path)
-        for f in net["forbidden_frameworks"]:
-            if f"/{f}/" in libraries:
-                found.add(("network-in-binary", f"{shown(rel)} {f}"))
+        archs, universal = slices(path)
+        for arch in archs:
+            for s in sorted(symbols(path, arch)):
+                if s in net["forbidden_symbols"]:
+                    found.add(("network-in-binary", tagged(f"{shown(rel)} {s}", arch, universal)))
+            libraries = linked(path, arch)
+            for f in net["forbidden_frameworks"]:
+                if f"/{f}/" in libraries:
+                    found.add(("network-in-binary", tagged(f"{shown(rel)} {f}", arch, universal)))
     if not read:
         raise Broken(f"not run: no Mach-O outside the update module in {shown(str(folder))}")
     return found.kept, found.total
 
 
 def load_commands(path):
-    """The libraries a Mach-O loads (otool -L, the first line is the file itself) and its run paths (otool -l)."""
-    names = [line.strip().split(" (")[0] for line in linked(path).splitlines()[1:] if line.strip()]
-    code, out = run(["otool", "-l", str(path)])
-    if code != 0:
-        raise Broken(f"otool cannot read the load commands of {shown(path.name)}")
-    rpaths, lines = [], out.splitlines()
-    for at, line in enumerate(lines):
-        if line.strip() == "cmd LC_RPATH":
-            for following in lines[at + 1:at + 4]:
-                parts = following.strip().split(" ", 1)
-                if parts[0] == "path" and len(parts) == 2:
-                    rpaths.append(parts[1].split(" (offset")[0])
+    """The libraries a Mach-O loads (otool -L, the first line is the file itself) and its run paths (otool -l), read
+    from every slice. Returns the loads as (name, label) pairs, one per slice that loads the name, and the run paths
+    of all slices, so a library only one slice reaches is still found and judged."""
+    archs, universal = slices(path)
+    names, rpaths = [], []
+    for arch in archs:
+        for line in linked(path, arch).splitlines()[1:]:
+            if line.strip():
+                names.append((line.strip().split(" (")[0], arch if universal else None))
+        code, out = run(["otool", "-arch", arch, "-l", str(path)])
+        if code != 0:
+            raise Broken(f"otool cannot read the load commands of the {arch} slice of {shown(path.name)}")
+        lines = out.splitlines()
+        for at, line in enumerate(lines):
+            if line.strip() == "cmd LC_RPATH":
+                for following in lines[at + 1:at + 4]:
+                    parts = following.strip().split(" ", 1)
+                    if parts[0] == "path" and len(parts) == 2:
+                        rpath = parts[1].split(" (offset")[0]
+                        if rpath not in rpaths:
+                            rpaths.append(rpath)
     return names, rpaths
 
 
@@ -311,19 +241,19 @@ def process_images(binary, folder, engine_names):
         yield "image", image
         names, rpaths = load_commands(image)
         run_paths = [(r, image) for r in rpaths] + inherited  # the image's own run paths first, then its loaders'
-        for name in names:
+        for name, label in names:
             base = pathlib.PurePosixPath(name).name.lower()
             if any(base.startswith(e) for e in engine_names):
-                yield "engine-load", name
+                yield "engine-load", (name, label)
             found = resolve(name, image, binary, run_paths, folder, names_in_folder)
             if found and found not in seen and is_mach_o(found):
                 queue.append((found, run_paths))
 
 
-def symbols(path):
-    code, out = run(["nm", "-P", str(path)])
+def symbols(path, arch):
+    code, out = run(["nm", "-arch", arch, "-P", str(path)])
     if code != 0:
-        raise Broken(f"nm cannot read {shown(path.name)}")
+        raise Broken(f"nm cannot read the {arch} slice of {shown(path.name)}")
     names = set()
     for line in out.splitlines():
         name = line.split(" ", 1)[0].split(":")[-1]
@@ -349,7 +279,7 @@ def main(argv):
         missing = [n for n in link["daemon_binaries"] if not exists(folder / n)]
         if missing:
             raise Broken(f"daemon binaries missing from {shown(str(folder))}: {', '.join(missing)}")
-        found = Collected()
+        found = collected()
         engine_names = ("lib" + link["engine_prefix"].rstrip("_").lower(), link["engine_prefix"].rstrip("_").lower())
         for name in present:
             root = regular(folder / name).resolve()
@@ -357,16 +287,20 @@ def main(argv):
             for kind, item in process_images(root, folder, engine_names):
                 if kind == "engine-load":
                     if daemon:  # the GUI loads the engine library for its key encoder; a daemon never loads it
-                        found.add(("engine-in-daemon", f"{name} loads {shown(pathlib.PurePosixPath(item).name)}"))
+                        loaded, label = item
+                        text = f"{name} loads {shown(pathlib.PurePosixPath(loaded).name)}"
+                        found.add(("engine-in-daemon", f"{text} ({label})" if label else text))
                     continue
                 if not daemon and item.name in link["engine_libraries"]:
                     continue  # the engine library itself, by exact name; what the GUI's own images use from it is judged
                 where = name if item == root else f"{name} via {shown(item.relative_to(folder.resolve()).as_posix())}"
-                for s in sorted(s for s in symbols(item) if s.startswith(link["engine_prefix"])):
-                    if daemon:
-                        found.add(("engine-in-daemon", f"{where} {s}"))
-                    elif not s.startswith(tuple(link["gui_allowed_prefixes"])):
-                        found.add(("engine-in-gui", f"{where} {s}"))
+                archs, universal = slices(item)
+                for arch in archs:
+                    for s in sorted(s for s in symbols(item, arch) if s.startswith(link["engine_prefix"])):
+                        if daemon:
+                            found.add(("engine-in-daemon", tagged(f"{where} {s}", arch, universal)))
+                        elif not s.startswith(tuple(link["gui_allowed_prefixes"])):
+                            found.add(("engine-in-gui", tagged(f"{where} {s}", arch, universal)))
     except Broken as error:
         print(f"link-check: broken: {error}", file=sys.stderr)
         return 2

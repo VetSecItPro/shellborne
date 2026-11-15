@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""Copy gate: user-facing text carries no security pitch, sparkle icon, British spelling or raw UI string (plan
+step P0.11.10).
+
+Usage: copy-lint <repo> [--tables-from <ref>]
+
+Reads copy-lint.toml beside this file: the forbidden phrases, the British-to-American word map and an allowlist of
+exact file-and-phrase entries, each with a reason. The binary suffixes come from hidden-chars.toml, so there is one
+list. With --tables-from both tables are read from that commit instead (git cat-file blob <ref>:tools/gates/<table>),
+so a branch cannot widen its own allowlist. The long-dash rule runs in hidden-chars.
+
+Where each rule reads, in tracked files only:
+  - forbidden-term and british-spelling: String Catalogs (.xcstrings), every tracked Markdown file (.md, at any
+    depth) and every text file under docs/ as whole text, and the string literals of Swift sources and of
+    crates/sb-cli/src. Phrases and words are matched as whole words without case. Between the words of a phrase any
+    run of whitespace, hyphens (U+2010 to U+2015), asterisks, underscores, backticks, brackets, parentheses and a Markdown link
+    target such as ](url) counts as the separator, so formatting cannot split a phrase.
+  - sparkle-icon: a Swift string literal or a tracked path that names a sparkle in any case, and the sparkle
+    characters U+2726, U+2727, U+2728, U+2747 and U+2748 in any tracked text. Only references to the Sparkle updater framework are exempt: in a Package.swift, the
+    sparkle-project/Sparkle package URL and the name "Sparkle" given as a .product name or a package argument;
+    in a path, a Sparkle.framework or Sparkle.xcframework part. An import is code, not a literal, so it is never
+    read. An asset name, an SF Symbol name or a UI string is refused whatever its case.
+  - ui-literal: a string literal passed straight to a known SwiftUI or AppKit initializer must be a key in a
+    tracked String Catalog of its own target. The target is the nearest ancestor folder of the Swift file that is a
+    direct child of a Sources folder (apple/Sources/App/... is target apple/Sources/App), and only catalogs inside
+    that folder count. A file with no such ancestor counts the catalogs in its own folder tree (its folder, any
+    folder below it, and any folder above it up to the repository root). A key in an unrelated target's catalog
+    does not help.
+
+Files are listed and read through the repo-rules reader, with its caps: tracked regular files only, opened without
+following a link, a byte cap per file and an entry cap on the listing. A file with a listed binary suffix is not
+decoded; every other tracked file must be UTF-8. A refusal names the rule and file:line and never prints source; at
+most the first 1000 are printed and the rest counted. Limits: only listed forms; it sees no pixels, computed or
+interpolated strings, or unmapped words, and a pitch in new words is the reviewer's job. Each run first proves every
+rule refuses its own control; if one does not, the gate is broken, and so is any error it did not expect. Exit 0
+clean, 1 refused, 2 broken.
+"""
+import bisect
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tomllib
+
+
+def crashed(kind, value, trace):
+    """Any error the run did not expect, even while this file loads its controls and rules, is broken (exit 2),
+    never read as a refusal or a pass. Only the error's type is printed, never source."""
+    sys.stderr.write(f"copy-lint: broken: an unexpected {kind.__name__} stopped the run, so no control or rule "
+                     "result can be trusted\n")
+    sys.stderr.flush()
+    os._exit(2)
+
+
+sys.excepthook = crashed
+
+HERE = pathlib.Path(__file__).resolve().parent
+READER = HERE / "repo-rules"
+TABLE_NAME = "copy-lint.toml"
+SHARED_NAME = "hidden-chars.toml"  # the binary suffixes, one list for both text gates
+GATE = "copy-lint"
+MAX_TABLE_BYTES = 256 * 1024
+MAX_ENTRIES = 2000
+MAX_KEYS = 100000
+EXACT_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
+REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
+WORD = re.compile(r"[A-Za-z]+")
+CLI_SOURCES = "crates/sb-cli/src/"
+SEPARATOR = r"(?:\]\([^)\s]*\)|[\s\-\u2010-\u2015*_`\[\]()])+"  # what may stand between a phrase's words
+PHRASE_WORDS = re.compile(r"[\s\-\u2010-\u2015*_`\[\]()]+")
+SPARKLE_CHAR = "[\u2726\u2727\u2728\u2747\u2748]"
+SPARKLE = re.compile(r"sparkle", re.IGNORECASE)
+FRAMEWORK = "Sparkle"  # the updater framework's name, exempt only where it names that framework
+FRAMEWORK_URL = re.compile(r"https://github\.com/sparkle-project/Sparkle(?:\.git)?")
+FRAMEWORK_ARGUMENT = re.compile(r"(?:\.product\s*\(\s*name|\bpackage)\s*:\s*$")
+FRAMEWORK_PARTS = {"Sparkle.framework", "Sparkle.xcframework"}
+MANIFEST = "Package.swift"
+UI_CALL = re.compile(
+    r"(?:(?<![\w.])(?:Text|Button|Label|Toggle|TextField|SecureField|Link|Menu|Picker|Section|NavigationLink|"
+    r"Stepper|DisclosureGroup|GroupBox|LabeledContent|ProgressView|ContentUnavailableView)\s*\(\s*"
+    r"|\.(?:navigationTitle|help|alert|confirmationDialog|accessibilityLabel|accessibilityHint)\s*\(\s*"
+    r"|\bNS(?:MenuItem|Menu|Button|Alert)\s*\(\s*title\s*:\s*"
+    r"|\bNSTextField\s*\(\s*(?:labelWithString|wrappingLabelWithString|string)\s*:\s*)$")
+RUST_RAW = re.compile(r'[bc]?r(#*)"')
+SWIFT_RAW = re.compile(r'(#+)("""|")')
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"', "'": "'", "\\": "\\"}
+
+# Known-bad controls, one per rule: every run must refuse each of them.
+CONTROLS = {
+    "forbidden-term": "Title\nShellborne is a security product.\n",
+    "british-spelling": "Theme\nPick a colour theme.\n",
+    "sparkle-icon": ('import SwiftUI\nlet badge = Image(systemName: "sparkles")\n// done \u2728\n'
+                     'let mode = Text("Sparkle mode")\n'),
+    "ui-literal": 'import SwiftUI\nlet view = Text("Open the control pane")\n',
+}
+CONTROL_NAMES = {"forbidden-term": "docs/control.md", "british-spelling": "docs/control.md",
+                 "sparkle-icon": "apple/Sources/Control/Control.swift",
+                 "ui-literal": "apple/Sources/Control/Control.swift"}
+CONTROL_LINES = {"forbidden-term": {2}, "british-spelling": {2}, "sparkle-icon": {2, 3, 4}, "ui-literal": {2}}
+SPARKLE_NAME_CONTROLS = ("apple/Sources/Shell/Assets.xcassets/sparkle-badge.imageset/Contents.json",
+                         "apple/Sources/Shell/Assets.xcassets/SparkleBadge.imageset/Contents.json")
+# Known-good: the updater framework references that must stay exempt, so the exemption is shown to work.
+FRAMEWORK_CONTROL_NAME = "apple/Package.swift"
+FRAMEWORK_CONTROL = ('let package = Package(name: "Control", dependencies: [\n'
+                     '    .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.6.4"),\n'
+                     '], targets: [.target(name: "Update", dependencies: [.product(name: "Sparkle", package: "Sparkle")])])\n')
+FRAMEWORK_PATH_CONTROL = "apple/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def table_bytes(rr, repo, ref, name=TABLE_NAME):
+    """A table's bytes, from beside this file or, with a ref, from that commit."""
+    if ref is None:
+        path = HERE / name
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(MAX_TABLE_BYTES + 1)
+        except OSError as error:
+            raise rr.Broken(f"cannot read {name}: {error.strerror}")
+    else:
+        if not REF.fullmatch(ref) or ref.startswith("-"):
+            raise rr.Broken(f"--tables-from needs a plain commit name, not {rr.shown(ref)}")
+        try:
+            done = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:tools/gates/{name}"],
+                                  capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            raise rr.Broken(f"git could not read {name} from {rr.shown(ref)}")
+        if done.returncode != 0:
+            raise rr.Broken(f"{rr.shown(ref)} has no readable tools/gates/{name}")
+        raw = done.stdout
+    if len(raw) > MAX_TABLE_BYTES:
+        raise rr.Broken(f"{name} is over the {MAX_TABLE_BYTES}-byte cap")
+    return raw
+
+
+def phrase_pattern(text):
+    """A phrase matched as whole words without case, any SEPARATOR between its words."""
+    parts = [part for part in PHRASE_WORDS.split(text) if part]
+    return re.compile(r"(?<![A-Za-z0-9])" + SEPARATOR.join(re.escape(part) for part in parts)
+                      + r"(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def shared_binary(rr, repo, ref):
+    """The binary suffixes from hidden-chars.toml, read from the same place as this gate's own table."""
+    try:
+        data = tomllib.loads(table_bytes(rr, repo, ref, SHARED_NAME).decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise rr.Broken(f"cannot read {SHARED_NAME}: {error}")
+    if "binary" not in data:
+        raise rr.Broken(f"{SHARED_NAME} has no binary suffixes")
+    return data["binary"]
+
+
+def load_table(rr, repo, ref):
+    try:
+        data = tomllib.loads(table_bytes(rr, repo, ref).decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise rr.Broken(f"cannot read {TABLE_NAME}: {error}")
+    if not {"forbidden", "spelling"} <= set(data) or set(data) - {"forbidden", "spelling", "allow"}:
+        raise rr.Broken(f"{TABLE_NAME} lacks or adds keys")
+    forbidden, spelling, binary = data["forbidden"], data["spelling"], shared_binary(rr, repo, ref)
+    if not (isinstance(forbidden, list) and 0 < len(forbidden) <= MAX_ENTRIES
+            and all(isinstance(v, str) and v.strip() for v in forbidden)):
+        raise rr.Broken(f"{TABLE_NAME}: forbidden must be a list of phrases")
+    if not (isinstance(spelling, dict) and 0 < len(spelling) <= MAX_ENTRIES
+            and all(WORD.fullmatch(k) and isinstance(v, str) and v.strip() for k, v in spelling.items())):
+        raise rr.Broken(f"{TABLE_NAME}: spelling must map single British words to American forms")
+    if not (isinstance(binary, list) and all(isinstance(v, str) and SUFFIX.fullmatch(v) for v in binary)):
+        raise rr.Broken(f"{SHARED_NAME}: binary must be a list of suffixes")
+    known = {" ".join(p.lower().split()) for p in forbidden}
+    allow = data.get("allow", [])
+    if not isinstance(allow, list) or len(allow) > MAX_ENTRIES:
+        raise rr.Broken(f"{TABLE_NAME}: allow must be at most {MAX_ENTRIES} [[allow]] entries")
+    allowed = set()
+    for entry in allow:
+        if not isinstance(entry, dict) or set(entry) != {"file", "phrase", "reason"}:
+            raise rr.Broken(f"{TABLE_NAME}: an [[allow]] entry needs exactly a file, a phrase and a reason")
+        name, phrase, reason = entry["file"], entry["phrase"], entry["reason"]
+        if not (isinstance(name, str) and EXACT_PATH.fullmatch(name)
+                and not any(part in (".", "..") for part in name.split("/"))):
+            raise rr.Broken(f"{TABLE_NAME}: an [[allow]] file is not one exact file path: {rr.shown(str(name))}")
+        if not isinstance(phrase, str) or " ".join(phrase.lower().split()) not in known:
+            raise rr.Broken(f"{TABLE_NAME}: the [[allow]] entry for {rr.shown(name)} names a phrase not in forbidden")
+        words = re.findall(r"[A-Za-z]{2,}", reason) if isinstance(reason, str) else []
+        if not words or any(word.lower() in rr.PLACEHOLDERS for word in words):
+            raise rr.Broken(f"{TABLE_NAME}: the [[allow]] entry for {rr.shown(name)} has no real reason")
+        allowed.add((name, " ".join(phrase.lower().split())))
+    words = sorted(spelling, key=len, reverse=True)
+    return {"forbidden": [(" ".join(p.lower().split()), phrase_pattern(p)) for p in forbidden],
+            "spelling": re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, words)) + r")(?![A-Za-z0-9_])",
+                                   re.IGNORECASE),
+            "binary": tuple(v.lower() for v in binary), "allow": allowed}
+
+
+def opened_string(text, index, rust):
+    """Where a string literal starting at index begins its content, the text that closes it, and whether a
+    backslash escapes the next character; None when no string starts here."""
+    if rust:
+        before = text[index - 1] if index else ""
+        if not (before.isalnum() or before == "_"):
+            raw = RUST_RAW.match(text, index)
+            if raw:
+                return raw.end(), '"' + raw.group(1), False
+    else:
+        raw = SWIFT_RAW.match(text, index)
+        if raw:
+            return raw.end(), raw.group(2) + raw.group(1), False
+        if text.startswith('"""', index):
+            return index + 3, '"""', True
+    if text[index] == '"':
+        return index + 1, '"', True
+    return None
+
+
+def literals(rr, name, text, rust):
+    """Each string literal outside a comment: (offset of its opening quote, offset of its content, content)."""
+    out, index, size = [], 0, len(text)
+    while index < size:
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            index = size if end < 0 else end
+            continue
+        if text.startswith("/*", index):
+            depth, at = 1, index + 2
+            while at < size and depth:
+                if text.startswith("/*", at):
+                    depth, at = depth + 1, at + 2
+                elif text.startswith("*/", at):
+                    depth, at = depth - 1, at + 2
+                else:
+                    at += 1
+            if depth:
+                raise rr.Broken(f"{rr.shown(name)} has a block comment that never closes, so it cannot be read")
+            index = at
+            continue
+        found = opened_string(text, index, rust)
+        if found:
+            start, close, escapes = found
+            at = start
+            while not text.startswith(close, at):
+                if at >= size:
+                    raise rr.Broken(f"{rr.shown(name)} has a string that never closes, so it cannot be read")
+                at += 2 if escapes and text[at] == "\\" else 1
+            out.append((index, start, text[start:at]))
+            index = at + len(close)
+            continue
+        if rust and text[index] == "'":  # a character literal, so a quote inside it opens no string
+            if text.startswith("\\", index + 1):
+                end = text.find("'", index + 3)
+                if 0 <= end <= index + 12:
+                    index = end + 1
+                    continue
+            elif index + 2 < size and text[index + 2] == "'":
+                index += 3
+                continue
+        index += 1
+    return out
+
+
+def unescaped(content):
+    """A plain literal's text with its simple escapes resolved, or None when it interpolates."""
+    if "\\(" in content:
+        return None
+    return re.sub(r"\\(.)", lambda m: ESCAPES.get(m.group(1), m.group(0)), content, flags=re.DOTALL)
+
+
+def prose_hits(table, name, text, offset=0):
+    """(rule, offset) for each forbidden phrase not allowed in this file, and each British word."""
+    hits = []
+    for phrase, pattern in table["forbidden"]:
+        if (name, phrase) not in table["allow"]:
+            hits += [("forbidden-term", offset + m.start()) for m in pattern.finditer(text)]
+    hits += [("british-spelling", offset + m.start()) for m in table["spelling"].finditer(text)]
+    return hits
+
+
+def names_sparkle(text):
+    """True when text names a sparkle in any case."""
+    return bool(SPARKLE.search(text))
+
+
+def path_names_sparkle(name):
+    """True when a tracked path names a sparkle outside a part that is the updater framework bundle. The binary
+    inside that bundle shares the framework's name, so a part exactly Sparkle after such a bundle is exempt too."""
+    parts = name.split("/")
+    for index, part in enumerate(parts):
+        if part in FRAMEWORK_PARTS:
+            continue
+        if part == FRAMEWORK and any(earlier in FRAMEWORK_PARTS for earlier in parts[:index]):
+            continue
+        if names_sparkle(part):
+            return True
+    return False
+
+
+def framework_literal(name, text, quote, content):
+    """True for a Package.swift literal that references the Sparkle updater framework: its package URL, or its
+    name given as a .product name or a package argument."""
+    if pathlib.PurePosixPath(name).name != MANIFEST:
+        return False
+    if FRAMEWORK_URL.fullmatch(content):
+        return True
+    return content == FRAMEWORK and bool(FRAMEWORK_ARGUMENT.search(text, max(0, quote - 120), quote))
+
+
+def file_hits(rr, table, name, text, keys):
+    """(rule, line number) refusals for one tracked text file."""
+    hits = [("sparkle-icon", m.start()) for m in re.finditer(SPARKLE_CHAR, text)]
+    lowered = name.lower()
+    swift, cli = lowered.endswith(".swift"), name.startswith(CLI_SOURCES) and lowered.endswith(".rs")
+    if lowered.endswith(".xcstrings") or name.startswith("docs/") or lowered.endswith(".md"):
+        hits += prose_hits(table, name, text)
+    if swift or cli:
+        for quote, start, content in literals(rr, name, text, rust=cli):
+            hits += prose_hits(table, name, content, start)
+            if swift and names_sparkle(content) and not framework_literal(name, text, quote, content):
+                hits.append(("sparkle-icon", start))
+            if swift and UI_CALL.search(text, max(0, quote - 120), quote):
+                plain = unescaped(content)
+                if plain and plain not in keys:
+                    hits.append(("ui-literal", start))
+    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    return sorted({(rule, bisect.bisect_right(starts, at)) for rule, at in hits}, key=lambda h: (h[1], h[0]))
+
+
+def target_folder(name):
+    """The nearest ancestor folder of a Swift file that is a direct child of a Sources folder, as a path
+    prefix; None when there is none."""
+    parts = pathlib.PurePosixPath(name).parts
+    for index in range(len(parts) - 2, 0, -1):  # a folder, never the file itself
+        if parts[index - 1] == "Sources":
+            return "/".join(parts[:index + 1]) + "/"
+    return None
+
+
+def keys_for(name, catalogs):
+    """The keys of the catalogs that count for one Swift file; catalogs maps each catalog path to its keys."""
+    target = target_folder(name)
+    own = str(pathlib.PurePosixPath(name).parent)
+    keys = set()
+    for path, found in catalogs.items():
+        folder = str(pathlib.PurePosixPath(path).parent)
+        if target is not None:
+            counts = path.startswith(target)
+        else:
+            counts = own == "." or folder == "." or folder == own or folder.startswith(own + "/") \
+                or own.startswith(folder + "/")
+        if counts:
+            keys |= found
+    return keys
+
+
+def catalog_keys(rr, name, text):
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise rr.Broken(f"{rr.shown(name)} is not a readable String Catalog")
+    strings = data.get("strings") if isinstance(data, dict) else None
+    if not isinstance(strings, dict):
+        raise rr.Broken(f"{rr.shown(name)} is not a readable String Catalog")
+    return set(strings)
+
+
+def prove_controls(rr, table):
+    """Each rule's control must be refused on its planted lines, or the gate cannot fail and is broken."""
+    for rule, text in CONTROLS.items():
+        lines = {line for found, line in file_hits(rr, table, CONTROL_NAMES[rule], text, set()) if found == rule}
+        if lines != CONTROL_LINES[rule]:
+            raise rr.Broken(f"the seeded {rule} control was not refused, so this gate cannot fail")
+        if rule == "sparkle-icon" and not all(map(path_names_sparkle, SPARKLE_NAME_CONTROLS)):
+            raise rr.Broken("a seeded sparkle-icon file name control was not refused, so this gate cannot fail")
+        if rule == "sparkle-icon" and (
+                any(found == rule for found, _ in file_hits(rr, table, FRAMEWORK_CONTROL_NAME, FRAMEWORK_CONTROL, set()))
+                or path_names_sparkle(FRAMEWORK_PATH_CONTROL)):
+            raise rr.Broken("an updater framework reference control was refused, so the exemption is unproven")
+        print(f"{GATE}: control {rule} refused as expected")
+    if set(CONTROLS) != set(CONTROL_LINES):
+        raise rr.Broken("a rule has no control, so it cannot be shown to fail")
+
+
+def scan(rr, table, repo):
+    found = rr.Collected()
+    names, catalogs, total = rr.tracked(repo), {}, 0
+    for name in names:  # first the catalog keys, so one file is held in memory at a time
+        rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
+        if name.lower().endswith(".xcstrings"):
+            catalogs[name] = catalog_keys(rr, name, rr.read_source(repo, name))
+            total += len(catalogs[name])
+            if total > MAX_KEYS:
+                raise rr.Broken(f"the String Catalogs hold over the cap of {MAX_KEYS} keys")
+    for name in names:
+        if path_names_sparkle(name):
+            found.add(f"sparkle-icon: {rr.shown(name)}:1")
+        if not name.lower().endswith(table["binary"]):
+            keys = keys_for(name, catalogs) if name.lower().endswith(".swift") else set()
+            for rule, line in file_hits(rr, table, name, rr.read_source(repo, name), keys):
+                found.add(f"{rule}: {rr.shown(name)}:{line}")
+    return found.kept, found.total
+
+
+def arguments(rr, argv):
+    repo, ref, rest = None, None, list(argv[1:])
+    usage = f"usage: {GATE} <repo> [--tables-from <ref>]"
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--tables-from":
+            if not rest or ref is not None:
+                raise rr.Broken(usage)
+            ref = rest.pop(0)
+        elif arg.startswith("-") or repo is not None:
+            raise rr.Broken(usage)
+        else:
+            repo = arg
+    if repo is None:
+        raise rr.Broken(usage)
+    return repo, ref
+
+
+def main(argv):
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"{GATE}: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        repo, ref = arguments(rr, argv)
+        table = load_table(rr, repo, ref)
+        prove_controls(rr, table)
+        kept, total = scan(rr, table, repo)
+    except rr.Broken as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    for where in kept:
+        print(f"{GATE}: refused {where}")
+    if total > len(kept):
+        print(f"{GATE}: refused: {total - len(kept)} more refusals not listed")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

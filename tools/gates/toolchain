@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Toolchain gate: Rust, Zig, the Ghostty commit and Xcode are each pinned exactly, and the tools a build would use
+report the pinned versions (plan step P0.12.1).
+
+Usage: toolchain [--rustc <path>] [--zig <path>] [--xcodebuild <path>] [--xcrun <path>] <repo>
+
+Reads two tracked files of <repo>:
+  - rust-toolchain.toml at the root: [toolchain] with an exact three-part channel and a targets list that holds
+    both aarch64-apple-darwin and x86_64-apple-darwin;
+  - tools/gates/toolchain.toml, the toolchain record: [ghostty] commit (40 lowercase hex) and reason, [zig]
+    version (exact three parts), [zig.sha256] aarch64-macos and x86_64-macos (64 lowercase hex each), and [xcode]
+    version, build and sdk as xcodebuild -version and xcrun --show-sdk-version print them.
+When third_party/ghostty/PIN.toml is tracked, its commit, and its zig version when it names one, must match the
+record.
+
+Rules, each named in its refusal:
+  - floating: a channel name, a dated nightly, a partial version, a range or wildcard, latest, a short hash, a
+    tag or a branch where an exact pin belongs, or a checksum that is not 64 hex characters;
+  - missing: a pin file that is absent or untracked, a missing field or a targets list without both Apple
+    targets; nothing is defaulted;
+  - mismatch: a tool reports a version other than its pin, or the compiler's sysroot lacks a pinned target;
+  - not-rustup: the rustc that will actually run is not inside rustup's toolchains folder ($RUSTUP_HOME, by
+    default ~/.rustup) in the folder for the pinned version, or the sysroot it reports is not, so a compiler rustup
+    did not provide, or a wrapper that only reports one, is refused even when its version matches;
+  - disagree: PIN.toml names a different Ghostty commit or Zig version than the record.
+
+The tools asked are the ones a build would use, run from the repository folder: $RUSTC or rustc on PATH, and
+zig, xcodebuild and xcrun on PATH. A rustup proxy is resolved with `rustup which rustc` run in the repository
+folder (which reads rust-toolchain.toml), then by realpath, and the binary it names is the one asked for its version
+and sysroot. Each option names a tool instead. A
+tool named by an option that cannot run, exits non-zero, runs past its time limit or prints past the output cap
+breaks the run; a tool not found on PATH is not run, and the run says which and exits 2, never 0. The Zig
+checksums are checked for form only; this gate never downloads anything.
+
+Files are read through the repo-rules reader, with its caps: tracked regular files only, never through a link,
+2 MiB each. A refusal is one line, `toolchain: refused <rule>: <file>[:line]` and a plain reason, and never quotes
+the source. On a clean run each pinned version is printed beside the one found. Each run first proves the pin
+checks refuse seeded floating values; if they do not, the gate is broken. Exit 0 clean, 1 refused, 2 broken or
+not run.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import selectors
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+
+READER = pathlib.Path(__file__).resolve().parent / "repo-rules"
+GATE = "toolchain"
+RUST_FILE = "rust-toolchain.toml"
+RECORD = "tools/gates/toolchain.toml"
+PIN = "third_party/ghostty/PIN.toml"
+TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
+ZIG_PLATFORMS = ("aarch64-macos", "x86_64-macos")
+TOOLS = ("rustc", "zig", "xcodebuild", "xcrun")
+OUTPUT_CAP = 64 * 1024  # bytes of output kept from one tool run; more breaks the run
+TOOL_SECONDS = 60
+
+EXACT = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+XCODE_VERSION = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+XCODE_BUILD = re.compile(r"^[0-9]+[A-Z][0-9]+[a-z]?$")
+SDK_VERSION = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+WORDS = re.compile(r"[A-Za-z]{2,}")
+
+HEADER = re.compile(r"^\s*\[\s*([A-Za-z0-9_.\-\" ]+?)\s*\]\s*(?:#.*)?$")
+KEY = re.compile(r"^\s*(\"?)([A-Za-z0-9_\-]+)\1\s*=")
+
+# Known-bad controls: values every run must refuse, beside exact values it must accept.
+CONTROLS = (
+    (EXACT, ("stable", "nightly-2026-01-01", "1.90", "^1.90", "1.90.*", "latest"), "1.91.0"),
+    (COMMIT, ("0123456", "v1.4.0", "main", "0123456789ABCDEF0123456789ABCDEF01234567"),
+     "0123456789abcdef0123456789abcdef01234567"),
+    (SHA256, ("ab" * 8, "z" * 64), "ab" * 32),
+    (XCODE_VERSION, ("latest", "26.*", "26"), "26.5"),
+)
+
+
+def reader():
+    """The repo-rules module, loaded from the file beside this one without writing bytecode next to it."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("repo_rules", str(READER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class Run:
+    """What one run found: refusals, lines to print beside them, and tools that were not run."""
+    def __init__(self, rr):
+        self.rr, self.refusals, self.notes, self.not_run = rr, [], [], []
+
+    def refuse(self, rule, where, why):
+        self.refusals.append(f"{GATE}: refused {rule}: {where}: {why}")
+
+
+def key_lines(text):
+    """The 1-based line of each table header and each key, as {(table, key): line}, the header under key None."""
+    lines, table = {}, ""
+    for number, line in enumerate(text.splitlines(), 1):
+        header = HEADER.match(line)
+        if header:
+            table = header.group(1).replace('"', "").replace(" ", "")
+            lines.setdefault((table, None), number)
+            continue
+        key = KEY.match(line)
+        if key:
+            lines.setdefault((table, key.group(2)), number)
+    return lines
+
+
+def where(rr, name, lines, table, key=None):
+    """file:line for a key, else for its table, else the file alone."""
+    line = lines.get((table, key)) or lines.get((table, None))
+    return f"{rr.shown(name)}:{line}" if line else rr.shown(name)
+
+
+def load_toml(rr, repo, name):
+    """A tracked file parsed as TOML with its key lines; None when the file is not tracked."""
+    if name not in repo.names:
+        return None
+    text = rr.read_source(repo.path, name)
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        raise rr.Broken(f"{rr.shown(name)} is not valid TOML")
+    return data, key_lines(text)
+
+
+def table(data, path):
+    """The nested table at a dotted path, or None."""
+    for part in path.split("."):
+        data = data.get(part) if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def pinned(run, name, data, lines, path, key, pattern, what):
+    """The exact value of one pin, or None after a refusal for a missing or floating one."""
+    rr, section = run.rr, table(data, path)
+    value = section.get(key) if section is not None else None
+    if value is None:
+        run.refuse("missing", where(rr, name, lines, path, key), f"{what} is not pinned")
+        return None
+    if not isinstance(value, str) or not pattern.match(value):
+        run.refuse("floating", where(rr, name, lines, path, key), f"{what} is not an exact pin")
+        return None
+    return value
+
+
+def read_rust(run, repo):
+    """The Rust channel from rust-toolchain.toml, and the line to name it by; None when not usable."""
+    rr = run.rr
+    loaded = load_toml(rr, repo, RUST_FILE)
+    if loaded is None:
+        run.refuse("missing", RUST_FILE, "no tracked rust-toolchain.toml at the root")
+        return None
+    data, lines = loaded
+    channel = pinned(run, RUST_FILE, data, lines, "toolchain", "channel", EXACT, "the Rust channel")
+    section = table(data, "toolchain") or {}
+    targets = section.get("targets")
+    if not isinstance(targets, list) or not all(t in targets for t in TARGETS):
+        run.refuse("missing", where(rr, RUST_FILE, lines, "toolchain", "targets" if "targets" in section else None),
+                   "the targets list does not hold both Apple targets")
+    if channel is None:
+        return None
+    return channel, where(rr, RUST_FILE, lines, "toolchain", "channel"), where(
+        rr, RUST_FILE, lines, "toolchain", "targets" if "targets" in section else None)
+
+
+def read_record(run, repo):
+    """The pins from the toolchain record, each with the line to name it by; None when the record is absent."""
+    rr = run.rr
+    loaded = load_toml(rr, repo, RECORD)
+    if loaded is None:
+        run.refuse("missing", RECORD, "no tracked toolchain record")
+        return None
+    data, lines = loaded
+    pins = {}
+    fields = (("ghostty", "commit", COMMIT, "the Ghostty commit"), ("zig", "version", EXACT, "the Zig version"),
+              ("xcode", "version", XCODE_VERSION, "the Xcode version"),
+              ("xcode", "build", XCODE_BUILD, "the Xcode build"), ("xcode", "sdk", SDK_VERSION, "the SDK version"))
+    fields += tuple(("zig.sha256", platform, SHA256, f"the Zig {platform} checksum") for platform in ZIG_PLATFORMS)
+    for path, key, pattern, what in fields:
+        value = pinned(run, RECORD, data, lines, path, key, pattern, what)
+        pins[(path, key)] = (value, where(rr, RECORD, lines, path, key))
+    reason = (table(data, "ghostty") or {}).get("reason")
+    if not isinstance(reason, str) or not WORDS.search(reason) or any(
+            word.lower() in rr.PLACEHOLDERS for word in WORDS.findall(reason)):
+        run.refuse("missing", where(rr, RECORD, lines, "ghostty", "reason"),
+                   "the Ghostty commit has no real reason recorded")
+    return pins
+
+
+def read_pin(run, repo, pins):
+    """PIN.toml, once tracked, must name the record's Ghostty commit, and its Zig version when it names one."""
+    rr = run.rr
+    loaded = load_toml(rr, repo, PIN)
+    if loaded is None:
+        return
+    data, lines = loaded
+    for key, record_key, what in (("commit", ("ghostty", "commit"), "Ghostty commit"),
+                                  ("zig", ("zig", "version"), "Zig version")):
+        value, record_where = pins[record_key]
+        if key not in data:
+            if key == "commit":
+                run.refuse("missing", rr.shown(PIN), "the Ghostty pin names no commit")
+            continue
+        if value is not None and data[key] != value:
+            run.refuse("disagree", where(rr, PIN, lines, "", key),
+                       f"names a different {what} than {record_where}")
+
+
+def ask(rr, tool, path, args, cwd):
+    """One tool's output as text: it must start, exit zero in time and stay under the output cap."""
+    try:
+        child = subprocess.Popen([str(path), *args], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+    except OSError as error:
+        raise rr.Broken(f"{tool} at {rr.shown(str(path))} cannot run: {error.strerror}")
+    chunks, size, deadline = [], 0, time.monotonic() + TOOL_SECONDS
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0 or not selector.select(timeout=left):
+                    raise rr.Broken(f"{tool} did not answer in {TOOL_SECONDS} seconds")
+                chunk = os.read(child.stdout.fileno(), 64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > OUTPUT_CAP:
+                    raise rr.Broken(f"{tool} printed past the {OUTPUT_CAP}-byte output cap")
+                chunks.append(chunk)
+        code = child.wait(timeout=max(1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        raise rr.Broken(f"{tool} did not exit in {TOOL_SECONDS} seconds")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()
+    if code != 0:
+        raise rr.Broken(f"{tool} exited with status {code}")
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        raise rr.Broken(f"{tool} printed output that is not UTF-8")
+
+
+def field(rr, tool, text, pattern):
+    """The first group of a pattern in a tool's output, or broken: output the gate cannot read is never a pass."""
+    found = re.search(pattern, text, re.MULTILINE)
+    if not found:
+        raise rr.Broken(f"{tool} printed no version the gate can read")
+    return found.group(1)
+
+
+def tool_path(run, chosen, name):
+    """The tool an option names, else the one a build would find; None, noted as not run, when there is none."""
+    if chosen.get(name):
+        return chosen[name]
+    if name == "rustc" and os.environ.get("RUSTC"):
+        return os.environ["RUSTC"]
+    found = shutil.which(name)
+    if found is None:
+        run.not_run.append(f"{name}: not found on PATH, so its pin was not compared with a real tool")
+    return found
+
+
+def inside(path, folder):
+    """True when path, resolved, sits strictly inside folder, resolved."""
+    path, folder = os.path.realpath(path), os.path.realpath(folder)
+    return path != folder and os.path.commonpath([path, folder]) == folder
+
+
+def rustup_toolchains():
+    home = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    return os.path.join(home, "toolchains")
+
+
+def runs_as(rr, path, cwd):
+    """The rustc binary that will actually compile for the compiler at path, or None when that cannot be told.
+    The rustup proxy (a link that resolves to a file named rustup) hands off to the toolchain `rustup which rustc`
+    names in the repository folder, so that binary is the one judged; any other file is judged as itself."""
+    real = os.path.realpath(path)
+    if os.path.basename(real) != "rustup":
+        return real
+    named = ask(rr, "rustup", real, ["which", "rustc"], cwd).strip()
+    if not named or "\n" in named or not os.path.isabs(named):
+        raise rr.Broken("rustup which rustc named no single binary")
+    return os.path.realpath(named)
+
+
+def check_rust(run, chosen, cwd, rust):
+    rr = run.rr
+    path = tool_path(run, chosen, "rustc")
+    if path is None:
+        return
+    resolved = runs_as(rr, path, cwd)
+    found = field(rr, "rustc", ask(rr, "rustc", resolved, ["-vV"], cwd), r"^release:\s*(\S+)\s*$")
+    sysroot = ask(rr, "rustc", resolved, ["--print", "sysroot"], cwd).strip()
+    if not sysroot or "\n" in sysroot:
+        raise rr.Broken("rustc printed no single sysroot")
+    toolchains = rustup_toolchains()
+    if not inside(resolved, toolchains):
+        run.refuse("not-rustup", RUST_FILE, f"the rustc that runs, {rr.shown(resolved)}, is not inside "
+                   f"{rr.shown(os.path.realpath(toolchains))}")
+    elif rust is not None and not os.path.basename(
+            os.path.relpath(resolved, os.path.realpath(toolchains)).split(os.sep)[0]).startswith(rust[0] + "-"):
+        run.refuse("not-rustup", RUST_FILE, f"the rustc that runs, {rr.shown(resolved)}, is not in the toolchain "
+                   f"folder for the pinned version {rust[0]}")
+    if not inside(sysroot, toolchains):
+        run.refuse("not-rustup", RUST_FILE, f"rustc's sysroot {rr.shown(os.path.realpath(sysroot))} is not inside "
+                   f"{rr.shown(os.path.realpath(toolchains))}")
+    if rust is None:
+        run.notes.append(f"{GATE}: rust found {rr.shown(found)}, not compared: there is no usable Rust pin")
+        return
+    channel, channel_where, targets_where = rust
+    if found != channel:
+        run.refuse("mismatch", channel_where, f"rustc reports {rr.shown(found)}, the pin is {channel}")
+    for target in TARGETS:
+        if not os.path.isdir(os.path.join(sysroot, "lib", "rustlib", target, "lib")):
+            run.refuse("mismatch", targets_where, f"rustc's sysroot has no {target} standard library")
+    run.notes.append(f"{GATE}: rust pinned {channel}, found {rr.shown(found)} from rustup at "
+                     f"{rr.shown(os.path.realpath(sysroot))}")
+
+
+def check_zig(run, chosen, cwd, pins):
+    rr = run.rr
+    pin, pin_where = pins[("zig", "version")]
+    path = tool_path(run, chosen, "zig")
+    if path is None:
+        if pin is not None:
+            run.notes.append(f"{GATE}: zig pinned {pin}, not run: no zig on PATH")
+        return
+    found = field(rr, "zig", ask(rr, "zig", path, ["version"], cwd), r"^\s*(\S+)\s*$")
+    if pin is None:
+        return
+    if found != pin:
+        run.refuse("mismatch", pin_where, f"zig reports {rr.shown(found)}, the pin is {pin}")
+    run.notes.append(f"{GATE}: zig pinned {pin}, found {rr.shown(found)}")
+
+
+def check_xcode(run, chosen, cwd, pins):
+    rr = run.rr
+    path = tool_path(run, chosen, "xcodebuild")
+    if path is not None:
+        text = ask(rr, "xcodebuild", path, ["-version"], cwd)
+        for key, pattern, what in (("version", r"^Xcode\s+(\S+)\s*$", "Xcode version"),
+                                   ("build", r"^Build version\s+(\S+)\s*$", "Xcode build")):
+            found = field(rr, "xcodebuild", text, pattern)
+            pin, pin_where = pins[("xcode", key)]
+            if pin is None:
+                continue
+            if found != pin:
+                run.refuse("mismatch", pin_where, f"xcodebuild reports {what} {rr.shown(found)}, the pin is {pin}")
+            run.notes.append(f"{GATE}: {what} pinned {pin}, found {rr.shown(found)}")
+    path = tool_path(run, chosen, "xcrun")
+    if path is not None:
+        found = field(rr, "xcrun", ask(rr, "xcrun", path, ["--show-sdk-version"], cwd), r"^\s*(\S+)\s*$")
+        pin, pin_where = pins[("xcode", "sdk")]
+        if pin is not None:
+            if found != pin:
+                run.refuse("mismatch", pin_where, f"xcrun reports SDK {rr.shown(found)}, the pin is {pin}")
+            run.notes.append(f"{GATE}: SDK pinned {pin}, found {rr.shown(found)}")
+
+
+def prove_controls(rr):
+    """Each seeded floating value must be refused and each exact one accepted, or the gate cannot fail."""
+    for pattern, bad, good in CONTROLS:
+        if any(pattern.match(value) for value in bad) or not pattern.match(good):
+            raise rr.Broken("a seeded floating pin was not refused, so this gate cannot fail")
+    print(f"{GATE}: control refused as expected")
+
+
+def arguments(rr, argv):
+    """The tools the options name and the repository folder."""
+    chosen, rest = {}, list(argv[1:])
+    while rest and rest[0].startswith("--"):
+        option = rest.pop(0)[2:]
+        if option not in TOOLS or option in chosen or not rest:
+            raise rr.Broken(f"usage: {GATE} [--rustc <path>] [--zig <path>] [--xcodebuild <path>] "
+                            "[--xcrun <path>] <repo>")
+        chosen[option] = rest.pop(0)
+    if len(rest) != 1:
+        raise rr.Broken(f"usage: {GATE} [--rustc <path>] [--zig <path>] [--xcodebuild <path>] [--xcrun <path>] <repo>")
+    return chosen, rest[0]
+
+
+class Repo:
+    def __init__(self, rr, path):
+        self.path = path
+        self.names = set(rr.tracked(path))
+
+
+def main(argv):
+    try:
+        rr = reader()
+    except Exception as error:  # a reader that cannot load is a broken check, never a pass
+        print(f"{GATE}: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
+        return 2
+    run = Run(rr)
+    try:
+        chosen, folder = arguments(rr, argv)
+        prove_controls(rr)
+        repo = Repo(rr, folder)
+        rust = read_rust(run, repo)
+        pins = read_record(run, repo)
+        if pins is not None:
+            read_pin(run, repo, pins)
+            pins_known = pins
+        else:
+            pins_known = {key: (None, RECORD) for key in (("zig", "version"), ("xcode", "version"),
+                                                         ("xcode", "build"), ("xcode", "sdk"))}
+        check_rust(run, chosen, folder, rust)
+        check_zig(run, chosen, folder, pins_known)
+        check_xcode(run, chosen, folder, pins_known)
+    except rr.Broken as error:
+        print(f"{GATE}: broken: {error}", file=sys.stderr)
+        return 2
+    if pins is not None and pins[("ghostty", "commit")][0] is not None:
+        run.notes.append(f"{GATE}: ghostty pinned {pins[('ghostty', 'commit')][0]}")
+    for note in run.notes:
+        print(note)
+    for line in run.refusals:
+        print(line)
+    if run.refusals:
+        return 1
+    if run.not_run:
+        for line in run.not_run:
+            print(f"{GATE}: not run: {line}")
+        return 2
+    print(f"{GATE}: clean")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
