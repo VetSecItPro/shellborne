@@ -15,7 +15,7 @@
 //! let _map = BoundedMap::<u8, u8>::new(4, Eviction::EvictOldest)?;
 //! let _set = BoundedSet::<u8>::new(4, Eviction::RefuseNew)?;
 //! let _list = BoundedList::<u8>::new(4, Eviction::EvictOldest)?;
-//! let _ring = ByteRing::new(4)?;
+//! let _ring = ByteRing::new(4, Eviction::RefuseNew)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -64,10 +64,14 @@
 //! let _ring = sb_bounds::ByteRing::new();
 //! ```
 //!
-//! A cap alone, without an eviction rule, does not build a count-capped collection either:
+//! A cap alone, without an eviction rule, does not build any of them either:
 //!
 //! ```compile_fail
 //! let _queue = sb_bounds::BoundedQueue::<u8>::new(4);
+//! ```
+//!
+//! ```compile_fail
+//! let _ring = sb_bounds::ByteRing::new(4);
 //! ```
 
 #![expect(
@@ -587,30 +591,86 @@ impl<T> BoundedList<T> {
     }
 }
 
-/// A byte buffer that holds the newest `cap` bytes written to it.
+/// A write to a [`ByteRing`] under [`Eviction::RefuseNew`] that did not fit.
 ///
-/// A write that would pass the cap evicts the oldest bytes; a single write longer than the cap keeps
-/// only its last `cap` bytes. Writes never fail.
+/// The ring stored the first `accepted` bytes of the write and none of the remaining `rejected` bytes.
+/// A refusal is not an eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingRefused {
+    /// How many bytes of the write, from its start, the ring stored.
+    pub accepted: usize,
+    /// How many bytes at the end of the write the ring did not store.
+    pub rejected: usize,
+}
+
+impl fmt::Display for RingRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "a full byte ring stored {} bytes of a write and refused the other {}",
+            self.accepted, self.rejected
+        )
+    }
+}
+
+impl std::error::Error for RingRefused {}
+
+/// A byte buffer that holds at most `cap` bytes, oldest first.
+///
+/// Under [`Eviction::EvictOldest`] it holds the newest `cap` bytes written to it: a write that would
+/// pass the cap evicts the oldest bytes, a single write longer than the cap keeps only its last `cap`
+/// bytes, and [`ByteRing::push`] never fails. Under [`Eviction::RefuseNew`] it holds the first `cap`
+/// bytes written to it: a write stores only the bytes that fit and returns [`RingRefused`] for the
+/// rest, so what is held is always an unbroken prefix of everything written.
 #[derive(Debug)]
 pub struct ByteRing {
     cap: usize,
+    eviction: Eviction,
     evictions: u64,
     bytes: VecDeque<u8>,
 }
 
 impl ByteRing {
     /// Builds an empty ring that holds at most `cap` bytes. A zero cap is refused.
-    pub fn new(cap: usize) -> Result<Self, ZeroCap> {
+    pub fn new(cap: usize, eviction: Eviction) -> Result<Self, ZeroCap> {
         Ok(Self {
             cap: checked_cap(cap)?,
+            eviction,
             evictions: 0,
             bytes: VecDeque::new(),
         })
     }
 
-    /// Appends `bytes` and returns how many bytes this write evicted, counting both older bytes
-    /// pushed out and bytes of this write that never fit.
-    pub fn push(&mut self, bytes: &[u8]) -> usize {
+    /// Appends `bytes`.
+    ///
+    /// Returns `Ok(evicted)` when every byte of the write was stored, where `evicted` counts the
+    /// bytes this write evicted under [`Eviction::EvictOldest`]: both older bytes pushed out and
+    /// bytes of this write that never fit. It is always zero under [`Eviction::RefuseNew`]. Returns
+    /// `Err(RingRefused)` under [`Eviction::RefuseNew`] when the write did not fit; the bytes that fit
+    /// were stored and the rest were not.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<usize, RingRefused> {
+        match self.eviction {
+            Eviction::RefuseNew => self.push_refusing(bytes),
+            Eviction::EvictOldest => Ok(self.push_evicting(bytes)),
+        }
+    }
+
+    fn push_refusing(&mut self, bytes: &[u8]) -> Result<usize, RingRefused> {
+        let room = self.cap.saturating_sub(self.bytes.len());
+        let accepted = bytes.len().min(room);
+        let (stored, refused) = bytes.split_at_checked(accepted).unwrap_or((bytes, &[]));
+        self.bytes.extend(stored);
+        if refused.is_empty() {
+            Ok(0)
+        } else {
+            Err(RingRefused {
+                accepted: stored.len(),
+                rejected: refused.len(),
+            })
+        }
+    }
+
+    fn push_evicting(&mut self, bytes: &[u8]) -> usize {
         let evicted = if bytes.len() >= self.cap {
             let never_fit = bytes.len().saturating_sub(self.cap);
             let evicted = self.bytes.len().saturating_add(never_fit);
