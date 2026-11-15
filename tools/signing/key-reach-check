@@ -22,11 +22,12 @@ Codesigning identities in --keychain are listed with `security find-identity -p 
 without -v, because codesign still signs with an identity that list would hide as untrusted. Each listed
 identity makes a real codesign attempt, codesign found on PATH, on a copy of the fixture in a temp folder:
 `codesign --keychain <keychain> -s <hash> -f <copy>`, its output discarded unread. An identity whose name
-starts with shellborne-keyreach-control- is the control and must sign, or the run is broken; any other
-identity that signs is reachable. A listed identity with no control among them is broken, and so is a
-control certificate with no usable private key. A keychain with no identity and no control certificate
-has nothing to probe for codesigning and is said so in one line. The user keychain search list is never
-changed, so codesign sees an identity only when --keychain is already on that list.
+starts with shellborne-keyreach-control- is the control, set up once by the owner in --keychain, and must
+sign, or the run is broken; any other identity that signs is reachable. This tool never creates, imports or
+deletes an identity. No control identity listed means the codesign probe is blind, and the run is broken,
+never a pass; so is a control certificate with no usable private key. The user keychain search list is never
+changed, and codesign sees an identity only when --keychain is already on that list, so a --keychain off the
+list is broken too.
 
 Each run plants a control item and a control EdDSA account under a random name with the prefix
 shellborne-keyreach-control- in --keychain, probes them first, and removes them even on failure. A
@@ -35,7 +36,8 @@ by attributes only, so a real signer that looks keys up under its own service re
 unreachable and the run is broken, never a pass.
 
 Exit 0 nothing reachable, 1 something reachable, 2 broken. This tool never receives, prints, logs or
-stores a byte of a key, of the signer's output or of a probed file.
+stores a byte of a key, of the signer's output or of a probed file. A program that cannot be started is
+broken.
 Plan-Step: P0.11.12
 """
 import argparse
@@ -61,6 +63,7 @@ MAX_INVENTORY_BYTES = 256 * 1024
 MAX_IDENTITIES = 200
 IDENTITY_LINE = re.compile(r'^\s*\d+\) ([0-9A-F]{40}) "(.*)"(?: \(.*\))?$')
 COUNT_LINE = re.compile(r"^\s*(\d+) identities found$")
+CERTIFICATE_HASH_LINE = re.compile(r"^SHA-1 hash: ([0-9A-F]{40})$")
 FIELDS = {"item": ("service", "account"), "eddsa": ("account",), "path": ("path",)}
 
 
@@ -119,11 +122,20 @@ def read_names(path):
     return entries
 
 
+def launch(argv, stdout):
+    """Starts argv in its own session with no input and stderr discarded. Raises Broken when it cannot start,
+    because an exception left to escape would exit 1, which means reachable."""
+    try:
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError as error:
+        raise Broken(f"could not start {os.path.basename(argv[0])}: {error.strerror}") from None
+
+
 def run_quiet(argv, timeout):
     """Runs argv with no input and its output discarded unread. Returns the exit status, or None on a timeout.
     The whole process group is killed on a timeout, so nothing is left waiting at a prompt."""
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, start_new_session=True)
+    process = launch(argv, subprocess.DEVNULL)
     try:
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -141,8 +153,7 @@ def run_listing(argv, timeout):
     """Runs argv with no input and stderr discarded, reading at most MAX_INVENTORY_BYTES of stdout.
     Returns (status, text). The status is None on a timeout or an over-cap listing."""
     with tempfile.TemporaryFile() as out:
-        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
-                                   start_new_session=True)
+        process = launch(argv, out)
         try:
             status = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -243,14 +254,24 @@ class Probe:
             raise Broken(f"security find-identity exited {status}, so the codesigning inventory is unknown")
         return parse_identities(text)
 
-    def control_certificate_present(self):
+    def control_certificates(self):
+        """Returns the SHA-1 hashes of every certificate in the keychain whose name holds the control prefix.
+        Only the hash lines of the listing are read; a certificate is public and holds no key."""
         # Without -a, find-certificate exits 44 when nothing matches; with -a it exits 0 either way.
-        status = self.security_status("find-certificate", "-c", CONTROL_PREFIX)
-        if status == 0:
-            return True
+        argv = [self.security, "find-certificate", "-a", "-Z", "-c", CONTROL_PREFIX, self.keychain]
+        status, text = run_listing(argv, self.timeout)
+        if status is None:
+            raise Broken(f"security find-certificate did not finish within {self.timeout:g} s or listed too much")
         if status == NOT_FOUND:
-            return False
-        raise Broken(f"security find-certificate exited {status}, neither found nor not found")
+            return set()
+        if status != 0:
+            raise Broken(f"security find-certificate exited {status}, neither found nor not found")
+        hashes = set()
+        for line in text.splitlines():
+            found = CERTIFICATE_HASH_LINE.match(line.strip())
+            if found:
+                hashes.add(found.group(1))
+        return hashes
 
     def codesigns(self, digest):
         with tempfile.TemporaryDirectory(prefix="key-reach-codesign-") as tmp:
@@ -293,19 +314,18 @@ def path_reachable(path):
 def check_identities(probe):
     """Returns the reachable identity lines. Raises Broken when the codesign probe cannot be trusted."""
     listed = probe.identities()
+    if probe.control_certificates() - {digest for digest, _name in listed}:
+        raise Broken("a control certificate is in the keychain without a usable private key")
     controls = [(digest, name) for digest, name in listed if name.startswith(CONTROL_PREFIX)]
     others = [(digest, name) for digest, name in listed if not name.startswith(CONTROL_PREFIX)]
     if not controls:
-        if probe.control_certificate_present():
-            raise Broken("a control certificate is in the keychain without a usable private key")
-        if others:
-            raise Broken("codesigning identities are listed but no control identity is, so codesign is unproven")
-        say("no codesigning identity in the keychain, so nothing was probed with codesign")
-        return []
+        raise Broken(f"no {CONTROL_PREFIX} identity is listed, so the codesign probe is blind; the owner sets up "
+                     "the control identity once in this keychain")
     for digest, _name in controls:
         status = probe.codesigns(digest)
         if status != 0:
-            raise Broken(f"the control identity did not sign (codesign exit {status}), so the codesign probe is blind")
+            raise Broken(f"the control identity did not sign (codesign exit {status}), so the codesign probe is blind; "
+                         "the owner sets up the control identity once in this keychain")
     found = []
     for digest, name in others:
         status = probe.codesigns(digest)
@@ -384,6 +404,8 @@ def main(argv):
         found = check(args, probe, entries)
     except (Broken, Stopped) as error:
         problems.append(str(error))
+    except OSError as error:
+        problems.append(f"an operating system call failed: {error.strerror}")
     finally:
         problems += probe.remove_planted()
         for number, handler in previous.items():

@@ -18,8 +18,12 @@ Where each rule reads, in tracked files only:
     sparkle-project/Sparkle package URL and the name "Sparkle" given as a .product name or a package argument;
     in a path, a Sparkle.framework or Sparkle.xcframework part. An import is code, not a literal, so it is never
     read. An asset name, an SF Symbol name or a UI string is refused whatever its case.
-  - ui-literal: a string literal passed straight to a known SwiftUI or AppKit initializer must be a key in one of
-    the tracked String Catalogs.
+  - ui-literal: a string literal passed straight to a known SwiftUI or AppKit initializer must be a key in a
+    tracked String Catalog of its own target. The target is the nearest ancestor folder of the Swift file that is a
+    direct child of a Sources folder (apple/Sources/App/... is target apple/Sources/App), and only catalogs inside
+    that folder count. A file with no such ancestor counts the catalogs in its own folder tree (its folder, any
+    folder below it, and any folder above it up to the repository root). A key in an unrelated target's catalog
+    does not help.
 
 Files are listed and read through the repo-rules reader, with its caps: tracked regular files only, opened without
 following a link, a byte cap per file and an entry cap on the listing. A file with a listed binary suffix is not
@@ -329,6 +333,33 @@ def file_hits(rr, table, name, text, keys):
     return sorted({(rule, bisect.bisect_right(starts, at)) for rule, at in hits}, key=lambda h: (h[1], h[0]))
 
 
+def target_folder(name):
+    """The nearest ancestor folder of a Swift file that is a direct child of a Sources folder, as a path
+    prefix; None when there is none."""
+    parts = pathlib.PurePosixPath(name).parts
+    for index in range(len(parts) - 2, 0, -1):  # a folder, never the file itself
+        if parts[index - 1] == "Sources":
+            return "/".join(parts[:index + 1]) + "/"
+    return None
+
+
+def keys_for(name, catalogs):
+    """The keys of the catalogs that count for one Swift file; catalogs maps each catalog path to its keys."""
+    target = target_folder(name)
+    own = str(pathlib.PurePosixPath(name).parent)
+    keys = set()
+    for path, found in catalogs.items():
+        folder = str(pathlib.PurePosixPath(path).parent)
+        if target is not None:
+            counts = path.startswith(target)
+        else:
+            counts = own == "." or folder == "." or folder == own or folder.startswith(own + "/") \
+                or own.startswith(folder + "/")
+        if counts:
+            keys |= found
+    return keys
+
+
 def catalog_keys(rr, name, text):
     try:
         data = json.loads(text)
@@ -359,17 +390,19 @@ def prove_controls(rr, table):
 
 def scan(rr, table, repo):
     found = rr.Collected()
-    names, keys = rr.tracked(repo), set()
+    names, catalogs, total = rr.tracked(repo), {}, 0
     for name in names:  # first the catalog keys, so one file is held in memory at a time
         rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
         if name.lower().endswith(".xcstrings"):
-            keys |= catalog_keys(rr, name, rr.read_source(repo, name))
-            if len(keys) > MAX_KEYS:
+            catalogs[name] = catalog_keys(rr, name, rr.read_source(repo, name))
+            total += len(catalogs[name])
+            if total > MAX_KEYS:
                 raise rr.Broken(f"the String Catalogs hold over the cap of {MAX_KEYS} keys")
     for name in names:
         if path_names_sparkle(name):
             found.add(f"sparkle-icon: {rr.shown(name)}:1")
         if not name.lower().endswith(table["binary"]):
+            keys = keys_for(name, catalogs) if name.lower().endswith(".swift") else set()
             for rule, line in file_hits(rr, table, name, rr.read_source(repo, name), keys):
                 found.add(f"{rule}: {rr.shown(name)}:{line}")
     return found.kept, found.total

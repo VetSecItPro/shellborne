@@ -22,15 +22,20 @@ request cannot drop its own key name. Files are listed and read through the repo
 tracked regular files only, never through a link, 2 MiB each, UTF-8 only; an oversized, symlinked or non-UTF-8
 file is broken, never read whole or followed. Each run first proves every key-name pattern refuses its own seeded
 line. A refusal names the rule and file:line, never the source. Exit 0 clean, 1 refused, 2 broken; a missing or
-different actionlint, or a missing, malformed or empty table, is broken, never a pass.
+different actionlint, an actionlint run that passes its timeout (300 seconds; the environment variable
+WORKFLOWS_ACTIONLINT_TIMEOUT can only lower it), or a missing, malformed or empty table, is broken, never a pass.
+At most 1 MiB of actionlint output is kept; the rest is dropped and a note says so.
 """
 import importlib.machinery
 import importlib.util
+import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import tomllib
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -39,6 +44,9 @@ TABLE = "workflows.toml"
 MAX_TABLE_BYTES = 256 * 1024
 MAX_FINDINGS = 1000
 ACTIONLINT = "1.7.12"
+LINT_TIMEOUT = 300  # seconds for the whole actionlint run; WORKFLOWS_ACTIONLINT_TIMEOUT can only lower it
+VERSION_TIMEOUT = 30
+MAX_LINT_BYTES = 1024 * 1024  # actionlint output kept; the rest is read and dropped
 USES = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?([^'\"\s#]+)")
 PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
 DIGEST = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
@@ -209,6 +217,59 @@ def selected(name):
     return None
 
 
+def lint_timeout():
+    """The actionlint timeout in seconds: the constant, or a smaller positive number from the environment."""
+    try:
+        wanted = float(os.environ.get("WORKFLOWS_ACTIONLINT_TIMEOUT", ""))
+    except ValueError:
+        return LINT_TIMEOUT
+    return min(LINT_TIMEOUT, wanted) if wanted > 0 else LINT_TIMEOUT
+
+
+def run_capped(command, timeout):
+    """(returncode, stdout text, stderr text, cut) of a command run in its own process group. Each stream keeps at
+    most MAX_LINT_BYTES and the rest is read and dropped. A run past the timeout is killed with its group and raises
+    Broken."""
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    kept, cut = {"out": bytearray(), "err": bytearray()}, []
+
+    def drain(stream, key):
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            room = MAX_LINT_BYTES - len(kept[key])
+            kept[key] += chunk[:max(room, 0)]
+            if len(chunk) > room:
+                cut.append(key)
+
+    threads = [threading.Thread(target=drain, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, "err"), daemon=True)]
+    for thread in threads:
+        thread.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise Broken(f"actionlint timed out after {timeout:g} seconds")
+    for thread in threads:
+        thread.join(timeout=10)
+    if any(thread.is_alive() for thread in threads):  # a child still holds the pipes: end its group
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def text(key):
+        data = bytes(kept[key])
+        if key in cut and b"\n" in data:
+            data = data[:data.rindex(b"\n") + 1]  # drop the line the cap cut in half
+        return data.decode("utf-8", errors="replace")
+
+    return proc.returncode, text("out"), text("err"), bool(cut)
+
+
 def broken(message):
     print(f"workflows: broken: {message}", file=sys.stderr)
     return 2
@@ -243,14 +304,23 @@ def main(argv):
         tool = shutil.which("actionlint")
         if not tool:
             return broken(f"actionlint is not installed; install actionlint {ACTIONLINT}. This gate never passes without it.")
-        version = subprocess.run([tool, "-version"], capture_output=True, text=True).stdout.split()
+        try:
+            version = subprocess.run([tool, "-version"], capture_output=True, text=True,
+                                     timeout=VERSION_TIMEOUT).stdout.split()
+        except subprocess.TimeoutExpired:
+            return broken(f"actionlint -version timed out after {VERSION_TIMEOUT} seconds")
         if not version or version[0] != ACTIONLINT:
             return broken(f"actionlint {version[0] if version else 'unknown'} found, {ACTIONLINT} pinned")
-        lint = subprocess.run([tool, "-no-color", "-oneline", *map(str, workflows)], capture_output=True, text=True)
-        for line in lint.stdout.splitlines():
+        try:
+            code, out, err, cut = run_capped([tool, "-no-color", "-oneline", *map(str, workflows)], lint_timeout())
+        except Broken as error:
+            return broken(str(error))
+        for line in out.splitlines():
             findings.append(("actionlint", line.split(": ", 1)[0]))
-        if lint.returncode not in (0, 1):
-            return broken(f"actionlint failed: {lint.stderr.strip()[:300]}")
+        if cut:
+            print(f"workflows: actionlint output cut at {MAX_LINT_BYTES} bytes; the rest was dropped", file=sys.stderr)
+        if code not in (0, 1):
+            return broken(f"actionlint failed: {err.strip()[:300]}")
     for kind, where in findings[:MAX_FINDINGS]:
         print(f"workflows: refused {kind} {where}", file=sys.stderr)
     if len(findings) > MAX_FINDINGS:

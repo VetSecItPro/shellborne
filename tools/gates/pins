@@ -14,7 +14,8 @@ Reads the tracked files of <repo> and refuses:
   - unlocked-build: a cargo command that resolves dependencies, in a workflow, a local action or a build script,
     without a locked flag;
   - unverified-download: a download in a workflow, a local action or a build script that no checksum
-    verification follows later in the same file. A checksum counts only as a command: one inside a comment, a
+    verification follows later in the same file. A checksum counts only when its pipeline holds a literal
+    64-hex SHA-256 digest written in the file, so a digest file made from the download does not count. It counts only as a command: one inside a comment, a
     quoted string or an argument to another command (echo, printf, an assignment) does not. For a curl or wget,
     or any download word that is not git, the checksum's pipeline must also name the downloaded file: the -o,
     --output, -O or > target, else the URL's last path part, so a checksum of another file does not count. A
@@ -46,6 +47,7 @@ import tomllib
 HERE = pathlib.Path(__file__).resolve().parent
 TABLE = "pins.toml"
 MAX_FINDINGS = 1000
+HEX_DIGEST = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".mk")
@@ -263,8 +265,11 @@ def command_findings(lines, rules):
                     continue
                 downloads.append((number, match.end(), download_name(word, segment_after(code, match.end()))))
         for pattern in rules["checksums"]:
-            checks += [(number, match.start(), pipeline_text(masked, code, match.start()))
-                       for match in pattern.finditer(masked) if in_command_position(masked, match.start())]
+            for match in pattern.finditer(masked):
+                if in_command_position(masked, match.start()):
+                    pipeline = pipeline_text(masked, code, match.start())
+                    if HEX_DIGEST.search(pipeline):  # a digest file made from the download proves nothing
+                        checks.append((number, match.start(), pipeline))
     for number, end, name in downloads:
         if not any((check_number, at) > (number, end) and (name is None or names_file(pipeline, name))
                    for check_number, at, pipeline in checks):
@@ -275,6 +280,10 @@ def command_findings(lines, rules):
 def prove_controls(rules):
     """Every word must refuse its own seeded line and pass its own verified or locked line."""
     first_check = rules["words"][("checksums", "commands")][0]
+    for check in rules["words"][("checksums", "commands")]:
+        made = [(1, f"{rules['downloads'][0][0]} {CONTROL_URL}"), (2, f"{check} {CONTROL_FILE}.sha256")]
+        if ("unverified-download", 1) not in command_findings(made, rules):
+            raise Broken("a checksum of a digest file made from the download counts as a check")
     verified = f'echo "{CONTROL_HASH}  {CONTROL_FILE}" | {{check}} -'
     for word, _ in rules["downloads"]:
         bad = command_findings([(1, f"{word} {CONTROL_URL}")], rules)

@@ -19,8 +19,9 @@ Usage: deps [--tables-from <ref>] <repo>
       * every vendored folder in the table that holds a tracked file names its license file. The gate reads
         that file itself and refuses it when its text is not the declared license (one SPDX id per folder),
         or when it is any GPL.
-        OFL-1.1 passes only for font files (.ttf, .otf, .woff, .woff2) and the folder's license file; any
-        other file under an OFL-1.1 folder is refused.
+        OFL-1.1 passes only for font files (.ttf, .otf, .woff, .woff2, with a real font signature in
+        their first bytes) and the folder's license file; any other file under an OFL-1.1 folder is
+        refused. BSD-2-Clause is not matched by a text that holds the BSD-3-Clause endorsement clause.
       * every tracked font file must sit in a vendored folder from the table, and every tracked file under
         third_party/ must sit in one too, except a PIN.toml, which is a pin record.
     Every LGPL fails, whatever its kind and however it would be linked.
@@ -67,6 +68,13 @@ LICENSE_TEXT = {
     "Unicode-3.0": ("unicode license v3",),
     "OFL-1.1": ("sil open font license", "version 1.1"),
 }
+# Text a license file must not hold for its declared license: the BSD 3-clause endorsement clause makes a text
+# BSD-3-Clause, so a file with it is not BSD-2-Clause.
+LICENSE_ABSENT = {
+    "BSD-2-Clause": ("neither the name", "nor the names of its contributors", "to endorse or promote products"),
+}
+# The first bytes of a font container: TrueType, OpenType, a collection, WOFF and WOFF2.
+FONT_SIGNATURES = (b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf", b"wOFF", b"wOF2")
 # Text that marks a license file as one of the GPL family, whatever it was declared as.
 COPYLEFT_TEXT = ("gnu general public license", "gnu lesser general public license", "gnu library general public license",
                  "gnu affero general public license")
@@ -360,6 +368,18 @@ def check_ghostty(rr, repo, names, pins, allow, findings):
         judge_pin("ghostty", "ghostty", str(commit), f"{rr.shown(name)}:{number}", pins, allow, findings)
 
 
+def has_font_signature(rr, repo, name):
+    """True when a regular tracked file starts with a font container signature, read without following a link."""
+    try:
+        handle = os.open(pathlib.Path(repo) / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            return os.read(handle, 4) in FONT_SIGNATURES
+        finally:
+            os.close(handle)
+    except OSError as error:
+        raise Broken(f"cannot read {rr.shown(name)}: {error.strerror}")
+
+
 def folded(text):
     return " ".join(text.lower().split())
 
@@ -384,11 +404,15 @@ def check_vendored(rr, repo, names, vendored, allow, findings):
             continue
         text = folded(rr.read_source(repo, license_file))
         phrases = LICENSE_TEXT.get(license)  # one SPDX id per vendored folder, so its one file can be checked
-        if not phrases or not all(phrase in text for phrase in phrases) or any(mark in text for mark in COPYLEFT_TEXT):
+        absent = LICENSE_ABSENT.get(license, ())
+        if (not phrases or not all(phrase in text for phrase in phrases) or any(mark in text for mark in absent)
+                or any(mark in text for mark in COPYLEFT_TEXT)):
             findings.append(("license", f"{rr.shown(license_file)} (the license file is not the declared license)"))
         if license == OFL:
             for name in inside:
-                if name != license_file and not name.lower().endswith(FONT_SUFFIXES):
+                if name == license_file:
+                    continue
+                if not name.lower().endswith(FONT_SUFFIXES) or not has_font_signature(rr, repo, name):
                     findings.append(("license", f"{rr.shown(name)} (OFL-1.1 covers font files only)"))
     covered = [entry["path"].rstrip("/") for entry in vendored]
     for name in names:

@@ -56,8 +56,13 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/workflows.toml" 2>/dev/null; then
+          if [ -z "$BASE" ]; then
+            tools/gates/workflows .
+          elif git cat-file -e "$BASE:tools/gates/workflows.toml" 2>/dev/null; then
             tools/gates/workflows --tables-from "$BASE" .
+          elif git cat-file -e "$BASE:tools/gates/workflows" 2>/dev/null; then
+            echo "The base commit has the workflows gate but not its table, tools/gates/workflows.toml. A change may not remove or rename a table, because the changed table would judge itself." >&2
+            exit 1
           else
             tools/gates/workflows .
           fi
@@ -92,8 +97,13 @@ jobs:
         run: |
           for pair in hidden-chars:hidden-chars.toml copy-lint:copy-lint.toml pins:pins.toml deny-calls:deny-calls.toml bypass-flags:bypass-flags.toml; do
             gate="${pair%%:*}"; table="${pair#*:}"
-            if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/$table" 2>/dev/null; then
+            if [ -z "$BASE" ]; then
+              "tools/gates/$gate" .
+            elif git cat-file -e "$BASE:tools/gates/$table" 2>/dev/null; then
               "tools/gates/$gate" --tables-from "$BASE" .
+            elif git cat-file -e "$BASE:tools/gates/$gate" 2>/dev/null; then
+              echo "The base commit has the $gate gate but not its table, tools/gates/$table. A change may not remove or rename a table, because the changed table would judge itself." >&2
+              exit 1
             else
               "tools/gates/$gate" .
             fi
