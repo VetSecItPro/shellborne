@@ -3,7 +3,9 @@
 
 # Invisible and bidi characters: zero width and direction marks, bidi embeddings and overrides, invisible
 # operators, bidi isolates, the byte order mark, the soft hyphen, the Mongolian vowel separator, variation
-# selectors, tag characters and the supplementary variation selectors.
+# selectors, tag characters and the supplementary variation selectors, plus the Arabic letter mark, the combining
+# grapheme joiner, the Hangul and Halfwidth fillers, the Khmer inherent vowels, the interlinear annotation marks, the
+# line and paragraph separators, the musical formatting controls and the shorthand format controls.
 ranges = [
     [0x200B, 0x200F],
     [0x202A, 0x202E],
@@ -15,11 +17,26 @@ ranges = [
     [0xFE00, 0xFE0F],
     [0xE0000, 0xE007F],
     [0xE0100, 0xE01EF],
+    [0x061C, 0x061C],
+    [0x034F, 0x034F],
+    [0x115F, 0x1160],
+    [0x3164, 0x3164],
+    [0xFFA0, 0xFFA0],
+    [0x17B4, 0x17B5],
+    [0xFFF9, 0xFFFB],
+    [0x2028, 0x2029],
+    [0x1D173, 0x1D17A],
+    [0x1BCA0, 0x1BCA3],
 ]
 
-# Long dashes: figure dash, en dash, em dash and horizontal bar. Write a hyphen or rewrite the sentence.
+# Long dashes: the hyphen and non-breaking hyphen forms, figure dash, en dash, em dash, horizontal bar, the two- and
+# three-em dashes, the vertical and presentation-form dashes and the fullwidth hyphen-minus. Write a hyphen or rewrite the sentence.
 dashes = [
-    [0x2012, 0x2015],
+    [0x2010, 0x2015],
+    [0x2E3A, 0x2E3B],
+    [0xFE31, 0xFE32],
+    [0xFE58, 0xFE58],
+    [0xFF0D, 0xFF0D],
 ]
 
 # Suffixes read as binary and never decoded, compared without case. Every other tracked file must be UTF-8.

@@ -3,19 +3,26 @@
 
 Usage: bundle-check <built-folder> [--tables-from <ref> --repo <repo>]
 
-Reads every regular file named Info.plist under the built folder: the app, the daemon and every nested helper. It
-refuses:
+Reads every regular file named Info.plist, in any letter case, or Info-<anything>.plist under the built folder: the
+app, the daemon and every nested helper. It refuses:
   - url-scheme: any CFBundleURLTypes key, even an empty one;
   - document-type: a CFBundleDocumentTypes entry whose LSItemContentTypes are not all on the allowlist, or that
     names none (an entry known only by extension is refused);
-  - exported-type: a UTExportedTypeDeclarations entry whose UTTypeIdentifier is not on the allowlist.
+  - exported-type: a UTExportedTypeDeclarations entry whose UTTypeIdentifier is not on the allowlist;
+  - services-key: an NSServices key;
+  - scripting-key: an OSAScriptingDefinition key, or NSAppleScriptEnabled set true (a boolean, YES or true);
+  - extension-key: an NSExtension key, which every app extension and plug-in declares.
 The allowlist is bundle-check.toml beside this file: [[allow]] entries, each with a kind (document or exported),
-one exact identifier with no wildcard and a real reason. It starts empty. With --tables-from the table is read
+one exact identifier with no wildcard and a real reason, or kind key: a key name from the last three rules and the
+exact path of the plist under the built folder, with a real reason, which allows that key in that plist only. It
+starts empty. With --tables-from the table is read
 from tools/gates/ at that commit of the repository named by --repo instead, so a branch cannot allow its own type.
 
 Each plist is read with a plist parser, XML or binary, at most 2 MiB, opened without following a link; a symlinked
 or special Info.plist breaks the run and is never followed, and so does a plist that does not parse. The walk never
-follows a symlinked folder and stops at a file cap. A folder with no Info.plist is not run, never clean. A refusal
+follows a symlinked folder: one that leads outside the built folder breaks the run, since what it holds would go
+unjudged, and one that stays inside it (a framework's Versions/Current) is reached through its real path. The walk
+stops at a file cap. A folder with no Info.plist is not run, never clean. A refusal
 names the rule and the plist's path under the built folder and never prints its contents. Each run first proves the
 gate refuses its own seeded plist with a scheme; if it does not, the gate is broken. Limit: it checks the declared
 plist, not a registration made at run time by other means. Exit 0 clean, 1 refused, 2 broken or not run.
@@ -48,6 +55,10 @@ MAX_ALLOW = 200
 REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 IDENTIFIER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
 KINDS = ("document", "exported")
+KEY_RULES = {"NSServices": "services-key", "OSAScriptingDefinition": "scripting-key",
+             "NSAppleScriptEnabled": "scripting-key", "NSExtension": "extension-key"}
+INFO_NAME = re.compile(r"info(?:-.*)?\.plist", re.IGNORECASE | re.DOTALL)
+PLAIN_PATH = re.compile(r"[A-Za-z0-9._+ @-]+(?:/[A-Za-z0-9._+ @-]+)*")
 
 
 def reader():
@@ -91,7 +102,8 @@ def real_reason(rr, text):
 
 
 def load_table(rr, raw):
-    """The allowlist as {kind: set of identifiers}; every entry exact, with a kind and a real reason."""
+    """The allowlist as {kind: set of identifiers, "key": set of (key, path)}; every entry exact, with a kind and a
+    real reason."""
     try:
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
@@ -102,7 +114,18 @@ def load_table(rr, raw):
     if not isinstance(entries, list) or len(entries) > MAX_ALLOW:
         raise rr.Broken(f"{TABLE_NAME}: allow must be a list of at most {MAX_ALLOW} [[allow]] entries")
     allowed = {kind: set() for kind in KINDS}
+    allowed["key"] = set()
     for entry in entries:
+        if isinstance(entry, dict) and entry.get("kind") == "key":
+            path = entry.get("path")
+            if (set(entry) != {"kind", "key", "path", "reason"} or entry["key"] not in KEY_RULES
+                    or not isinstance(path, str) or not PLAIN_PATH.fullmatch(path)
+                    or ".." in path.split("/") or not real_reason(rr, entry["reason"])):
+                raise rr.Broken(f"{TABLE_NAME}: a key [[allow]] entry needs exactly a key (NSServices, "
+                                "OSAScriptingDefinition, NSAppleScriptEnabled or NSExtension), the exact relative path "
+                                "of one plist with no wildcard, and a real reason")
+            allowed["key"].add((entry["key"], path))
+            continue
         if (not isinstance(entry, dict) or set(entry) != {"kind", "identifier", "reason"}
                 or entry["kind"] not in KINDS or not isinstance(entry["identifier"], str)
                 or not IDENTIFIER.fullmatch(entry["identifier"]) or not real_reason(rr, entry["reason"])):
@@ -112,8 +135,15 @@ def load_table(rr, raw):
     return allowed
 
 
-def judge(data, allowed):
-    """The rules one parsed Info.plist breaks."""
+def enabled(value):
+    """NSAppleScriptEnabled is a boolean, though Apple's tools also accept the string YES."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("yes", "true", "1")
+    return bool(value)
+
+
+def judge(data, allowed, where=None):
+    """The rules one parsed Info.plist breaks. where is the plist's path under the built folder, for the key rules."""
     rules = []
     if not isinstance(data, dict):
         return ["url-scheme", "document-type", "exported-type"]  # a plist that is not a dictionary is never clean
@@ -134,7 +164,10 @@ def judge(data, allowed):
             if not isinstance(identifier, str) or identifier not in allowed["exported"]:
                 rules.append("exported-type")
                 break
-    return rules
+    for key, rule in KEY_RULES.items():
+        if key in data and (key != "NSAppleScriptEnabled" or enabled(data[key])) and (key, where) not in allowed["key"]:
+            rules.append(rule)
+    return sorted(set(rules), key=rules.index)
 
 
 def parse(rr, raw, where):
@@ -173,7 +206,8 @@ def read_plist(rr, path, where):
 
 
 def plists(rr, built):
-    """Every entry named Info.plist under the folder, as (path, shown name), walked without following a link."""
+    """Every entry named Info.plist (any case) or Info-*.plist under the folder, as (path, shown name), walked
+    without following a link."""
     try:
         if not stat.S_ISDIR(os.lstat(built).st_mode):
             raise rr.Broken(f"{rr.shown(str(built))} is not a folder")
@@ -184,13 +218,21 @@ def plists(rr, built):
     def failed(error):
         raise rr.Broken(f"cannot read a folder under the built folder: {error.strerror}")
 
+    root = os.path.realpath(built)
     for folder, dirs, files in os.walk(built, onerror=failed, followlinks=False):
         dirs.sort()
+        for name in dirs:
+            link = pathlib.Path(folder) / name
+            if os.path.islink(link):
+                target = os.path.realpath(link)
+                if target != root and not target.startswith(root + os.sep):
+                    raise rr.Broken(f"{rr.shown(link.relative_to(built).as_posix())} is a symlinked folder that leads "
+                                    "outside the built folder, so what it holds would go unjudged")
         walked += len(dirs) + len(files)
         if walked > MAX_WALKED:
             raise rr.Broken(f"the built folder holds over the cap of {MAX_WALKED} entries")
-        for name in sorted(files + [d for d in dirs if d == "Info.plist"]):
-            if name == "Info.plist":
+        for name in sorted(files + [d for d in dirs if INFO_NAME.fullmatch(d)]):
+            if INFO_NAME.fullmatch(name):
                 path = pathlib.Path(folder) / name
                 found.append((path, path.relative_to(built).as_posix()))
     return found
@@ -236,7 +278,7 @@ def main(argv):
         found = rr.Collected()
         listed = plists(rr, built)
         for path, where in listed:
-            for rule in judge(parse(rr, read_plist(rr, path, where), where), allowed):
+            for rule in judge(parse(rr, read_plist(rr, path, where), where), allowed, where):
                 found.add(f"{rule}: {rr.shown(where)}")
     except rr.Broken as error:
         print(f"{GATE}: broken: {error}", file=sys.stderr)

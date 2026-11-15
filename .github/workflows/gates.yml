@@ -49,8 +49,20 @@ jobs:
       - name: Leak guard over the whole history
         run: tools/gates/leak-guard commits . HEAD
 
-      - name: Secrets over the whole history
-        run: tools/gates/secrets commits . HEAD
+      - name: Secrets over the whole history, with the scanner rules from the base commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -z "$BASE" ]; then
+            tools/gates/secrets commits . HEAD
+          elif git cat-file -e "$BASE:tools/gates/gitleaks.toml" 2>/dev/null; then
+            tools/gates/secrets --tables-from "$BASE" commits . HEAD
+          elif git cat-file -e "$BASE:tools/gates/secrets" 2>/dev/null; then
+            echo "The base commit has the secrets gate but not its table, tools/gates/gitleaks.toml. A change may not remove or rename a table, because the changed table would judge itself." >&2
+            exit 1
+          else
+            tools/gates/secrets commits . HEAD
+          fi
 
       - name: Workflow rules, with the rules table from the base commit
         env:
@@ -76,11 +88,15 @@ jobs:
       - name: Devlog entries
         run: tools/gates/devlog-check .
 
-      - name: Source rules
-        run: tools/gates/repo-rules .
-
-      - name: Language strictness, Rust half
-        run: tools/gates/unsafe-code --rust .
+      - name: Language strictness, Rust half, with the reviewed paths from the base commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/unsafe-code" 2>/dev/null; then
+            tools/gates/unsafe-code --rust --tables-from "$BASE" .
+          else
+            tools/gates/unsafe-code --rust .
+          fi
 
       - name: Who frees at the C seam
         run: tools/gates/who-frees .
@@ -88,14 +104,11 @@ jobs:
       - name: Build settings target macOS 26 on both architectures
         run: tools/gates/build-settings .
 
-      - name: No calendar dates in the Intel policy
-        run: tools/gates/term-lint .
-
-      - name: Hidden characters, dashes, copy, pins, denied calls and bypass flags, with their tables from the base commit
+      - name: Source rules, calendar wording, hidden characters, dashes, copy, pins, denied calls and bypass flags, with their tables from the base commit
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          for pair in hidden-chars:hidden-chars.toml copy-lint:copy-lint.toml pins:pins.toml deny-calls:deny-calls.toml bypass-flags:bypass-flags.toml; do
+          for pair in repo-rules:repo-rules.toml term-lint:schedule-terms.toml hidden-chars:hidden-chars.toml copy-lint:copy-lint.toml pins:pins.toml deny-calls:deny-calls.toml bypass-flags:bypass-flags.toml; do
             gate="${pair%%:*}"; table="${pair#*:}"
             if [ -z "$BASE" ]; then
               "tools/gates/$gate" .

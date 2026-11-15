@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Term lint: the Intel support policy names what ends support by evidence, never by a date (plan step P0.12.5).
 
-Usage: term-lint <repo>
+Usage: term-lint <repo> [--tables-from <ref>]
 
 Reads the tracked docs/intel-support-policy.md of <repo> (git ls-files, through the bounded reader in repo-rules
 beside this file) and the phrase table schedule-terms.toml beside this file, the one table the plan's own schedule
-lint reads too. Every term in the table binds the policy: a date, a month, a year, a quarter or a duration in digits
-or words. A line holding any term is refused as schedule-term, naming the file, the line and the term, never the
-text. A policy that is missing or untracked is refused as missing-policy, never clean.
+lint reads too. With --tables-from the table is read from that commit instead (git cat-file blob
+<ref>:tools/gates/schedule-terms.toml), so a branch cannot delete a term and add the wording it matched. Every term
+in the table binds the policy: a date, a month, a year, a quarter or a duration in digits or words. The text is read
+with each run of whitespace collapsed to one space, so a phrase wrapped across lines is still one phrase, and a hit
+is reported at the line where it starts. A line holding any term is refused as schedule-term, naming the file, the
+line and the term, never the text. A policy that is missing or untracked is refused as missing-policy, never clean.
 
 The table is typed exactly: a missing, malformed or empty table, an unknown field, or a pattern that does not compile
 is broken. Every run first proves the table against known-bad and known-good sentences for each scope, so a table
@@ -19,6 +22,7 @@ import importlib.machinery
 import importlib.util
 import pathlib
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -31,6 +35,8 @@ SCOPES = ("plan", "policy")  # a plan term binds both lints; a policy term binds
 TERM_FIELDS = {"name", "scope", "ignore_case", "pattern"}
 TERM_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 MAX_TABLE_BYTES = 256 * 1024
+TABLE_REF_PATH = "tools/gates/schedule-terms.toml"
+REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 MAX_TERMS = 500
 MAX_PATTERN_CHARS = 2000
 CONTROLS = {  # (sentences each scope must refuse, sentences it must pass)
@@ -40,8 +46,15 @@ CONTROLS = {  # (sentences each scope must refuse, sentences it must pass)
              ("The page lists shipped features with no target date, and a soak runs for 24 hours.",)),
     "policy": (("Support ends in September 2027.", "We drop it in September.", "Support continues through 2028.",
                 "Support ends in Q3.", "Support ends in 6 months.", "Support continues for two years.",
-                "Support ends on 2027-09-15.", "Support ends by the end of next year.", "The deadline is set."),
-               ("Support ends on evidence, not on a date, and a 24-hour soak on the iMac stays a release gate.",)),
+                "Support ends on 2027-09-15.", "Support ends by the end of next year.", "The deadline is set.",
+                "Support ends 2027-09.", "Support ends in FY2027.", "Support ends 15.09.2027.",
+                "Support ends at year-end.", "Support ends at EOY.", "Support ends in 2 yrs.",
+                "Support ends in 6mo.", "Support ends in a fortnight.", "Support continues for fifteen months.",
+                "Support continues for a two-year window.", "Support ends in september.",
+                "Support ends in SEPTEMBER.", "Support ends in Q3FY27.", "Support ends after 8760 hours.",
+                "Support continues for two\nyears."),
+               ("Support ends on evidence, not on a date, and a 24-hour soak on the iMac stays a release gate.",
+                "You may need a 72 hours soak, and each build is universal.")),
 }
 
 
@@ -49,15 +62,36 @@ class Broken(Exception):
     pass
 
 
+def parse_table(raw, name):
+    try:
+        if len(raw) > MAX_TABLE_BYTES:
+            raise Broken(f"{name} is over the {MAX_TABLE_BYTES}-byte cap for the phrase table")
+        return tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise Broken(f"cannot read {name}: {error}")
+
+
 def read_table(path):
     try:
         with open(path, "rb") as handle:
             raw = handle.read(MAX_TABLE_BYTES + 1)
-        if len(raw) > MAX_TABLE_BYTES:
-            raise Broken(f"{path.name} is over the {MAX_TABLE_BYTES}-byte cap for the phrase table")
-        return tomllib.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+    except OSError as error:
         raise Broken(f"cannot read {path.name}: {error}")
+    return parse_table(raw, path.name)
+
+
+def read_table_from_ref(repo, ref):
+    """The phrase table as committed at ref, so the run judges a branch by its base's table."""
+    if not REF.fullmatch(ref) or ref.startswith("-"):
+        raise Broken(f"--tables-from needs a plain commit name, not {ref!r}")
+    try:
+        done = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{TABLE_REF_PATH}"],
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Broken(f"git could not read {TABLE.name} from {ref!r}")
+    if done.returncode != 0:
+        raise Broken(f"{ref!r} has no readable {TABLE_REF_PATH}")
+    return parse_table(done.stdout[:MAX_TABLE_BYTES + 1], TABLE.name)
 
 
 def words(data, path):
@@ -72,13 +106,14 @@ def words(data, path):
     return {"{months}": "|".join(months), "{number}": "|".join(number)}
 
 
-def load_terms(path=TABLE, scope="policy"):
+def load_terms(path=TABLE, scope="policy", data=None):
     """[(name, compiled pattern)] binding the scope: plan terms for the plan, plan and policy terms for the policy.
     Broken for a missing, malformed or empty table, or one that fails its own controls."""
     if scope not in SCOPES:
         raise Broken(f"unknown scope {scope}")
     path = pathlib.Path(path)
-    data = read_table(path)
+    if data is None:
+        data = read_table(path)
     if set(data) != {"words", "term"}:
         raise Broken(f"{path.name} must hold exactly a [words] table and [[term]] entries")
     expand = words(data, path)
@@ -108,9 +143,9 @@ def load_terms(path=TABLE, scope="policy"):
         raise Broken(f"{path.name} holds no plan term, so the plan's lint could not fail")
     bound = {"plan": terms["plan"], "policy": terms["plan"] + terms["policy"]}
     for each, (bad, good) in CONTROLS.items():
-        if any(not matches(bound[each], sentence) for sentence in bad):
+        if any(not hits(bound[each], sentence) for sentence in bad):
             raise Broken(f"{path.name} fails its own control: a known-bad {each} sentence passes")
-        if any(matches(bound[each], sentence) for sentence in good):
+        if any(hits(bound[each], sentence) for sentence in good):
             raise Broken(f"{path.name} fails its own control: a known-good {each} sentence is refused")
     return bound[scope]
 
@@ -118,6 +153,32 @@ def load_terms(path=TABLE, scope="policy"):
 def matches(terms, text):
     """The name of the first term found in the text, or None."""
     return next((name for name, compiled in terms if compiled.search(text)), None)
+
+
+def flatten(text):
+    """The text with each run of whitespace (and any leading quote marker on a line) collapsed to one space, and the
+    line number each kept character came from."""
+    flat, lines = [], []
+    for number, line in enumerate(text.splitlines(), 1):
+        for word in re.sub(r"^\s*(?:>\s*)+", "", line).split():
+            if flat:
+                flat.append(" ")
+                lines.append(number)
+            flat.append(word)
+            lines.extend([number] * len(word))
+    return "".join(flat), lines
+
+
+def hits(terms, text):
+    """[(line number, term name)], one per line: the first term in table order that matches in the collapsed text,
+    reported at the line where the match starts."""
+    flat, lines = flatten(text)
+    found = {}
+    for name, compiled in terms:
+        for found_at in compiled.finditer(flat):
+            number = lines[found_at.start()] if flat else 1
+            found.setdefault(number, name)
+    return sorted(found.items())
 
 
 def source_reader():
@@ -132,21 +193,36 @@ def source_reader():
     return module
 
 
+def arguments(argv):
+    usage = "usage: term-lint <repo> [--tables-from <ref>]"
+    repo, ref, rest = None, None, list(argv[1:])
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--tables-from":
+            if not rest or ref is not None:
+                raise Broken(usage)
+            ref = rest.pop(0)
+        elif arg.startswith("-") or repo is not None:
+            raise Broken(usage)
+        else:
+            repo = arg
+    if repo is None:
+        raise Broken(usage)
+    return repo, ref
+
+
 def main(argv):
     try:
-        if len(argv) != 2 or argv[1].startswith("-"):
-            raise Broken("usage: term-lint <repo>")
-        terms = load_terms(TABLE, "policy")
+        repo, ref = arguments(argv)
+        terms = load_terms(TABLE, "policy", read_table_from_ref(repo, ref) if ref is not None else None)
         rr = source_reader()
         found = rr.Collected()
         try:
-            if POLICY not in rr.tracked(argv[1]):
+            if POLICY not in rr.tracked(repo):
                 found.add(("missing-policy", POLICY))
             else:
-                for number, line in enumerate(rr.read_source(argv[1], POLICY).splitlines(), 1):
-                    term = matches(terms, line)
-                    if term:
-                        found.add(("schedule-term", f"{POLICY}:{number} {term}"))
+                for number, term in hits(terms, rr.read_source(repo, POLICY)):
+                    found.add(("schedule-term", f"{POLICY}:{number} {term}"))
         except rr.Broken as error:
             raise Broken(str(error))
         kept, total = found.kept, found.total

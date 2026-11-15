@@ -1,9 +1,16 @@
-# The harness bypass flags and permission keys no launch path may hold (plan step P0.11.8). tools/gates/bypass-flags
-# reads only the launch_paths below and refuses each string here as an exact match, with no letter, digit,
-# underscore or hyphen on either side. Shellborne runs the person's exact agent command and adds only a harness's
-# documented resume argument, so none of these strings belongs in code that builds a command line or writes a config.
-# Adapter display code, which shows the mode a harness reports, is not a launch path and may name them.
-# In CI the gate reads this file from the base commit, so a branch cannot drop a flag, a key or a path.
+# The harness bypass flags, auto-approval options, environment words and permission keys that Shellborne code never
+# holds. tools/gates/bypass-flags reads every tracked Rust, Swift, C-family, shell, Python, JavaScript, TypeScript,
+# TOML, JSON and YAML file, except the paths under allow, and refuses each flag, short flag, option with a listed
+# value and environment word here. A flag or key matches as an exact string with no letter, digit, underscore or
+# hyphen on either side; comments are blanked first and strings stay. Shellborne runs the person's exact agent command
+# and adds only a harness's documented resume argument, so none of these strings belongs in code that builds a command
+# line, sets an environment or writes a config.
+# A short flag matches as a whole argument or word. An option matches as option=value or as the option followed by
+# the value in the next argument. An environment word matches inside an upper-case variable name.
+# Keys are refused only under launch_paths. A path under allow may name a flag, never launches one, and needs a
+# stated reason in real words. This table itself is never read for flags: it defines them.
+# In CI the gate reads this file from the base commit, so a branch cannot drop a flag, a key, a path or an allowlist
+# entry.
 
 flags = [
     "--dangerously-skip-permissions",
@@ -12,6 +19,24 @@ flags = [
     "--yolo",
     "--full-auto",
     "--allow-all-tools",
+    "--allow-all-paths",
+    "--allow-all-urls",
+    "--allow-all",
+]
+
+short_flags = [
+    "-y",
+]
+
+env_words = [
+    "SKIP_PERMISSIONS",
+    "BYPASS_PERMISSIONS",
+    "SKIP_APPROVALS",
+    "AUTO_APPROVE",
+    "APPROVE_ALL",
+    "ALLOW_ALL",
+    "FULL_AUTO",
+    "YOLO",
 ]
 
 keys = [
@@ -29,3 +54,23 @@ launch_paths = [
     "crates/sb-core/src/scheduler/",
     "apple/Sources/CoreClient/Scheduler/",
 ]
+
+[[options]]
+option = "--approval-mode"
+values = ["yolo", "full-auto"]
+
+[[options]]
+option = "--ask-for-approval"
+values = ["never"]
+
+[[options]]
+option = "-a"
+values = ["never"]
+
+[[options]]
+option = "--permission-mode"
+values = ["bypassPermissions"]
+
+[[allow]]
+path = "tools/gates/bypass-flags"
+reason = "this gate holds the strings it refuses in its seeded controls and its own description"

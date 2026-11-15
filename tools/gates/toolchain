@@ -19,12 +19,15 @@ Rules, each named in its refusal:
   - missing: a pin file that is absent or untracked, a missing field or a targets list without both Apple
     targets; nothing is defaulted;
   - mismatch: a tool reports a version other than its pin, or the compiler's sysroot lacks a pinned target;
-  - not-rustup: the sysroot rustc reports, resolved, is not inside rustup's toolchains folder ($RUSTUP_HOME, by
-    default ~/.rustup), so a compiler rustup did not provide is refused even when its version matches;
+  - not-rustup: the rustc that will actually run is not inside rustup's toolchains folder ($RUSTUP_HOME, by
+    default ~/.rustup) in the folder for the pinned version, or the sysroot it reports is not, so a compiler rustup
+    did not provide, or a wrapper that only reports one, is refused even when its version matches;
   - disagree: PIN.toml names a different Ghostty commit or Zig version than the record.
 
-The tools asked are the ones a build would use, run from the repository folder: $RUSTC or rustc on PATH (a rustup
-proxy there reads rust-toolchain.toml), and zig, xcodebuild and xcrun on PATH. Each option names a tool instead. A
+The tools asked are the ones a build would use, run from the repository folder: $RUSTC or rustc on PATH, and
+zig, xcodebuild and xcrun on PATH. A rustup proxy is resolved with `rustup which rustc` run in the repository
+folder (which reads rust-toolchain.toml), then by realpath, and the binary it names is the one asked for its version
+and sysroot. Each option names a tool instead. A
 tool named by an option that cannot run, exits non-zero, runs past its time limit or prints past the output cap
 breaks the run; a tool not found on PATH is not run, and the run says which and exits 2, never 0. The Zig
 checksums are checked for form only; this gate never downloads anything.
@@ -278,17 +281,42 @@ def inside(path, folder):
     return path != folder and os.path.commonpath([path, folder]) == folder
 
 
+def rustup_toolchains():
+    home = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    return os.path.join(home, "toolchains")
+
+
+def runs_as(rr, path, cwd):
+    """The rustc binary that will actually compile for the compiler at path, or None when that cannot be told.
+    The rustup proxy (a link that resolves to a file named rustup) hands off to the toolchain `rustup which rustc`
+    names in the repository folder, so that binary is the one judged; any other file is judged as itself."""
+    real = os.path.realpath(path)
+    if os.path.basename(real) != "rustup":
+        return real
+    named = ask(rr, "rustup", real, ["which", "rustc"], cwd).strip()
+    if not named or "\n" in named or not os.path.isabs(named):
+        raise rr.Broken("rustup which rustc named no single binary")
+    return os.path.realpath(named)
+
+
 def check_rust(run, chosen, cwd, rust):
     rr = run.rr
     path = tool_path(run, chosen, "rustc")
     if path is None:
         return
-    found = field(rr, "rustc", ask(rr, "rustc", path, ["-vV"], cwd), r"^release:\s*(\S+)\s*$")
-    sysroot = ask(rr, "rustc", path, ["--print", "sysroot"], cwd).strip()
+    resolved = runs_as(rr, path, cwd)
+    found = field(rr, "rustc", ask(rr, "rustc", resolved, ["-vV"], cwd), r"^release:\s*(\S+)\s*$")
+    sysroot = ask(rr, "rustc", resolved, ["--print", "sysroot"], cwd).strip()
     if not sysroot or "\n" in sysroot:
         raise rr.Broken("rustc printed no single sysroot")
-    home = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
-    toolchains = os.path.join(home, "toolchains")
+    toolchains = rustup_toolchains()
+    if not inside(resolved, toolchains):
+        run.refuse("not-rustup", RUST_FILE, f"the rustc that runs, {rr.shown(resolved)}, is not inside "
+                   f"{rr.shown(os.path.realpath(toolchains))}")
+    elif rust is not None and not os.path.basename(
+            os.path.relpath(resolved, os.path.realpath(toolchains)).split(os.sep)[0]).startswith(rust[0] + "-"):
+        run.refuse("not-rustup", RUST_FILE, f"the rustc that runs, {rr.shown(resolved)}, is not in the toolchain "
+                   f"folder for the pinned version {rust[0]}")
     if not inside(sysroot, toolchains):
         run.refuse("not-rustup", RUST_FILE, f"rustc's sysroot {rr.shown(os.path.realpath(sysroot))} is not inside "
                    f"{rr.shown(os.path.realpath(toolchains))}")

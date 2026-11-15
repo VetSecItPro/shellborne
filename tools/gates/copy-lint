@@ -10,11 +10,13 @@ list. With --tables-from both tables are read from that commit instead (git cat-
 so a branch cannot widen its own allowlist. The long-dash rule runs in hidden-chars.
 
 Where each rule reads, in tracked files only:
-  - forbidden-term and british-spelling: String Catalogs (.xcstrings), every text file under docs/, README.md and
-    CONTRIBUTING.md as whole text, and the string literals of Swift sources and of crates/sb-cli/src. Phrases and
-    words are matched as whole words without case.
-  - sparkle-icon: a Swift string literal or a tracked path that names a sparkle in any case, and U+2728 in any
-    tracked text. Only references to the Sparkle updater framework are exempt: in a Package.swift, the
+  - forbidden-term and british-spelling: String Catalogs (.xcstrings), every tracked Markdown file (.md, at any
+    depth) and every text file under docs/ as whole text, and the string literals of Swift sources and of
+    crates/sb-cli/src. Phrases and words are matched as whole words without case. Between the words of a phrase any
+    run of whitespace, hyphens (U+2010 to U+2015), asterisks, underscores, backticks, brackets, parentheses and a Markdown link
+    target such as ](url) counts as the separator, so formatting cannot split a phrase.
+  - sparkle-icon: a Swift string literal or a tracked path that names a sparkle in any case, and the sparkle
+    characters U+2726, U+2727, U+2728, U+2747 and U+2748 in any tracked text. Only references to the Sparkle updater framework are exempt: in a Package.swift, the
     sparkle-project/Sparkle package URL and the name "Sparkle" given as a .product name or a package argument;
     in a path, a Sparkle.framework or Sparkle.xcframework part. An import is code, not a literal, so it is never
     read. An asset name, an SF Symbol name or a UI string is refused whatever its case.
@@ -69,8 +71,9 @@ SUFFIX = re.compile(r"\.[A-Za-z0-9]+")
 REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 WORD = re.compile(r"[A-Za-z]+")
 CLI_SOURCES = "crates/sb-cli/src/"
-PROSE_FILES = ("README.md", "CONTRIBUTING.md")
-SPARKLE_CHAR = "\u2728"
+SEPARATOR = r"(?:\]\([^)\s]*\)|[\s\-\u2010-\u2015*_`\[\]()])+"  # what may stand between a phrase's words
+PHRASE_WORDS = re.compile(r"[\s\-\u2010-\u2015*_`\[\]()]+")
+SPARKLE_CHAR = "[\u2726\u2727\u2728\u2747\u2748]"
 SPARKLE = re.compile(r"sparkle", re.IGNORECASE)
 FRAMEWORK = "Sparkle"  # the updater framework's name, exempt only where it names that framework
 FRAMEWORK_URL = re.compile(r"https://github\.com/sparkle-project/Sparkle(?:\.git)?")
@@ -145,9 +148,10 @@ def table_bytes(rr, repo, ref, name=TABLE_NAME):
 
 
 def phrase_pattern(text):
-    """A phrase matched as whole words without case, any run of spaces or a line break between its words."""
-    return re.compile(r"(?<![A-Za-z0-9_])" + r"\s+".join(re.escape(part) for part in text.split())
-                      + r"(?![A-Za-z0-9_])", re.IGNORECASE)
+    """A phrase matched as whole words without case, any SEPARATOR between its words."""
+    parts = [part for part in PHRASE_WORDS.split(text) if part]
+    return re.compile(r"(?<![A-Za-z0-9])" + SEPARATOR.join(re.escape(part) for part in parts)
+                      + r"(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def shared_binary(rr, repo, ref):
@@ -318,7 +322,7 @@ def file_hits(rr, table, name, text, keys):
     hits = [("sparkle-icon", m.start()) for m in re.finditer(SPARKLE_CHAR, text)]
     lowered = name.lower()
     swift, cli = lowered.endswith(".swift"), name.startswith(CLI_SOURCES) and lowered.endswith(".rs")
-    if lowered.endswith(".xcstrings") or name.startswith("docs/") or name in PROSE_FILES:
+    if lowered.endswith(".xcstrings") or name.startswith("docs/") or lowered.endswith(".md"):
         hits += prose_hits(table, name, text)
     if swift or cli:
         for quote, start, content in literals(rr, name, text, rust=cli):

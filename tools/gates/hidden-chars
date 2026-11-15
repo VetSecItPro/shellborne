@@ -15,7 +15,8 @@ exact file, tracked or not, inside the repository or not: a symlink is read at i
 a regular file, and a missing path or anything else breaks the run.
 
 Rules: hidden-character (a listed invisible or bidi character, including emoji tag sequences and variation
-selectors) and dash (U+2012 to U+2015). A refusal names the rule and file:line and never prints source; at most the
+selectors) and dash (the listed long dashes and hyphen forms). Each tracked file name is judged the same way as the
+contents, binary or allowlisted files included, and is refused as file:1 with the name's characters escaped. A refusal names the rule and file:line and never prints source; at most the
 first 1000 are printed and the rest counted. It does not catch look-alike letters, visible instructions, text inside
 images or binaries, or commit messages. Each run first proves the gate refuses its own control text; if it does
 not, the gate is broken, and so is any error it did not expect. Exit 0 clean, 1 refused, 2 broken.
@@ -147,12 +148,20 @@ def refused_lines(table, text):
     return out
 
 
+def refused_rules(table, name):
+    """The rules a file name breaks."""
+    return [rule for rule in ("hidden-character", "dash") if table[rule].search(name)]
+
+
 def prove_control(rr, table):
     """The control text must be refused on each planted line, or the gate cannot fail and is broken."""
     if {line for rule, line in refused_lines(table, CONTROL) if rule == "hidden-character"} != CONTROL_LINES:
         raise rr.Broken("the seeded instruction-file control was not refused, so this gate cannot fail")
     if ("dash", 2) not in refused_lines(table, DASH_CONTROL):
         raise rr.Broken("the seeded dash control was not refused, so this gate cannot fail")
+    if refused_rules(table, "docs/report\u202etxt.md") != ["hidden-character"] \
+            or refused_rules(table, "docs/open\u2014pane.md") != ["dash"]:
+        raise rr.Broken("the seeded file name control was not refused, so this gate cannot fail")
     print(f"{GATE}: control refused as expected")
 
 
@@ -166,6 +175,8 @@ def scan(rr, table, repo, also):
                         "entry allows nothing real")
     for name in names:
         rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
+        for rule in refused_rules(table, name):  # a name is judged whatever the file is
+            found.add(f"{rule}: {rr.shown(name)}:1")
         if name.lower().endswith(table["binary"]) or name in table["allow"]:
             continue
         for rule, line in refused_lines(table, rr.read_source(repo, name)):

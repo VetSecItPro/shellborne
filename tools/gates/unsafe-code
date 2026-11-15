@@ -2,10 +2,14 @@
 """Unsafe-code gate: the strictest settings each language offers stay in the files every build reads, and the
 build under those settings is clean (plan steps P0.10.1, P0.10.2 and P0.10.3).
 
-Usage: unsafe-code [--rust] <repo>
+Usage: unsafe-code [--rust] [--tables-from <ref>] <repo>
 
 With --rust only the Rust half runs and the Swift half says "not run"; that is for a runner with no Swift, and a
-run that skipped a half never stands in for a pass of that half.
+run that skipped a half never stands in for a pass of that half. With --tables-from the reviewed-path list
+tools/gates/unsafe-allowed.txt is read from that commit of the repository (git cat-file of the blob at
+<ref>:tools/gates/unsafe-allowed.txt, at most 256 KiB, UTF-8), so a branch cannot exempt a path by adding a line to
+its own list; a ref that is not a plain commit name, a list over the cap, not text, or not a regular file at the ref
+is broken, and a commit with no list means no reviewed path.
 
 Rust (when the root Cargo.toml exists), settings first, each read as TOML:
   - the root [workspace.lints] denies unsafe_code and the Clippy lints panic, unwrap_used, expect_used,
@@ -20,22 +24,39 @@ Rust (when the root Cargo.toml exists), settings first, each read as TOML:
   - no Cargo config file cargo reads from the repo upward, or from CARGO_HOME, sets rustflags that allow, warn or
     cap a lint, swaps the compiler, aliases clippy or sets a Clippy or rustc variable; nor does RUSTFLAGS,
     CARGO_ENCODED_RUSTFLAGS, CARGO_BUILD_RUSTFLAGS, CARGO_HOST_RUSTFLAGS or CARGO_TARGET_<triple>_RUSTFLAGS in the
-    environment, and CLIPPY_CONF_DIR and the rustc wrapper variables are not set. A build script cannot lower a
-    lint: cargo takes only -l and -L from its rustc-flags.
-No lint from the deny list, or a group that holds one, is waived in source (allow, expect, warn, or any of them
-inside cfg_attr) outside a path in tools/gates/unsafe-allowed.txt. The one built-in exception: files under
+    environment, and CLIPPY_CONF_DIR, RUSTC, CARGO_BUILD_RUSTC and the rustc wrapper variables (RUSTC_WRAPPER,
+    RUSTC_WORKSPACE_WRAPPER and their CARGO_BUILD_ forms) are not set. A build script cannot lower a lint: cargo
+    takes only -l and -L from its rustc-flags;
+  - Clippy's old names for a denied lint (option_unwrap_used, integer_arithmetic and the like, from Clippy's own
+    renamed list) and the checks that would hide one, renamed_and_removed_lints and unknown_lints, are not set
+    below deny in the workspace table.
+No lint from the deny list, an old name for one, a group that holds one, renamed_and_removed_lints or
+unknown_lints is waived in source (allow, expect, warn, or any of them inside cfg_attr) outside a path in
+tools/gates/unsafe-allowed.txt. The one built-in exception: files under
 crates/sb-bounds/ may waive disallowed_types and disallowed_methods, and nothing else, because that crate wraps the
 std collections on purpose. The waiver reader does not parse Rust, so an attribute written in a comment or string
-counts too; reword it. When the settings hold, cargo clippy runs over the whole workspace and all targets
-with no lint flags of its own, so it reports exactly what a plain build reports; any diagnostic is refused.
+counts too; reword it. The waiver reader reads only .rs files, so Rust source that pulls in code from another
+file is refused outright outside a reviewed path: include! of any file, include_str! or include_bytes! of a .rs
+file or of a path that is not one plain string, and a path attribute, plain or inside cfg_attr. That is the simplest
+rule that fails closed: no file type can carry a waiver past the reader. When the settings hold, cargo clippy runs
+over the whole workspace, all targets and all features with no lint flags of its own, so it reports what a plain
+build with every feature on reports; any diagnostic is refused, in a file of any type. Limit: clippy runs for the
+host target only, so code behind a cfg for another target (target_os, target_arch) is not linted here; a Mac
+runner per target is the planned fix.
 
 Swift: every tracked Package.swift is read through swift package dump-package, so only the evaluated manifest
 counts. The tools version is 6.2 or higher; the package lists language modes of 6 or higher; every target has
 .treatAllWarnings(as: .error) with no condition, no lowered warning, no unsafeFlags (the gate cannot read what a raw
 flag does, so warnings as errors through one does not count) and no language mode below 6; EngineSurface also has
-.strictMemorySafety(). When the manifest holds, swift build runs with no flags of its own. Swift files outside any
-package are type-checked in mode 6 with warnings as errors. Raw-pointer, bit-cast and unmanaged APIs are refused
-by name outside a reviewed path.
+.strictMemorySafety(), and TerminalView, DesignSystem, FeaturePlaceholder and PlatformShell have
+.defaultIsolation(MainActor.self) with no condition. Each setting is read from the evaluated manifest, so one inside
+a comment, a string or an unused constant does not count. When the manifest holds, swift build runs with no flags of
+its own. Swift files outside any package are type-checked in mode 6 with warnings as errors. Raw-pointer, bit-cast
+and unmanaged APIs are refused by name outside a reviewed path: the Unsafe pointer types under any prefix
+(AutoreleasingUnsafeMutablePointer too), OpaquePointer, withUnsafe calls, unsafeBitCast, unsafeDowncast, Unmanaged,
+the unsafeAddress accessors and unowned(unsafe). Comments and string text are blanked before the names are read,
+and code interpolated into a string still counts; a file with a block comment, multi-line string or interpolation
+that never closes is broken.
 
 Reviewed paths are listed in tools/gates/unsafe-allowed.txt, one per line, each with a "# reason"; an entry with no
 reason, an absolute entry or one with ".." is broken. An entry names one file or, matched on whole path parts,
@@ -76,7 +97,16 @@ CLIPPY_DENIED = ("panic", "unwrap_used", "expect_used", "indexing_slicing", "ari
                  "disallowed_types", "disallowed_methods")
 RUST_DENIED = ("unsafe_code",)
 GROUPS = {"rust": ("warnings",), "clippy": ("all", "style", "restriction")}  # groups that hold a denied lint
-WAIVED = set(CLIPPY_DENIED) | set(RUST_DENIED) | {"warnings", "all", "style", "restriction"}
+# Clippy's renamed list (clippy_lints deprecated_lints.rs, as shipped in the pinned toolchain): an old name still
+# names the new lint, so a waiver under it waives a denied lint.
+RENAMED = {"option_unwrap_used": "unwrap_used", "result_unwrap_used": "unwrap_used",
+           "option_expect_used": "expect_used", "result_expect_used": "expect_used",
+           "integer_arithmetic": "arithmetic_side_effects", "disallowed_type": "disallowed_types",
+           "disallowed_method": "disallowed_methods"}
+# Lints that hide a waiver under a name the reader does not know, and Clippy's old name for one of them.
+SILENCERS = {"rust": ("renamed_and_removed_lints", "unknown_lints"), "clippy": (*RENAMED, "unknown_clippy_lints")}
+WAIVED = (set(CLIPPY_DENIED) | set(RUST_DENIED) | {"warnings", "all", "style", "restriction"} | set(RENAMED)
+          | set(SILENCERS["rust"]) | {"unknown_clippy_lints"})
 RANK = {"allow": 0, "warn": 1, "force-warn": 1, "deny": 2, "forbid": 3}
 
 DISALLOWED_TYPES = tuple(f"std::collections::{name}" for name in
@@ -87,27 +117,43 @@ CLIPPY_NAMES = {"clippy.toml", ".clippy.toml"}
 
 FLAG_VARIABLES = ("RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_HOST_RUSTFLAGS")
 TARGET_FLAGS = re.compile(r"CARGO_TARGET_\w+_RUSTFLAGS")
-REFUSED_VARIABLES = ("CLIPPY_CONF_DIR", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+REFUSED_VARIABLES = ("CLIPPY_CONF_DIR", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
+                     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "RUSTC", "CARGO_BUILD_RUSTC")
 LOWERING = re.compile(r"(?:-A|-W|--allow|--warn|--force-warn|--cap-lints)(?:$|=|[A-Za-z])")
 COMPILER_KEYS = ("rustc", "rustc-wrapper", "rustc-workspace-wrapper")
 
 ATTRIBUTE = re.compile(r"#\s*!?\s*\[\s*(allow|expect|warn|cfg_attr)\s*\(")
 INNER = re.compile(r"\b(allow|expect|warn)\s*\(")
 STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+INCLUDE = re.compile(r"\binclude\s*!")
+INCLUDE_TEXT = re.compile(r"\binclude_(?:str|bytes)\s*!\s*[(\[{]\s*")
+LITERAL = re.compile(r'(?:r(#*)"(.*?)"\1|"((?:\\.|[^"\\])*)")\s*[)\]}]', re.S)
+PATH_ATTRIBUTE = re.compile(r"#\s*!?\s*\[\s*path\s*=")
+PATH_KEY = re.compile(r"\bpath\s*=")
 
-SWIFT_UNSAFE = re.compile(r"\b(unsafeBitCast|unsafeDowncast|Unsafe(?:Mutable)?(?:Raw)?(?:Buffer)?Pointer|"
-                          r"withUnsafe\w*|Unmanaged)\b")
+SWIFT_UNSAFE = re.compile(r"\b(?:unsafeBitCast|unsafeDowncast|withUnsafe\w*|Unmanaged|OpaquePointer|"
+                          r"unsafe(?:Mutable)?Address\w*)\b|Unsafe(?:Mutable)?(?:Raw)?(?:Buffer)?Pointer\b|"
+                          r"\bunowned\s*\(\s*unsafe\s*\)")
+LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"  # what str.splitlines splits on
 DIAGNOSTIC = re.compile(r"^(?:\s*-->\s*)?([^\s:][^:]*\.(?:rs|swift)):(\d+):\d+:?\s*(?:error|warning)?")
+ANY_DIAGNOSTIC = re.compile(r"^([^\s:][^:]*):(\d+):\d+:\s*(?:error|warning)\b")  # a diagnostic in a file of any type
+MAIN_ISOLATED = ("TerminalView", "DesignSystem", "FeaturePlaceholder", "PlatformShell")
 SWIFT_TOOLS = (6, 2)
 SWIFT_MODE = 6
 SKIPPED_TARGETS = {"binary", "system"}
 
 RUN_SECONDS = 900
 MAX_OUTPUT = 8 * 1024 * 1024
+GIT_SECONDS = 60
+MAX_LIST_BYTES = 256 * 1024
+REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 
 # Known-bad controls: every run proves its own readers still refuse these.
 WAIVER_CONTROL = "#[cfg_attr(test, expect(clippy::unwrap_used))]\nfn f() {}\n"
 FLAG_CONTROL = ["--cap-lints", "warn"]
+HIDDEN_CONTROL = ('include!("waiver.txt");\n#[path = "waiver.txt"]\nmod hidden;\n'
+                  'const SOURCE: &str = include_str!("lib.rs");\n')
+SWIFT_CONTROL = 'let text = "a//b"; let pointer: AutoreleasingUnsafeMutablePointer<Int>\n'
 
 
 def reader():
@@ -120,11 +166,57 @@ def reader():
     return module
 
 
-def reviewed_paths(rr, repo):
+def git_output(rr, repo, args, ref):
+    """The bytes git prints for one read-only command under a time limit; a failure to run it is broken."""
+    try:
+        done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=GIT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        raise rr.Broken(f"git could not read unsafe-allowed.txt from {rr.shown(ref)}")
+    return done.returncode, done.stdout
+
+
+def list_at(rr, repo, ref):
+    """unsafe-allowed.txt as text from the commit ref names; None when that commit has no list."""
+    if not REF.fullmatch(ref) or ref.startswith("-"):
+        raise rr.Broken(f"--tables-from needs a plain commit name, not {rr.shown(ref)}")
+    code, out = git_output(rr, repo, ["rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}"], ref)
+    commit = out.decode("ascii", "replace").strip()
+    if code != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise rr.Broken(f"--tables-from {rr.shown(ref)} does not name a commit in the repository")
+    code, out = git_output(rr, repo, ["ls-tree", "-l", "--end-of-options", commit, "--", REVIEWED_LIST], ref)
+    if code != 0:
+        raise rr.Broken(f"git could not list {REVIEWED_LIST} at {rr.shown(ref)}")
+    entry = out.decode("utf-8", "replace").strip()
+    if not entry:
+        return None
+    fields, _, path = entry.partition("\t")
+    parts = fields.split()
+    if path != REVIEWED_LIST or len(parts) != 4 or parts[0] != "100644" or parts[1] != "blob":
+        raise rr.Broken(f"{REVIEWED_LIST} at {rr.shown(ref)} is not a regular file")
+    if not parts[3].isdigit() or int(parts[3]) > MAX_LIST_BYTES:
+        raise rr.Broken(f"{REVIEWED_LIST} at {rr.shown(ref)} is over the {MAX_LIST_BYTES}-byte cap")
+    code, raw = git_output(rr, repo, ["cat-file", "blob", parts[2]], ref)
+    if code != 0 or len(raw) > MAX_LIST_BYTES:
+        raise rr.Broken(f"git could not read {REVIEWED_LIST} at {rr.shown(ref)} within the {MAX_LIST_BYTES}-byte cap")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise rr.Broken(f"{REVIEWED_LIST} at {rr.shown(ref)} is malformed: it is not UTF-8 text")
+
+
+def reviewed_paths(rr, repo, ref=None):
+    """The reviewed paths, from the tree or, with a ref, from that commit."""
     allowed = set()
-    if not os.path.lexists(repo / REVIEWED_LIST):
+    if ref is not None:
+        text = list_at(rr, repo, ref)
+    elif os.path.lexists(repo / REVIEWED_LIST):
+        text = rr.read_source(repo, REVIEWED_LIST)
+    else:
+        text = None
+    if text is None:
         return allowed
-    for number, line in enumerate(rr.read_source(repo, REVIEWED_LIST).splitlines(), 1):
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         path, _, reason = line.partition("#")
@@ -211,6 +303,11 @@ def check_workspace(rr, repo, root, found):
         for group in GROUPS[tool]:
             if group in table and not denies(table[group]):
                 found.add(("rust", f"Cargo.toml: workspace lint group {group} is set below deny"))
+        for name in SILENCERS[tool]:
+            if name in table and not denies(table[name]):
+                shown_name = name if tool == "rust" else f"clippy::{name}"
+                found.add(("rust", f"Cargo.toml: workspace lint {shown_name} is set below deny, so a denied lint "
+                                   "can be waived under a name the gate does not read"))
     profiles = root.get("profile") if isinstance(root.get("profile"), dict) else {}
     for name in ("dev", "release"):
         profile = profiles.get(name) if isinstance(profiles.get(name), dict) else {}
@@ -403,7 +500,38 @@ def waivers(text, bounds):
     return sorted(set(lines))
 
 
+def hidden_source(text):
+    """The line numbers that pull Rust code in from a file the waiver reader may not read: include! of anything,
+    include_str! or include_bytes! of a .rs file or of anything but one plain string, and a path attribute, plain
+    or inside cfg_attr."""
+    lines = set()
+
+    def line_of(position):
+        return text.count("\n", 0, position) + 1
+
+    for match in INCLUDE.finditer(text):
+        lines.add(line_of(match.start()))
+    for match in INCLUDE_TEXT.finditer(text):
+        literal = LITERAL.match(text, match.end())
+        target = None if literal is None else (literal.group(2) if literal.group(2) is not None else literal.group(3))
+        if target is None or target.lower().endswith(".rs"):
+            lines.add(line_of(match.start()))
+    for match in PATH_ATTRIBUTE.finditer(text):
+        lines.add(line_of(match.start()))
+    for match in ATTRIBUTE.finditer(text):
+        if match.group(1) != "cfg_attr":
+            continue
+        end = balanced(text, match.end())
+        body = text[match.end():] if end is None else text[match.end():end - 1]
+        if PATH_KEY.search(STRING.sub(lambda m: " " * len(m.group(0)), body)):
+            lines.add(line_of(match.start()))
+    return sorted(lines)
+
+
 def prove_controls(rr):
+    swift = swift_code(rr, "control.swift", SWIFT_CONTROL)
+    if hidden_source(HIDDEN_CONTROL) != [1, 2, 4] or not SWIFT_UNSAFE.search(swift):
+        raise rr.Broken("a seeded include, path attribute or Swift pointer name was not refused, so this gate cannot fail")
     if waivers(WAIVER_CONTROL, False) != [1] or not lowering(FLAG_CONTROL):
         raise rr.Broken("a seeded waiver or lowering flag was not refused, so this gate cannot fail")
 
@@ -445,7 +573,7 @@ def run_bounded(rr, args, cwd, env=None, what="a build"):
 def diagnostics(rr, output, repo):
     found = []
     for line in output.splitlines():
-        match = DIAGNOSTIC.match(line)
+        match = DIAGNOSTIC.match(line) or ANY_DIAGNOSTIC.match(line)
         if match:
             path = pathlib.Path(match.group(1))
             rel = path.relative_to(repo).as_posix() if path.is_absolute() and repo in path.parents else match.group(1)
@@ -470,8 +598,12 @@ def check_rust(rr, repo, tracked, allowed, found):
     for name in rust_files:
         if is_reviewed(name, allowed):
             continue
-        for line in waivers(rr.read_source(repo, name), name.startswith(BOUNDS_CRATE)):
+        text = rr.read_source(repo, name)
+        for line in waivers(text, name.startswith(BOUNDS_CRATE)):
             found.add(("rust", f"{rr.shown(name)}:{line} (a denied lint is waived outside a reviewed path)"))
+        for line in hidden_source(text):
+            found.add(("rust", f"{rr.shown(name)}:{line} (code from another file through include! or a path "
+                               "attribute, which the waiver reader does not read, outside a reviewed path)"))
     if not settled:
         print("unsafe-code: rust clippy not run: the settings above are refused", file=sys.stderr)
         return
@@ -481,7 +613,7 @@ def check_rust(rr, repo, tracked, allowed, found):
     with tempfile.TemporaryDirectory() as target:
         env = dict(os.environ)
         env.setdefault("CARGO_TARGET_DIR", target)
-        args = [cargo, "clippy", "--workspace", "--all-targets", "--keep-going", "--quiet", "--message-format=short"]
+        args = [cargo, "clippy", "--workspace", "--all-targets", "--all-features", "--keep-going", "--quiet", "--message-format=short"]
         code, out, err = run_bounded(rr, args, repo, env, "cargo clippy")
     hits = diagnostics(rr, err + out, repo)
     for hit in hits:
@@ -533,6 +665,7 @@ def check_manifest(rr, repo, name, found):
         kinds = [(next(iter(s.get("kind") or {"": None})), s) for s in settings]
         strict = False
         memory = False
+        isolated = False
         for kind, setting in kinds:
             value = (setting.get("kind") or {}).get(kind)
             first = value.get("_0") if isinstance(value, dict) else None
@@ -550,11 +683,90 @@ def check_manifest(rr, repo, name, found):
                 found.add(("swift", f"{label} sets a language mode below {SWIFT_MODE}"))
             elif kind == "strictMemorySafety" and unconditional:
                 memory = True
+            elif kind == "defaultIsolation" and first == "MainActor" and unconditional:
+                isolated = True
         if not strict:
             found.add(("swift", f"{label} lacks .treatAllWarnings(as: .error)"))
         if target.get("name") == "EngineSurface" and not memory:
             found.add(("swift", f"{label} lacks .strictMemorySafety()"))
+        if target.get("name") in MAIN_ISOLATED and not isolated:
+            found.add(("swift", f"{label} lacks main-actor default isolation: .defaultIsolation(MainActor.self) "
+                                "with no condition"))
     return found.total == before
+
+
+def swift_code(rr, name, text):
+    """The Swift source with comments and string text replaced by spaces, line breaks kept, so a name written
+    inside one is not read as code and line numbers stay put. Code interpolated into a string is kept, so a name
+    there still counts. Handles line comments, nested block comments, plain, multi-line and raw strings; a block
+    comment, multi-line string or interpolation that never closes breaks the run."""
+    out = list(text)
+    size = len(text)
+
+    def blank(start, end):
+        for at in range(start, min(end, size)):
+            if out[at] not in LINE_BREAKS:
+                out[at] = " "
+
+    index = 0
+    while index < size:
+        if text.startswith("//", index):
+            end = index
+            while end < size and text[end] not in "\n\r":
+                end += 1
+            blank(index, end)
+            index = end
+        elif text.startswith("/*", index):
+            depth, at = 1, index + 2
+            while at < size and depth:
+                if text.startswith("/*", at):
+                    depth, at = depth + 1, at + 2
+                elif text.startswith("*/", at):
+                    depth, at = depth - 1, at + 2
+                else:
+                    at += 1
+            if depth:
+                raise rr.Broken(f"{rr.shown(name)} has a block comment that never closes, so it cannot be read")
+            blank(index, at)
+            index = at
+        elif text[index] in '#"':
+            quote_at = index
+            while quote_at < size and text[quote_at] == "#":
+                quote_at += 1
+            if quote_at >= size or text[quote_at] != '"':
+                index = max(quote_at, index + 1)
+                continue
+            hashes = text[index:quote_at]
+            multi = text.startswith('"""', quote_at)
+            closer = ('"""' if multi else '"') + hashes
+            at, segment, closed = quote_at + (3 if multi else 1), index, False
+            while at < size:
+                if text.startswith("\\" + hashes + "(", at):
+                    blank(segment, at)
+                    depth, at = 1, at + len(hashes) + 2
+                    while at < size and depth:
+                        depth += {"(": 1, ")": -1}.get(text[at], 0)
+                        at += 1
+                    if depth:
+                        raise rr.Broken(f"{rr.shown(name)} has an interpolation that never closes, so it cannot be read")
+                    segment = at - 1
+                elif text.startswith("\\" + hashes, at):
+                    at += len(hashes) + 2
+                elif text.startswith(closer, at):
+                    at += len(closer)
+                    closed = True
+                    break
+                elif text[at] in "\n\r" and not multi:
+                    break
+                else:
+                    at += 1
+            if multi and not closed:
+                raise rr.Broken(f"{rr.shown(name)} has a multi-line string that never closes, so it cannot be read")
+            blank(segment, at)
+            index = max(at, index + 1)
+        else:
+            index += 1
+    return "".join(out)
 
 
 def check_swift(rr, repo, tracked, allowed, found, rust_only):
@@ -567,8 +779,8 @@ def check_swift(rr, repo, tracked, allowed, found, rust_only):
     for name in files:
         if is_reviewed(name, allowed):
             continue
-        for number, line in enumerate(rr.read_source(repo, name).splitlines(), 1):
-            if SWIFT_UNSAFE.search(line.split("//", 1)[0]):
+        for number, line in enumerate(swift_code(rr, name, rr.read_source(repo, name)).splitlines(), 1):
+            if SWIFT_UNSAFE.search(line):
                 found.add(("swift", f"{rr.shown(name)}:{number} (a raw-pointer or unmanaged API outside a reviewed path)"))
     packages = sorted(n for n in files if n.rsplit("/", 1)[-1] == "Package.swift")
     folders = [n.rpartition("/")[0] for n in packages]
@@ -606,19 +818,26 @@ def main(argv):
     except Exception as error:  # a reader that cannot load is a broken check, never a pass
         print(f"unsafe-code: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
         return 2
-    rust_only = argv[:1] == ["--rust"]
-    argv = argv[1:] if rust_only else argv
-    if len(argv) != 1:
-        print("unsafe-code: broken: usage: unsafe-code [--rust] <repo>", file=sys.stderr)
+    args, rust_only, ref, usable = list(argv), False, None, True
+    while usable and args and args[0] in ("--rust", "--tables-from"):
+        flag = args.pop(0)
+        if flag == "--rust":
+            usable, rust_only = not rust_only, True
+        elif ref is not None or len(args) < 2:
+            usable = False
+        else:
+            ref = args.pop(0)
+    if not usable or len(args) != 1 or args[0].startswith("-"):
+        print("unsafe-code: broken: usage: unsafe-code [--rust] [--tables-from <ref>] <repo>", file=sys.stderr)
         return 2
-    repo = pathlib.Path(argv[0]).resolve()
+    repo = pathlib.Path(args[0]).resolve()
     found = rr.Collected()
     try:
         prove_controls(rr)
         tracked = rr.tracked(repo)
         for name in tracked:
             rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
-        allowed = reviewed_paths(rr, repo)
+        allowed = reviewed_paths(rr, repo, ref)
         check_rust(rr, repo, tracked, allowed, found)
         check_swift(rr, repo, tracked, allowed, found, rust_only)
     except rr.Broken as error:

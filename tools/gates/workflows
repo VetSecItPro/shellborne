@@ -6,12 +6,26 @@ Usage: workflows [--tables-from <ref>] <repo>
 
 Checks every tracked file in .github/workflows/ (.yml or .yaml) and every tracked action file under
 .github/actions/ (action.yml or action.yaml):
-  - unpinned-action: a `uses:` that is not a local path, a docker image by digest, or owner/repo@<40-hex SHA>;
+  - unpinned-action: a `uses:` that is not a local path, a docker image by digest, or owner/repo@<40-hex SHA>.
+    The key is found in block form, in a flow mapping (`- {uses: ...}`, on its own line or after another key),
+    quoted, or as an explicit `? uses` key, and its value is read on the same line or on the one deeper-indented
+    line after it. A value the gate cannot read (an alias, an anchor, a tag, a block scalar, a quoted string with
+    a backslash, a plain value over several lines, or no value) is refused the same way. The word inside a block
+    scalar, such as a run script, is text and not a key;
   - permissions: a workflow with no top-level `permissions:` block, a job with no `permissions:` of its own
     (an explicit `permissions: {}` counts), or `write-all` anywhere;
   - untrusted-trigger: `pull_request_target` or `workflow_run`, which hand secrets or a write token
     to code from an untrusted pull request. The one exception is a pull_request_target workflow that opts in
-    with `# untrusted-trigger: base-only` and keeps its terms (see base_only below);
+    with `# untrusted-trigger: base-only` and keeps its terms (see base_only below). In such a workflow the whole
+    text, comments included, may hold no secrets reference in any form or case (secrets.X, secrets['X'],
+    toJSON(secrets)), no head_ref (GITHUB_HEAD_REF included), no pull request head in dotted or bracket form except
+    the head SHA as a whole env value, no pull/ ref, no `ref` or `repository` key in block, flow or explicit form,
+    no YAML escape (\\x, \\u, \\U, or a backslash at a line end) that could spell one of those names, and no
+    `${{` expression inside a run value, on its line or on the deeper lines after it, because pull request text
+    there is script injection. A step's env may still hold expressions. These terms keep pull request code from
+    being checked out by the workflow, but they cannot stop a run step from executing content it fetched as data,
+    such as a head commit whose SHA arrives through an env variable; a change to a base-only workflow relies on
+    the owner's review;
   - key-name: a line naming the update signing key, by any pattern in workflows.toml beside this file, matched
     without case anywhere on the line, comments included. Secret names themselves are checked by the
     repo-settings gate; a key under an innocent name passes here;
@@ -24,7 +38,8 @@ file is broken, never read whole or followed. Each run first proves every key-na
 line. A refusal names the rule and file:line, never the source. Exit 0 clean, 1 refused, 2 broken; a missing or
 different actionlint, an actionlint run that passes its timeout (300 seconds; the environment variable
 WORKFLOWS_ACTIONLINT_TIMEOUT can only lower it), or a missing, malformed or empty table, is broken, never a pass.
-At most 1 MiB of actionlint output is kept; the rest is dropped and a note says so.
+At most 1 MiB of actionlint output is kept; the rest is dropped and a note says so. An actionlint run that exits 1
+with no findings is broken, and so is any unexpected error inside the gate, reported by its type only.
 """
 import importlib.machinery
 import importlib.util
@@ -47,12 +62,22 @@ ACTIONLINT = "1.7.12"
 LINT_TIMEOUT = 300  # seconds for the whole actionlint run; WORKFLOWS_ACTIONLINT_TIMEOUT can only lower it
 VERSION_TIMEOUT = 30
 MAX_LINT_BYTES = 1024 * 1024  # actionlint output kept; the rest is read and dropped
-USES = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?([^'\"\s#]+)")
+USES_KEY = re.compile(r"(?:^[\s?-]*|[{,\[]\s*|\?\s+)(['\"]?)uses\1(?![\w-])")
+BLOCK_SCALAR = re.compile(r"^\s*(?:-\s+)*(?:(?:\"[^\"]*\"|'[^']*'|[^\s'\"{\[][^:]*?)\s*:\s+)?[|>][-+1-9]{0,2}$")
+PLAIN = re.compile(r"[^\s,\[\]{}]+")
 PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
 DIGEST = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
 UNTRUSTED = re.compile(r"\b(pull_request_target|workflow_run)\b")
 BASE_ONLY = "# untrusted-trigger: base-only"
 HEAD_AS_DATA = re.compile(r"^\s+[A-Z_]+:\s*\$\{\{\s*github\.event\.pull_request\.head\.sha\s*\}\}\s*$")
+SECRETS_WORD = re.compile(r"(?<![\w-])secrets(?![\w-])", re.IGNORECASE)
+BASE_ONLY_WORDS = re.compile(r"head_ref|pull/", re.IGNORECASE)
+YAML_ESCAPE = re.compile(r"\\[xuU]|\\$")
+BRACKET = re.compile(r"\[['\"]([\w-]+)['\"]\]")
+PR_TOKEN = re.compile(r"pull_request(?![\w-])")
+RUN_KEY = re.compile(r"(?:^[\s?-]*|[{,\[]\s*|\?\s+)(['\"]?)run\1\s*:")
+CHECKOUT_KEY = re.compile(r"(?:^[\s?-]*|[{,\[]\s*)(['\"]?)(ref|repository)\1\s*:", re.IGNORECASE)
+EXPLICIT_KEY = re.compile(r"\?\s+['\"]?(ref|repository)['\"]?(?![\w-])", re.IGNORECASE)
 
 
 class Broken(Exception):
@@ -126,12 +151,47 @@ def prove_controls(patterns):
         raise Broken("a key-name pattern refuses an empty line")
 
 
+def names_head(line):
+    """True when a line reaches the pull request head: pull_request followed by .head, by a bracket or filter the
+    gate cannot read, or by nothing (the whole object), after lowercasing, dropping whitespace and reading
+    ['name'] as .name."""
+    flat = BRACKET.sub(r".\1", re.sub(r"\s+", "", line.lower()))
+    for match in PR_TOKEN.finditer(flat):
+        member = re.match(r"\.([\w-]+)", flat[match.end():])
+        if not member or member.group(1) == "head":
+            return True
+    return False
+
+
+def run_expression(lines):
+    """True when a run value holds a `${{` expression: after the run key on its line (the rest of a flow mapping
+    included), or on any later line indented past the key's column, which covers block scalars and values continued
+    on the next lines. Whole lines are read, comments included, so a hash cannot hide one."""
+    for index, line in enumerate(lines):
+        match = RUN_KEY.search(line)
+        if not match:
+            continue
+        if "${{" in line[match.end():]:
+            return True
+        column = match.start(1)  # where the key starts, after any dash or bracket
+        for later in lines[index + 1:]:
+            if later.strip() and indent(later) <= column:
+                break
+            if "${{" in later:
+                return True
+    return False
+
+
 def base_only(lines):
     """True when a pull_request_target workflow opts in to the base-only exception and keeps its terms: a
-    read-only token, no secrets, no checkout of another ref or repository, the head only as an env value,
-    and never workflow_run. GitHub then runs the base branch's copy and no pull request code runs."""
+    read-only token, no secrets in any form, no head_ref, no pull/ ref, no checkout of another ref or
+    repository in any YAML form, no escape that could spell a name, the head only as its SHA in an env value,
+    and never workflow_run. GitHub then runs the base branch's copy and no pull request code runs. Comments
+    are read too, so a stray quote cannot hide a reference behind a hash."""
     text = "\n".join(lines)
-    if BASE_ONLY not in lines or "workflow_run" in text or "secrets." in text:
+    if BASE_ONLY not in lines or "workflow_run" in text or SECRETS_WORD.search(text) or BASE_ONLY_WORDS.search(text):
+        return False
+    if any(YAML_ESCAPE.search(line) for line in lines):
         return False
     top = [i for i, line in enumerate(lines) if re.match(r"^permissions\s*:", line)]
     if len(top) != 1:
@@ -144,9 +204,97 @@ def base_only(lines):
             block.append(line.strip())
     if block != ["contents: read"] or any(re.search(r":\s*write\b", line) for line in lines):
         return False
-    if any(re.match(r"^\s+(ref|repository)\s*:", line) for line in lines):
+    if any(CHECKOUT_KEY.search(line) or EXPLICIT_KEY.search(line) for line in lines):
         return False
-    return all(HEAD_AS_DATA.match(line) for line in lines if "pull_request.head" in line)
+    if run_expression(lines):
+        return False
+    return not any(names_head(line) and not HEAD_AS_DATA.match(line) for line in lines)
+
+
+def indent(line):
+    return len(line) - len(line.lstrip())
+
+
+def code_of(line):
+    return line.split("#", 1)[0].rstrip()
+
+
+def block_scalar_lines(lines):
+    """The 0-based lines that are the text of a block scalar (`run: |` and the like): every later line that is
+    blank or indented past the column of the key that opened it. Bounding by the key column, never the dash, can
+    only take too few lines as text, so a real key is never hidden."""
+    text, index = set(), 0
+    while index < len(lines):
+        if BLOCK_SCALAR.match(code_of(lines[index])):
+            column = re.match(r"^\s*(?:-\s+)*", lines[index]).end()
+            index += 1
+            while index < len(lines) and (not lines[index].strip() or indent(lines[index]) > column):
+                text.add(index)
+                index += 1
+            continue
+        index += 1
+    return text
+
+
+def scalar(value):
+    """The action reference a YAML value holds, or None when the gate cannot read it with certainty."""
+    value = value.lstrip()
+    if value.startswith("'"):
+        end = 1
+        while True:
+            end = value.find("'", end)
+            if end < 0:
+                return None
+            if value[end + 1:end + 2] != "'":
+                break
+            end += 2
+        found, rest = value[1:end].replace("''", "'"), value[end + 1:]
+    elif value.startswith('"'):
+        end = value.find('"', 1)
+        if end < 0 or "\\" in value[1:end]:
+            return None
+        found, rest = value[1:end], value[end + 1:]
+    else:
+        match = PLAIN.match(value)
+        if not match or value[0] in "&*!|>%@`?-:":
+            return None
+        found, rest = match.group(0), value[match.end():]
+    return found if re.match(r"^\s*([,}\]].*)?$", rest) else None
+
+
+def uses_refusals(lines):
+    """The 1-based line of each uses key whose value is not a pinned reference or cannot be read."""
+    text = block_scalar_lines(lines)
+    refused = []
+    for index, line in enumerate(lines):
+        if index in text:
+            continue
+        code = code_of(line)
+        for match in USES_KEY.finditer(code):
+            column = match.end() - len("uses") - len(match.group(1)) * 2
+            after = re.match(r"^\s*:(?:\s|$)", code[match.end():])
+            ref = None
+            if after:
+                value = code[match.end() + after.end():]
+                if value.strip():
+                    ref = scalar(value)
+                else:
+                    ref = next_line_value(lines, index, column)
+            if ref is None or not (ref.startswith("./") or PINNED.match(ref) or DIGEST.match(ref)):
+                refused.append(index + 1)
+                break
+    return refused
+
+
+def next_line_value(lines, index, column):
+    """The value of a key left empty on its line: the one significant line after it indented past the key's
+    column. None for no such line, or a value that runs on to a second deeper line."""
+    later = [i for i in range(index + 1, len(lines)) if significant(lines[i])]
+    if not later or indent(lines[later[0]]) <= column:
+        return None
+    if len(later) > 1 and indent(lines[later[1]]) > column:
+        return None
+    return scalar(code_of(lines[later[0]]))
 
 
 def significant(line):
@@ -192,13 +340,10 @@ def check_file(rel, text, is_workflow, patterns, findings):
             findings.append(("permissions", f"{shown}:{number} (a job with no permissions of its own)"))
     else:
         exempt = False
+    for number in uses_refusals(lines):
+        findings.append(("unpinned-action", f"{shown}:{number}"))
     for number, line in enumerate(lines, 1):
         code = line.split("#", 1)[0]
-        match = USES.match(code)
-        if match:
-            ref = match.group(1)
-            if not (ref.startswith("./") or PINNED.match(ref) or DIGEST.match(ref)):
-                findings.append(("unpinned-action", f"{shown}:{number}"))
         if re.search(r"\bwrite-all\b", code):
             findings.append(("permissions", f"{shown}:{number}"))
         found = UNTRUSTED.search(code)
@@ -231,17 +376,20 @@ def run_capped(command, timeout):
     most MAX_LINT_BYTES and the rest is read and dropped. A run past the timeout is killed with its group and raises
     Broken."""
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    kept, cut = {"out": bytearray(), "err": bytearray()}, []
+    kept, cut, failed = {"out": bytearray(), "err": bytearray()}, [], []
 
     def drain(stream, key):
-        while True:
-            chunk = stream.read(65536)
-            if not chunk:
-                return
-            room = MAX_LINT_BYTES - len(kept[key])
-            kept[key] += chunk[:max(room, 0)]
-            if len(chunk) > room:
-                cut.append(key)
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    return
+                room = MAX_LINT_BYTES - len(kept[key])
+                kept[key] += chunk[:max(room, 0)]
+                if len(chunk) > room:
+                    cut.append(key)
+        except Exception as error:  # a reader that dies would drop findings: the run is broken, never clean
+            failed.append(type(error).__name__)
 
     threads = [threading.Thread(target=drain, args=(proc.stdout, "out"), daemon=True),
                threading.Thread(target=drain, args=(proc.stderr, "err"), daemon=True)]
@@ -260,6 +408,8 @@ def run_capped(command, timeout):
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    if failed:
+        raise Broken(f"reading actionlint output failed: {failed[0]}")
 
     def text(key):
         data = bytes(kept[key])
@@ -315,12 +465,15 @@ def main(argv):
             code, out, err, cut = run_capped([tool, "-no-color", "-oneline", *map(str, workflows)], lint_timeout())
         except Broken as error:
             return broken(str(error))
-        for line in out.splitlines():
+        reported = [line for line in out.splitlines() if line.strip()]
+        for line in reported:
             findings.append(("actionlint", line.split(": ", 1)[0]))
         if cut:
             print(f"workflows: actionlint output cut at {MAX_LINT_BYTES} bytes; the rest was dropped", file=sys.stderr)
         if code not in (0, 1):
             return broken(f"actionlint failed: {err.strip()[:300]}")
+        if code == 1 and not reported:
+            return broken(f"actionlint exited 1 with no findings: {err.strip()[:300]}")
     for kind, where in findings[:MAX_FINDINGS]:
         print(f"workflows: refused {kind} {where}", file=sys.stderr)
     if len(findings) > MAX_FINDINGS:
@@ -328,5 +481,13 @@ def main(argv):
     return 1 if findings else 0
 
 
+def entry(argv):
+    """main, with any unexpected error reported as broken by its type only, never as a refusal or a traceback."""
+    try:
+        return main(argv)
+    except Exception as error:
+        return broken(f"unexpected error: {type(error).__name__}")
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(entry(sys.argv[1:]))

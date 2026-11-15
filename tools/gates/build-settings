@@ -32,6 +32,12 @@ non-ASCII characters in the name escaped. Every read is bounded: repo-rules' cap
 file, MAX_DEPTH nested braces in a project file, MAX_FILES entries walked, MAX_BINARY_BYTES per binary, MAX_OUTPUT
 bytes from one tool run, MAX_SECONDS for the stub read, and at most MAX_FINDINGS refusals kept, the rest counted.
 Exit 0 clean, 1 refused, 2 broken or not run.
+
+Known limit (scheduled): a deployment target spelled as -platform_version, -macos_version_min or an -apple-darwinN
+triple, or set with the fish form `set -gx`, is not read. A project file is read whole, comments removed, split on
+braces and semicolons outside quoted strings, so an object written on one line is judged like one split over lines.
+A minimum-version flag in a Swift file is judged only on code (comments and string literals blanked) and inside the
+string literals of an unsafeFlags call.
 """
 import importlib.machinery
 import importlib.util
@@ -169,6 +175,25 @@ def blank_swift_text(text):
     return "".join(out)
 
 
+UNSAFE_FLAGS = re.compile(r"\.unsafeFlags\s*\(")
+STRING_LITERAL = re.compile(r'#*"(?:[^"\\\n]|\\.)*"')
+
+
+def unsafe_flag_lines(text, visible):
+    """The line numbers of string literals inside .unsafeFlags(...) calls that carry a minimum-version flag. visible is
+    the blanked text, same length as text, so a parenthesis inside a comment or string does not close a call."""
+    lines = []
+    for call in UNSAFE_FLAGS.finditer(visible):
+        depth, at = 1, call.end()
+        while at < len(visible) and depth:
+            depth += {"(": 1, ")": -1}.get(visible[at], 0)
+            at += 1
+        for literal in STRING_LITERAL.finditer(text, call.end(), at):
+            if flag_findings(literal.group()):
+                lines.append(text.count("\n", 0, literal.start()) + 1)
+    return lines
+
+
 def judge_package(name, text, found):
     platforms = 0
     visible = blank_swift_text(text).splitlines()
@@ -184,8 +209,10 @@ def judge_package(name, text, found):
                     found.add(("deployment-target", where))
             elif form.group("v") != "26" or form.group("m") not in (None, "0"):
                 found.add(("deployment-target", where))
-        if flag_findings(line):
+        if flag_findings(visible[number - 1] if number <= len(visible) else ""):
             found.add(("deployment-target", where))
+    for number in unsafe_flag_lines(text, blank_swift_text(text)):
+        found.add(("deployment-target", f"{RR.shown(name)}:{number}"))
     if name == PACKAGE and not platforms:
         found.add(("missing-deployment-target", RR.shown(name)))
 
@@ -239,89 +266,147 @@ def judge_xcconfig_archs(configs, found):
             found.add(("missing-archs", RR.shown(name)))
 
 
-def without_comments(line, state):
-    """A project file line with /* */ comments removed outside quoted strings, and its braces outside strings, in
-    order. state carries an open comment across lines."""
-    out, braces, at, quoted = [], [], 0, False
-    while at < len(line):
-        if state["comment"]:
-            end = line.find("*/", at)
-            if end < 0:
-                return "".join(out), braces
-            state["comment"], at = False, end + 2
-            continue
-        char = line[at]
-        if quoted:
-            out.append(char)
-            if char == "\\" and at + 1 < len(line):
-                out.append(line[at + 1])
+def pbx_tokens(text):
+    """The project file as (token, line) pairs with comments removed. Punctuation { } ( ) = ; , is a token each, a
+    quoted string is one token with its quotes, and anything else runs to whitespace or punctuation ($( ) kept whole)."""
+    out, at, line, size = [], 0, 1, len(text)
+    while at < size:
+        char = text[at]
+        if char == "\n":
+            line, at = line + 1, at + 1
+        elif char.isspace():
+            at += 1
+        elif text.startswith("/*", at):
+            end = text.find("*/", at + 2)
+            end = size if end < 0 else end + 2
+            line += text.count("\n", at, end)
+            at = end
+        elif text.startswith("//", at):
+            while at < size and text[at] != "\n":
                 at += 1
-            elif char == '"':
-                quoted = False
-        elif line.startswith("/*", at):
-            state["comment"], at = True, at + 2
-            continue
-        elif line.startswith("//", at):
-            break
+        elif char in "{}();=,":
+            out.append((char, line))
+            at += 1
+        elif char == '"':
+            end = at + 1
+            while end < size and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            end = min(end + 1, size)
+            out.append((text[at:end], line))
+            line += text.count("\n", at, end)
+            at = end
         else:
-            out.append(char)
-            if char == '"':
-                quoted = True
-            elif char in "{}":
-                braces.append((char, "".join(out)))
-        at += 1
-    return "".join(out), braces
+            end = at
+            while end < size and not text[end].isspace() and text[end] not in "{}();=,\"":
+                if text[end] == "$" and text.startswith("(", end + 1):
+                    close = text.find(")", end)
+                    end = size if close < 0 else close
+                end += 1
+            end = max(end, at + 1)
+            out.append((text[at:end], line))
+            at = end
+    return out
+
+
+class PbxReader:
+    """Reads the tokens into nested entries: a dictionary is a list of (key, value, line), a list value a list of
+    values, anything else its text."""
+
+    def __init__(self, name, tokens):
+        self.name, self.tokens, self.at = name, tokens, 0
+
+    def peek(self):
+        return self.tokens[self.at][0] if self.at < len(self.tokens) else None
+
+    def take(self):
+        token = self.tokens[self.at]
+        self.at += 1
+        return token
+
+    def too_deep(self):
+        return RR.Broken(f"{RR.shown(self.name)} nests over the {MAX_DEPTH}-brace cap")
+
+    def value(self, depth):
+        if depth > MAX_DEPTH:
+            raise self.too_deep()
+        token = self.peek()
+        if token == "{":
+            return self.dictionary(depth)
+        if token == "(":
+            self.take()
+            items = []
+            while self.peek() not in (")", None):
+                if self.peek() == ",":
+                    self.take()
+                else:
+                    items.append(self.value(depth + 1))
+            if self.peek() is None:
+                raise RR.Broken(f"{RR.shown(self.name)} ends inside a list")
+            self.take()
+            return items
+        return self.take()[0]
+
+    def dictionary(self, depth):
+        opened = self.take()[1]
+        entries = []
+        while self.peek() not in ("}", None):
+            key, line = self.take()
+            if self.peek() != "=":
+                continue
+            self.take()
+            if self.peek() in (None, "}", ";"):
+                raise RR.Broken(f"{RR.shown(self.name)}:{line} has a key with no value")
+            entries.append((key, self.value(depth + 1), line))
+            if self.peek() == ";":
+                self.take()
+        if self.peek() is None:
+            raise RR.Broken(f"{RR.shown(self.name)}:{opened} has a brace that never closes")
+        self.take()
+        return {"line": opened, "entries": entries}
+
+
+def pbx_text(value):
+    """A value as one string of its words, so a list is judged as the settings text it spells."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(f"{key} = {pbx_text(item)};" for key, item, _ in value["entries"])
+    return "( " + " ".join(pbx_text(item) for item in value) + " )"
+
+
+def pbx_dicts(value):
+    """Every dictionary in the tree, outermost first."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            yield item
+            stack.extend(child for _, child, _ in reversed(item["entries"]))
+        elif isinstance(item, list):
+            stack.extend(reversed(item))
 
 
 def judge_pbxproj(name, text, found):
     """Every setting in every XCBuildConfiguration, with that configuration's name deciding Debug. A configuration
     name that no XCBuildConfiguration of that name gives an ARCHS or a base xcconfig is refused as missing-archs."""
-    stack, state, pending = [], {"comment": False}, None
+    reader = PbxReader(name, pbx_tokens(text))
+    if reader.peek() != "{":
+        return
     names = {}
-    for number, raw in enumerate(text.splitlines(), 1):
-        line, braces = without_comments(raw, state)
-        if pending:  # a parenthesized list value, read to its close
-            pending["value"] += " " + line
-            if ")" in line:
-                stack[-1]["settings"].append((pending["key"], pending["value"], pending["line"]))
-                pending = None
+    for table in pbx_dicts(reader.value(1)):
+        fields = {key: value for key, value, _ in table["entries"]}
+        if fields.get("isa") != "XCBuildConfiguration":
             continue
-        if not braces and stack:
-            top = stack[-1]
-            if re.search(r"\bisa\s*=\s*XCBuildConfiguration\s*;", line):
-                top["isa"] = True
-            if top["settings_of"] is None and re.search(r"\bbaseConfigurationReference\s*=", line):
-                top["base"] = True
-            named = re.match(r"^\s*name\s*=\s*\"?([^\";]*)\"?\s*;", line)
-            if named:
-                top["name"] = named.group(1)
-            if top["settings_of"] is not None:
-                setting = SETTING.match(line)
-                if setting:
-                    entry = {"key": setting.group("key"), "value": setting.group("value"), "line": number}
-                    if entry["value"].startswith("(") and ")" not in entry["value"]:
-                        pending = entry
-                    else:
-                        top["settings"].append((entry["key"], entry["value"], number))
-            continue
-        for brace, before in braces:
-            if brace == "{":
-                if len(stack) >= MAX_DEPTH:
-                    raise RR.Broken(f"{RR.shown(name)} nests over the {MAX_DEPTH}-brace cap")
-                is_settings = bool(re.search(r"\bbuildSettings\s*=\s*\{$", before))
-                stack.append({"isa": False, "name": None, "settings": [], "base": False, "line": number,
-                              "settings_of": stack[-1] if is_settings and stack else None})
-            elif stack:
-                frame = stack.pop()
-                if frame["settings_of"] is not None:
-                    frame["settings_of"]["settings"].extend(frame["settings"])
-                elif frame["isa"]:
-                    debug = (frame["name"] or "").lower().startswith("debug")
-                    for key, value, line_number in frame["settings"]:
-                        judge_setting(key, value, debug, f"{RR.shown(name)}:{line_number}", found)
-                    first, covered = names.get(frame["name"], (frame["line"], False))
-                    covered = covered or frame["base"] or any(key == "ARCHS" for key, _, _ in frame["settings"])
-                    names[frame["name"]] = (first, covered)
+        label = str(fields.get("name", "")).strip('"')
+        settings = fields.get("buildSettings")
+        settings = [(key.strip('"').split("[", 1)[0], pbx_text(value), line)
+                    for key, value, line in settings["entries"]] if isinstance(settings, dict) else []
+        debug = label.lower().startswith("debug")
+        for key, value, line in settings:
+            judge_setting(key, value, debug, f"{RR.shown(name)}:{line}", found)
+        first, covered = names.get(label, (table["line"], False))
+        names[label] = (first, covered or "baseConfigurationReference" in fields
+                        or any(key == "ARCHS" for key, _, _ in settings))
     for first, covered in names.values():
         if not covered:
             found.add(("missing-archs", f"{RR.shown(name)}:{first}"))

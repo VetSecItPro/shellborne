@@ -11,7 +11,7 @@ never key material:
     [[eddsa]]     an EdDSA key account, probed by a signing attempt
     [[path]]      a named key path, checked with access(R_OK) and lstat, never opened
 
-Lookups run `security` from PATH against the --keychain path, never with -w, -g, -X, -p, an export
+Lookups run /usr/bin/security against the --keychain path, never with -w, -g, -X, -p, an export
 verb or dump-keychain, and keep only the exit status: 0 reachable, 44 unreachable, anything else
 broken. The signer runs as `<signer> --account <account> <fixture>` on a copy of the fixture in a
 temp folder that is deleted; its output is discarded unread. Exit 0 is reachable, exit 1 is
@@ -20,7 +20,7 @@ prompt that waits) is broken.
 
 Codesigning identities in --keychain are listed with `security find-identity -p codesigning <keychain>`,
 without -v, because codesign still signs with an identity that list would hide as untrusted. Each listed
-identity makes a real codesign attempt, codesign found on PATH, on a copy of the fixture in a temp folder:
+identity makes a real codesign attempt, with /usr/bin/codesign, on a copy of the fixture in a temp folder:
 `codesign --keychain <keychain> -s <hash> -f <copy>`, its output discarded unread. An identity whose name
 starts with shellborne-keyreach-control- is the control, set up once by the owner in --keychain, and must
 sign, or the run is broken; any other identity that signs is reachable. This tool never creates, imports or
@@ -37,10 +37,17 @@ unreachable and the run is broken, never a pass.
 
 Exit 0 nothing reachable, 1 something reachable, 2 broken. This tool never receives, prints, logs or
 stores a byte of a key, of the signer's output or of a probed file. A program that cannot be started is
-broken.
+broken, and so is any unexpected error, so no fault can read as reachable.
+
+security and codesign are named by absolute path and are never looked up on PATH, so a program placed earlier on
+PATH cannot answer for them. The only stand-in is the module constants SECURITY and CODESIGN, which a test sets
+after loading this file as a module; no environment variable or argument moves them. A named key path whose
+folder the account cannot search (lstat fails with EACCES or EPERM) is unreachable. Once the first signal or the
+end of the probes is reached, SIGINT, SIGTERM and SIGHUP are ignored until every planted control is removed.
 Plan-Step: P0.11.12
 """
 import argparse
+import errno
 import os
 import pathlib
 import re
@@ -53,6 +60,9 @@ import tempfile
 import tomllib
 
 CONTROL_PREFIX = "shellborne-keyreach-control-"
+SECURITY = "/usr/bin/security"
+CODESIGN = "/usr/bin/codesign"
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 FIXTURE = pathlib.Path(__file__).resolve().parent / "sign-probe-fixture.txt"
 NOT_FOUND = 44
 DEFAULT_TIMEOUT = 30.0
@@ -79,7 +89,13 @@ def say(line):
     print(f"key-reach-check: {line}", flush=True)
 
 
+def ignore_signals():
+    for number in SIGNALS:
+        signal.signal(number, signal.SIG_IGN)
+
+
 def stop(signum, _frame):
+    ignore_signals()  # a second signal while this one unwinds and the controls are removed changes nothing
     raise Stopped(f"stopped by signal {signum}")
 
 
@@ -227,8 +243,8 @@ class Probe:
         for service, account in self.planted:
             try:
                 status = self.security_status("delete-generic-password", "-s", service, "-a", account)
-            except Broken as error:
-                failures.append(str(error))
+            except (Broken, OSError) as error:
+                failures.append(str(error) if isinstance(error, Broken) else "could not remove a control item")
                 continue
             if status not in (0, NOT_FOUND):
                 failures.append(f"could not remove the control {service} (security exit {status})")
@@ -307,6 +323,8 @@ def path_reachable(path):
     except FileNotFoundError:
         return False
     except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM):  # a folder this account cannot search: the key is out of reach
+            return False
         raise Broken(f"lstat failed on a named path: {error.strerror}") from None
     return os.access(path, os.R_OK)
 
@@ -361,6 +379,14 @@ def check(args, probe, entries):
 
 
 def main(argv):
+    try:
+        return run(argv)
+    except Exception as error:  # an uncaught exception exits 1, which this tool defines as "something reachable"
+        say(f"broken: an unexpected {type(error).__name__} ended the run")
+        return 2
+
+
+def run(argv):
     parser = argparse.ArgumentParser(prog="key-reach-check", add_help=True)
     parser.add_argument("--keychain", required=True)
     parser.add_argument("--names", required=True)
@@ -379,16 +405,14 @@ def main(argv):
     except Broken as error:
         say(f"broken: {error}")
         return 2
-    security = shutil.which("security")
-    if not security:
-        say("broken: security(1) is not on PATH")
+    if not os.access(SECURITY, os.X_OK):
+        say("broken: /usr/bin/security is not an executable file")
         return 2
     if not os.access(args.signer, os.X_OK):
         say("broken: the signer is not an executable file")
         return 2
-    codesign = shutil.which("codesign")
-    if not codesign:
-        say("broken: codesign(1) is not on PATH")
+    if not os.access(CODESIGN, os.X_OK):
+        say("broken: /usr/bin/codesign is not an executable file")
         return 2
     if not os.path.isfile(args.keychain):
         say("broken: the --keychain path is not a file, and security would list it as empty")
@@ -396,8 +420,8 @@ def main(argv):
     if not FIXTURE.is_file():
         say("broken: the signing fixture is missing")
         return 2
-    probe = Probe(security, args.keychain, args.signer, codesign, args.timeout)
-    previous = {number: signal.signal(number, stop) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    probe = Probe(SECURITY, args.keychain, args.signer, CODESIGN, args.timeout)
+    previous = {number: signal.signal(number, stop) for number in SIGNALS}
     problems = []
     found = []
     try:
@@ -406,7 +430,10 @@ def main(argv):
         problems.append(str(error))
     except OSError as error:
         problems.append(f"an operating system call failed: {error.strerror}")
+    except Exception as error:  # nothing unexpected may escape: an uncaught exception exits 1, which means reachable
+        problems.append(f"an unexpected {type(error).__name__} ended the run")
     finally:
+        ignore_signals()
         problems += probe.remove_planted()
         for number, handler in previous.items():
             signal.signal(number, handler)

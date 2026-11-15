@@ -6,15 +6,17 @@
 # A download: refused unless a checksum verification follows it in the same file. A git fetch from the
 # repository's own origin is not a download.
 [downloads]
-commands = ["curl", "wget", "git clone", "git fetch"]
+commands = ["curl", "wget", "git clone", "git fetch", "git pull"]
 
 # A checksum verification that counts after a download.
 [checksums]
 commands = ["sha256sum -c", "sha256sum --check", "shasum -a 256 -c", "shasum -a 256 --check",
             "shasum --algorithm 256 -c", "shasum --algorithm 256 --check"]
 
-# A cargo command that resolves dependencies: refused without one of the locked flags.
+# A cargo command that resolves dependencies: refused without one of the locked flags. Cargo's built-in
+# one-letter aliases (b, c, t, r, d) are the same commands as build, check, test, run and doc.
 [builds]
 commands = ["cargo build", "cargo test", "cargo clippy", "cargo install", "cargo run", "cargo check",
-            "cargo bench", "cargo doc", "cargo nextest"]
+            "cargo bench", "cargo doc", "cargo nextest", "cargo b", "cargo c", "cargo t", "cargo r", "cargo d",
+            "cargo fetch", "cargo update", "cargo package", "cargo publish", "cargo fix"]
 locked = ["--locked", "--frozen"]

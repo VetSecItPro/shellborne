@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
-"""Launch gate: no launch or config-writing code path holds a harness bypass flag or permission key (plan step
-P0.11.8).
+"""Launch gate: no tracked source holds a harness bypass flag, an auto-approval option or environment variable, and
+no launch or config-writing code path holds a harness permission key (plan step P0.11.8).
 
 Usage: bypass-flags [--tables-from <ref>] <repo>
 
 Reads bypass-flags.toml beside this file, or with --tables-from from tools/gates/ at that commit of the repository
-(git cat-file blob <ref>:tools/gates/bypass-flags.toml), so a branch cannot drop a flag or a path from its own list.
-The table holds flags (each harness's exact flag strings), keys (the permission keys) and launch_paths (the launch
-and config-writing paths: a folder ends in /, anything else is one exact file, never a wildcard). It refuses:
-  - bypass-flag: a listed flag string in a tracked file under a launch path;
-  - permission-key: a listed permission key in a tracked file under a launch path.
-A match is the exact string with no letter, digit, underscore or hyphen on either side, so a longer flag that starts
-with a listed one passes. Only launch paths are read: the same string in adapter display code, which shows the mode a
-harness reports, passes. Shellborne runs the person's exact command and never adds one of these strings itself.
+(git cat-file blob <ref>:tools/gates/bypass-flags.toml), so a branch cannot drop a flag, a path or an allowlist
+entry from its own list. The table holds
+  flags: each harness's exact flag strings; short_flags: single-dash flags, matched as a whole argument or word;
+  options: an option and the values that grant approval, as [[options]] with option and values, matched as
+    option=value or as the option followed by the value in the next argument; env_words: words that make an
+    environment variable name (upper case, digits and underscores) grant skip-permission or auto-approval;
+  keys: the permission keys; launch_paths: the launch and config-writing paths where keys are refused (a folder ends
+    in /, anything else is one exact file, never a wildcard);
+  allow: [[allow]] entries with path (same form as a launch path) and a reason of real words, for display-only or
+    test-fixture files that may name a flag.
+It refuses, in every tracked Rust, Swift, C-family, shell, Python, JavaScript and TypeScript, TOML, JSON and YAML file
+(a file with no extension is read when it starts with #!) that no allow entry covers:
+  - bypass-flag: a listed flag, short flag, option with a listed value, or environment word;
+and in a file under a launch path:
+  - permission-key: a listed permission key.
+A flag or key matches as the exact string with no letter, digit, underscore or hyphen on either side, so a longer
+flag that starts with a listed one passes. Comments are blanked before matching (// and /* */ in C-family, Rust,
+Swift and JavaScript code, # in shell, Python, TOML and YAML), strings stay, so a comment that says the product never
+adds a flag passes and a flag in a string is found. Shellborne runs the person's exact command and never adds one
+of these strings itself.
 
 Files are listed and read through the repo-rules reader, with its caps: tracked regular files only, opened without
-following a link, 2 MiB each; a symlink or special file breaks the run, and so does a file under a launch path that
-is not UTF-8 text. A refusal names the rule and file:line and never prints source; at most the first 1000 are
-printed and the rest counted. Each run first proves the gate refuses a seeded launch line holding each listed flag
-and each listed key; if one is not refused, the gate is broken. Limit: a flag built from fragments is not caught.
+following a link, 2 MiB each; a symlink or special file breaks the run, and so does a scanned file that is not UTF-8
+text. A refusal names the rule and file:line and never prints source; at most the first 1000 are printed and the rest
+counted. Each run first proves the gate refuses a seeded launch line holding each listed form and each listed key,
+and passes a flag inside a comment; if not, the gate is broken. Limits: a flag built from fragments is not caught,
+and a comment marker inside a string the scan cannot pair is read as code (the safe direction).
 Exit 0 clean, 1 refused, 2 broken; a missing, malformed or empty table is broken.
 """
 import importlib.machinery
@@ -42,6 +55,19 @@ REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 STRING = re.compile(r"[A-Za-z0-9._:=/-]{2,200}")
 PREFIX = re.compile(r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?")
 SHAPE = ("flags", "keys", "launch_paths")
+OPTIONAL = ("short_flags", "options", "env_words", "allow")
+SHORT = re.compile(r"-[A-Za-z0-9]")
+VALUE = re.compile(r"[A-Za-z0-9._:-]{1,60}")
+WORD = re.compile(r"[A-Z][A-Z0-9_]{2,60}")
+SLASH_STYLES = {".rs": "rust", ".swift": "rust", ".c": "c", ".h": "c", ".cc": "c", ".cpp": "c", ".hpp": "c",
+                ".m": "c", ".mm": "c", ".js": "js", ".mjs": "js", ".cjs": "js", ".ts": "js", ".tsx": "js",
+                ".jsx": "js"}
+HASH_STYLES = {".sh": "hash", ".bash": "hash", ".zsh": "hash", ".py": "hash", ".toml": "hash", ".yaml": "hash",
+               ".yml": "hash", ".json": "plain"}
+STYLES = {**SLASH_STYLES, **HASH_STYLES}
+# Between an option and its value: an equals sign, or the end of one argument and the start of the next, in a
+# string list, a shell line or a chain of arg calls.
+JOIN = r"(?:=[\"'`]?|[\s\"'`,)\].;]*(?:[A-Za-z_][A-Za-z0-9_.]*\()?[\s\"'`,(\[]*)"
 
 
 def reader():
@@ -83,51 +109,182 @@ def exact(text):
     return re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(text) + r"(?![A-Za-z0-9_-])")
 
 
+def list_of(rr, data, field, form):
+    values = data[field]
+    if (not isinstance(values, list) or not values or len(values) > MAX_ENTRIES
+            or not all(isinstance(v, str) and form.fullmatch(v) for v in values)):
+        raise rr.Broken(f"{TABLE_NAME}: {field} must be a non-empty list of exact strings, with no wildcard, "
+                        "and an empty list cannot fail")
+    return values
+
+
+def tables_of(rr, data, field, keys):
+    values = data[field]
+    if (not isinstance(values, list) or not values or len(values) > MAX_ENTRIES
+            or not all(isinstance(v, dict) and set(v) == set(keys) for v in values)):
+        raise rr.Broken(f"{TABLE_NAME}: {field} must be a non-empty list of tables holding exactly {', '.join(keys)}")
+    return values
+
+
 def load_table(rr, raw):
     try:
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise rr.Broken(f"{TABLE_NAME} is malformed: {type(error).__name__}")
-    if set(data) != set(SHAPE):
-        raise rr.Broken(f"{TABLE_NAME} must hold exactly flags, keys and launch_paths")
-    for field, form in (("flags", STRING), ("keys", STRING), ("launch_paths", PREFIX)):
-        values = data[field]
-        if (not isinstance(values, list) or not values or len(values) > MAX_ENTRIES
-                or not all(isinstance(v, str) and form.fullmatch(v) for v in values)):
-            raise rr.Broken(f"{TABLE_NAME}: {field} must be a non-empty list of exact strings, with no wildcard, "
-                            "and an empty list cannot fail")
-    if any(".." in path.split("/") for path in data["launch_paths"]):
+    if not set(SHAPE) <= set(data) or set(data) - set(SHAPE) - set(OPTIONAL):
+        raise rr.Broken(f"{TABLE_NAME} must hold flags, keys and launch_paths, and may hold only "
+                        + ", ".join(OPTIONAL) + " besides")
+    flags, keys = list_of(rr, data, "flags", STRING), list_of(rr, data, "keys", STRING)
+    launch = list_of(rr, data, "launch_paths", PREFIX)
+    shorts = list_of(rr, data, "short_flags", SHORT) if "short_flags" in data else []
+    words = list_of(rr, data, "env_words", WORD) if "env_words" in data else []
+    pairs = []
+    for item in tables_of(rr, data, "options", ("option", "values")) if "options" in data else []:
+        if not isinstance(item["option"], str) or not STRING.fullmatch(item["option"]):
+            raise rr.Broken(f"{TABLE_NAME}: an option must be an exact string")
+        pairs += [(item["option"], value) for value in list_of(rr, item, "values", VALUE)]
+    allowed = []
+    for item in tables_of(rr, data, "allow", ("path", "reason")) if "allow" in data else []:
+        path, reason = item["path"], item["reason"]
+        if not isinstance(path, str) or not PREFIX.fullmatch(path) or ".." in path.split("/"):
+            raise rr.Broken(f"{TABLE_NAME}: an allow path must be a folder ending in / or one exact file, "
+                            "with no wildcard and no climbing")
+        said = re.findall(r"[A-Za-z]{2,}", reason) if isinstance(reason, str) else []
+        if len(said) < 2 or any(word.lower() in rr.PLACEHOLDERS for word in said):
+            raise rr.Broken(f"{TABLE_NAME}: the allow entry for {rr.shown(path)} needs a stated reason in real words")
+        allowed.append(path)
+    if any(".." in path.split("/") for path in launch):
         raise rr.Broken(f"{TABLE_NAME}: a launch path climbs out of the tree")
-    rules = [("bypass-flag", text, exact(text)) for text in data["flags"]]
-    rules += [("permission-key", text, exact(text)) for text in data["keys"]]
-    return rules, data["launch_paths"]
+    rules = [("bypass-flag", text, exact(text)) for text in flags]
+    rules += [("bypass-flag", text, re.compile(r"(?<![^\s\"'`,(\[])" + re.escape(text) + r"(?![^\s\"'`,)\];])"))
+              for text in shorts]
+    rules += [("bypass-flag", f"{option} {value}",
+               re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(option) + JOIN + exact(value).pattern))
+              for option, value in pairs]
+    rules += [("bypass-flag", word, re.compile(r"(?<![A-Za-z0-9_])(?:[A-Z0-9]+_)*" + re.escape(word)
+                                               + r"(?:_[A-Z0-9]+)*(?![A-Za-z0-9_])")) for word in words]
+    rules += [("permission-key", text, exact(text)) for text in keys]
+    return rules, launch, allowed
 
 
-def judge(text, rules):
-    """(rule, line) for each listed string in one launch-path file."""
+def style_of(rr, repo, name):
+    """The comment style of a tracked file, or None when the gate does not read it as source."""
+    suffix = pathlib.PurePosixPath(name).suffix.lower()
+    if suffix in STYLES:
+        return STYLES[suffix]
+    if not suffix and rr.starts_with_shebang(repo, name):
+        return "hash"
+    return None
+
+
+def blank_comments(text, style):
+    """The text with every comment replaced by spaces, newlines kept so line numbers stay true. Strings stay, since
+    flags live in strings. A quote the scan cannot pair leaves the rest as code, so a doubtful marker never hides a
+    flag."""
+    if style not in ("rust", "c", "js", "hash"):
+        return text
+    out, index, size = [], 0, len(text)
+    quote, depth, slash = None, 0, style != "hash"
+    quotes = ('"', "'", "`") if style == "js" else ('"', "'") if style == "hash" else ('"',)
+    while index < size:
+        char = text[index]
+        if depth:
+            if style == "rust" and text.startswith("/*", index):
+                depth += 1
+                out.append("  ")
+                index += 2
+            elif text.startswith("*/", index):
+                depth -= 1
+                out.append("  ")
+                index += 2
+            else:
+                out.append("\n" if char == "\n" else " ")
+                index += 1
+        elif quote:
+            out.append(char)
+            if char == "\\" and not (style == "hash" and quote == "'"):
+                if index + 1 < size:
+                    out.append(text[index + 1])
+                index += 1
+            elif char == quote:
+                quote = None
+            index += 1
+        elif char in quotes:
+            if style in ("rust", "c") and text.startswith("'\"'", index):
+                out.append("'\"'")
+                index += 3
+                continue
+            quote = char
+            out.append(char)
+            index += 1
+        elif slash and text.startswith("//", index) or (
+                not slash and char == "#" and (index == 0 or text[index - 1] in " \t\r\n;")):
+            end = text.find("\n", index)
+            end = size if end < 0 else end
+            out.append(" " * (end - index))
+            index = end
+        elif slash and text.startswith("/*", index):
+            depth = 1
+            out.append("  ")
+            index += 2
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def judge(text, rules, style="rust", keys=True, flags=True):
+    """(rule, line) for each listed string in one file, after comments are blanked. keys is False outside a launch
+    path and flags is False for an allowlisted file."""
     found = set()
-    for number, line in enumerate(text.splitlines(), 1):
-        for rule, _, pattern in rules:
-            if pattern.search(line):
-                found.add((rule, number))
+    text = blank_comments(text, style)
+    for rule, _, pattern in rules:
+        if rule == "permission-key" and not keys or rule == "bypass-flag" and not flags:
+            continue
+        for match in pattern.finditer(text):
+            found.add((rule, text.count("\n", 0, match.start()) + 1))
     return sorted(found, key=lambda item: (item[1], item[0]))
 
 
+def seeded(rules, planted):
+    """(label, rule, seeded source) for each listed string: a line that must be refused by its own rule."""
+    flag_line, key_line = CONTROL
+    for rule, text, pattern in rules:
+        if rule == "permission-key":
+            yield text, rule, key_line.replace("{key}", text)
+        elif " " in text:  # an option and a value: joined by = and by the next argument
+            option, value = text.split(" ", 1)
+            yield text, rule, flag_line.replace(planted.group(1), f"{option}={value}")
+            yield text, rule, flag_line.replace(planted.group(0), f'"{option}", "{value}"')
+        elif text.isupper() and re.fullmatch(r"[A-Z][A-Z0-9_]*", text) and not text.startswith("-"):
+            yield text, rule, f'    cmd.env("X_{text}_Y", "1");\n'
+        elif text.startswith("--"):
+            yield text, rule, flag_line.replace(planted.group(1), text)
+        else:
+            yield text, rule, flag_line.replace(planted.group(0), f'"{text}"')
+
+
 def prove_controls(rr, rules):
-    """A seeded launch line holding each listed flag, and one holding each listed key, must be refused by its own
-    rule, or the gate cannot fail and is broken."""
+    """A seeded launch line holding each listed string must be refused by its own rule, a flag named only in a
+    comment must pass, and a flag in a string beside a comment marker must still be refused, or the gate cannot
+    fail and is broken."""
     if not isinstance(CONTROL, tuple) or len(CONTROL) != 2 or not all(isinstance(part, str) for part in CONTROL):
         raise rr.Broken("the seeded control is not a launch line and a config line, so this gate cannot fail")
-    flag_line, key_line = CONTROL
+    flag_line = CONTROL[0]
     planted = re.search(r'"(--[^"]+)"', flag_line)
     if not planted:
         raise rr.Broken("the seeded launch line plants no flag, so this gate cannot fail")
-    for rule, text, _ in rules:
-        line = flag_line.replace(planted.group(1), text) if rule == "bypass-flag" else key_line.replace("{key}", text)
-        if (rule, 1) not in judge(line, rules):
+    for label, rule, source in seeded(rules, planted):
+        if (rule, 1) not in judge(source, rules):
             raise rr.Broken(f"the seeded {rule} control was not refused, so this gate cannot fail")
     if ("bypass-flag", 1) not in judge(flag_line, rules):
         raise rr.Broken("the seeded launch line was not refused, so this gate cannot fail")
+    for style, mark in (("rust", "//"), ("hash", "#")):
+        if judge(mark + " never" + flag_line.strip(), rules, style):
+            raise rr.Broken("a flag named in a comment was refused, so this gate would refuse honest comments")
+        quoted = f'let a = ["{mark}x",' + flag_line.strip().split(",", 1)[1].rstrip("]") + "]\n"
+        if ("bypass-flag", 1) not in judge(quoted, rules, style):
+            raise rr.Broken("a flag beside a comment marker in a string was not refused, so this gate cannot fail")
     print(f"{GATE}: control bypass-flag and permission-key refused as expected")
 
 
@@ -144,14 +301,18 @@ def main(argv):
         if len(args) != 1 or args[0].startswith("-"):
             raise rr.Broken(f"usage: {GATE} [--tables-from <ref>] <repo>")
         repo = args[0]
-        rules, paths = load_table(rr, table_bytes(rr, repo, ref))
+        rules, paths, allowed = load_table(rr, table_bytes(rr, repo, ref))
         prove_controls(rr, rules)
         found = rr.Collected()
         for name in rr.tracked(repo):
             rr.kind_check(repo, name)  # a symlink or special file breaks the run whatever its name
-            if not rr.allowed_at(name, paths):
+            style = style_of(rr, repo, name)
+            launch = rr.allowed_at(name, paths)
+            # the table itself defines the strings, so it is never read for flags
+            flags = name != f"tools/gates/{TABLE_NAME}" and not rr.allowed_at(name, allowed)
+            if not launch and not (flags and style):
                 continue
-            for rule, line in judge(rr.read_source(repo, name), rules):
+            for rule, line in judge(rr.read_source(repo, name), rules, style or "plain", launch, flags):
                 found.add(f"{rule}: {rr.shown(name)}:{line}")
     except rr.Broken as error:
         print(f"{GATE}: broken: {error}", file=sys.stderr)

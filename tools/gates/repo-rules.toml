@@ -156,25 +156,31 @@ control = 'let ok = NSButton(title: "OK", target: nil, action: nil)'
 id = "wait-on-cooperative-thread"
 enforces = "no Swift code blocks a thread on a semaphore, group or condition wait, or a thread sleep"
 suffixes = [".swift"]
-patterns = ['\.\s*wait\s*\(', '\bdispatch_(?:semaphore|group)_wait\b', '\bpthread_cond_(?:timed)?wait\b',
-            '\bThread\s*\.\s*sleep\b']
+patterns = ['\.\s*wait\w*\s*\(', '\bdispatch_(?:semaphore|group)_wait\b', '\bpthread_cond_(?:timed)?wait\b',
+            '\bThread\s*\.\s*sleep\b', '\bRunLoop\b.*\.run\s*\(']
 allowed = []
 control = "DispatchSemaphore(value: 0).wait()"
+controls = ["p.waitUntilExit()", "dispatch_group_wait(group, DISPATCH_TIME_FOREVER)", "pthread_cond_wait(&cond, &mutex)",
+            "Thread.sleep(forTimeInterval: 0.5)", "RunLoop.current.run(until: .distantFuture)"]
 
 # A lock or a synchronous queue hop is refused in main-isolated Swift: every file under the within folders, and any
-# other Swift file that names @MainActor anywhere (within_marker).
+# other Swift file that names MainActor or DispatchQueue.main anywhere (within_marker). A rule with a controls list
+# must have every pattern match its control or one of its controls.
 [[rule]]
 id = "lock-on-main-isolated-code"
 enforces = "main-isolated Swift takes no lock and makes no synchronous queue hop"
 suffixes = [".swift"]
-patterns = ['\bNS(?:Recursive)?Lock\b', '\bos_unfair_lock\w*', '\bOSAllocatedUnfairLock\b', '\bMutex\b',
-            '\bpthread_mutex_(?:lock|trylock)\b', '\bobjc_sync_enter\b', '@synchronized\b', '\.\s*withLock\w*',
-            '\.\s*sync\s*[({]']
+patterns = ['\bNS(?:Recursive)?Lock\b', '\bNSCondition(?:Lock)?\b', '\bos_unfair_lock\w*', '\bOSAllocatedUnfairLock\b', '\bMutex\b',
+            '\bpthread_mutex_(?:lock|trylock)\b', '\bpthread_rwlock_\w*lock', '\bobjc_sync_enter\b', '@synchronized\b',
+            '\.\s*withLock\w*', '\.\s*(?:sync|asyncAndWait)\s*[({]']
 allowed = []
 within = ["apple/Sources/PlatformShell/", "apple/Sources/TerminalView/", "apple/Sources/DesignSystem/",
           "apple/Sources/FeaturePlaceholder/"]
-within_marker = '@MainActor\b'
+within_marker = '\bMainActor\b|DispatchQueue\s*\.\s*main\b'
 control = "@MainActor final class Box { let lock = NSLock() }"
+controls = ["let c = NSConditionLock(condition: 0)", "var raw = os_unfair_lock()", "let state = OSAllocatedUnfairLock(initialState: 0)",
+            "let state = Mutex<Int>(0)", "pthread_mutex_lock(&m)", "pthread_rwlock_wrlock(&rw)", "objc_sync_enter(self)",
+            "@synchronized (self) { }", "box.withLock { $0 += 1 }", "q.asyncAndWait {}", "q.sync { }"]
 
 # Launch Services and Apple Events (plan step P0.11.7). Shellborne registers no URL scheme, at build time or at run
 # time, and installs no handler for the get-URL Apple Event; no path is allowed.

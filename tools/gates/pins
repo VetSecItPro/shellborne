@@ -6,8 +6,9 @@ Usage: pins [--tables-from <ref>] <repo>
 
 Reads the tracked files of <repo> and refuses:
   - cargo-git-rev: a Cargo git dependency, in any dependency, workspace, target, patch or replace table, without a
-    rev of exactly 40 lowercase hex characters;
-  - swiftpm-requirement: a remote .package( requirement in a Package.swift other than exact or revision;
+    rev of exactly 40 lowercase hex characters; the patch tables of every tracked .cargo/config(.toml) count too;
+  - cargo-source: a [source.*] table with replace-with in a tracked .cargo/config(.toml);
+  - swiftpm-requirement: a remote .package( requirement in a Package.swift other than exact or a revision of exactly 40 lowercase hex characters, judged with string contents blanked;
   - missing-lockfile: a Cargo workspace root, or a crate outside any workspace that no other manifest names as a
     path dependency, with no tracked Cargo.lock beside it; a Package.swift with a remote dependency and no
     tracked Package.resolved beside it;
@@ -30,7 +31,12 @@ proves every word refuses its own seeded line and passes its own verified or loc
 breaks the run.
 
 A build script is a tracked .sh, .bash, .zsh or .mk file, a Makefile or justfile, or a file with a shell shebang.
-Workflow commands are read from run: values only. This gate reads text; it never builds, runs repository code or
+Workflow commands are read from run: values only, line by line: a multi-line YAML scalar or a flow-mapping run
+value is not joined into one command (a known limit, scheduled). A cargo command is judged on its masked text (no
+comment, no quoted string) cut at the first bare --, so a flag in a comment or in a binary's own arguments is not a
+locked flag; cargo global options and a +toolchain may stand before the subcommand. A tracked .cargo/config or
+.cargo/config.toml is read like a manifest: a patch table needs a 40-hex rev, and a [source.*] table with
+replace-with is refused (cargo-source). This gate reads text; it never builds, runs repository code or
 uses the network, and it does not read a dependency's own build script. Files are listed and read through the
 repo-rules reader, with its caps: tracked regular files only, never through a link, 2 MiB each. A refusal names the
 rule and file:line, never the source. Exit 0 clean, 1 refused, 2 broken; a missing, malformed or empty table, a
@@ -61,9 +67,13 @@ COMMAND_PREFIXES = {"if", "then", "do", "else", "elif", "while", "until", "!", "
                     "exec"}
 CURL_OUTPUT = {"-o", "--output"}
 WGET_OUTPUT = {"-O", "--output-document"}
-# git fetch options that take their value as the next word, so it is not read as the remote.
-FETCH_VALUE_OPTIONS = {"--depth", "--deepen", "--shallow-since", "--shallow-exclude", "--negotiation-tip", "--refmap",
-                       "-o", "--server-option", "-j", "--jobs", "--upload-pack", "--recurse-submodules-default"}
+# git fetch and pull options that take their value as the next word, so it is not read as the remote.
+FETCH_VALUE_OPTIONS = {"-s", "--strategy", "-X", "--strategy-option", "--depth", "--deepen", "--shallow-since",
+                       "--shallow-exclude", "--negotiation-tip", "--refmap", "-o", "--server-option", "-j", "--jobs", "--upload-pack", "--recurse-submodules-default"}
+# A path that may lead a command word: absolute, home or relative with a dot, never a bare URL part.
+PATH_PREFIX = r"(?:(?:\.{1,2}|~)?/[^\s;&|()\"'`]*)?"
+# A +toolchain or an option, with an optional value, between a command and its subcommand.
+OPTIONS = r"(?:\s+(?:\+\S+|--?[A-Za-z][\w-]*(?:=[^\s;&|]+)?(?:\s+(?!-)[^\s;&|]+)?))*"
 CONTROL_URL = "https://example.invalid/control.tgz"
 CONTROL_FILE = "control.tgz"
 CONTROL_HASH = "0" * 64
@@ -84,12 +94,13 @@ class Broken(Exception):
 
 
 def word_pattern(command):
-    """A command phrase as whole words, any run of white space between them, a cargo toolchain or a one-letter
-    option with its value allowed between the first word and the rest (git -C dir fetch is git fetch)."""
+    """A command phrase as whole words, any run of white space between them. A path may lead the first word
+    (/usr/bin/curl), and a toolchain or any number of options with an optional value may stand between the first
+    word and the rest (git -C dir fetch is git fetch; cargo -v build is cargo build)."""
     words = command.split()
-    between = r"(?:\s+(?:\+\S+|-[A-Za-z]\s+\S+))*" if len(words) > 1 else ""
+    between = OPTIONS if len(words) > 1 else ""
     body = re.escape(words[0]) + between + "".join(r"\s+" + re.escape(word) for word in words[1:])
-    return re.compile(r"(?<![\w./-])" + body + r"(?![\w-])")
+    return re.compile(r"(?<![\w./:-])" + PATH_PREFIX + body + r"(?![\w.-])")
 
 
 def load_rules(text):
@@ -256,12 +267,15 @@ def command_findings(lines, rules):
         masked, code = shell_mask(text)
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
-                rest = segment_after(text, match.end()).split()
+                source = masked if masked[match.start()] == text[match.start()] else code  # a quoted command
+                rest = segment_after(source, match.end()).split()
+                rest = rest[:rest.index("--")] if "--" in rest else rest  # after -- the words are the binary's
+                rest = [word.strip("\"'") for word in rest]
                 if not any(word == flag or word.startswith(flag + "=") for word in rest for flag in rules["locked"]):
                     found.append(("unlocked-build", number))
         for word, pattern in rules["downloads"]:
             for match in pattern.finditer(text):
-                if word == "git fetch" and fetch_from_origin(segment_after(text, match.end())):
+                if word in ("git fetch", "git pull") and fetch_from_origin(segment_after(text, match.end())):
                     continue
                 downloads.append((number, match.end(), download_name(word, segment_after(code, match.end()))))
         for pattern in rules["checksums"]:
@@ -390,7 +404,35 @@ def dependency_tables(data):
     yield ("replace",), data.get("replace")
 
 
+def is_cargo_config(name):
+    path = pathlib.PurePosixPath(name)
+    return path.name in ("config", "config.toml") and path.parent.name == ".cargo"
+
+
+def check_cargo_config(rr, repo, names, findings):
+    """A tracked .cargo/config(.toml): its patch tables are judged like a manifest's, and a source replacement is
+    refused, because it changes where every dependency comes from."""
+    for name in filter(is_cargo_config, names):
+        text = rr.read_source(repo, name)
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            raise Broken(f"{rr.shown(name)} is not valid TOML")
+        patches = data.get("patch")
+        for registry, table in (patches.items() if isinstance(patches, dict) else []):
+            for dependency, spec in (table.items() if isinstance(table, dict) else []):
+                if isinstance(spec, dict) and "git" in spec and not REVISION.match(str(spec.get("rev", ""))):
+                    where = ("patch", registry, dependency)
+                    findings.append(("cargo-git-rev", f"{rr.shown(name)}:{locate(text, where)}"))
+        sources = data.get("source")
+        for source, table in (sources.items() if isinstance(sources, dict) else []):
+            if isinstance(table, dict) and "replace-with" in table:
+                findings.append(("cargo-source", f"{rr.shown(name)}:{locate(text, ('source', source, 'replace-with'))} "
+                                                 "(a source replacement)"))
+
+
 def check_cargo(rr, repo, names, findings):
+    check_cargo_config(rr, repo, names, findings)
     tracked = set(names)
     manifests = {}
     for name in names:
@@ -452,6 +494,37 @@ def swift_blank(text):
     return "".join(out)
 
 
+def blank_strings(text):
+    """The text with the inside of every string literal blanked, quotes and length kept."""
+    out, index, quote = [], 0, False
+    while index < len(text):
+        char = text[index]
+        if quote and char == "\\" and index + 1 < len(text):
+            out.append("  ")
+            index += 2
+            continue
+        if char == '"':
+            quote = not quote
+            out.append(char)
+        else:
+            out.append(" " if quote and char != "\n" else char)
+        index += 1
+    return "".join(out)
+
+
+def revision_problem(arguments, blanked):
+    """True when a revision requirement in the call holds anything but a literal of 40 lowercase hex characters;
+    the form is found in the blanked text and the value read from the original."""
+    forms = list(re.finditer(r"\brevision\s*:|\.revision\s*\(", blanked))
+    if not forms:
+        return False
+    for form in forms:
+        value = re.match(r"\s*\"([^\"]*)\"", arguments[form.end():])
+        if value and REVISION.match(value.group(1)):
+            return False
+    return True
+
+
 def package_calls(text):
     """(1-based line, argument text) of each .package( call; raises ValueError when one never closes."""
     clean = swift_blank(text)
@@ -485,11 +558,14 @@ def check_swift(rr, repo, names, findings):
             raise Broken(f"cannot read {rr.shown(name)}: {error}")
         remote = False
         for number, arguments in calls:
-            if re.search(r"\bpath\s*:", arguments) and not re.search(r"\burl\s*:", arguments):
+            blanked = blank_strings(arguments)
+            if re.search(r"\bpath\s*:", blanked) and not re.search(r"\burl\s*:", blanked):
                 continue  # a package inside the tree
             remote = True
-            if not re.search(r"\b(?:exact|revision)\s*:|\.(?:exact|revision)\s*\(", arguments):
-                findings.append(("swiftpm-requirement", f"{rr.shown(name)}:{number} (neither exact nor revision)"))
+            if not re.search(r"\bexact\s*:|\.exact\s*\(", blanked) and (
+                    not re.search(r"\brevision\s*:|\.revision\s*\(", blanked) or revision_problem(arguments, blanked)):
+                findings.append(("swiftpm-requirement",
+                                 f"{rr.shown(name)}:{number} (neither exact nor a 40-hex revision)"))
         folder = posixpath.dirname(name)
         resolved = posixpath.join(folder, "Package.resolved") if folder else "Package.resolved"
         if remote and resolved not in tracked:
@@ -595,6 +671,9 @@ def main(argv):
                 findings.append(("docker-digest", f"{rr.shown(name)}:{number} (an image with no sha256 digest)"))
     except (Broken, deps.Broken, rr.Broken) as error:
         print(f"pins: broken: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:  # an unexpected failure is a broken check, never a refusal and never a pass
+        print(f"pins: broken: unexpected {type(error).__name__}", file=sys.stderr)
         return 2
     for kind, where in findings[:MAX_FINDINGS]:
         print(f"pins: refused {kind} {where}", file=sys.stderr)

@@ -67,6 +67,25 @@ scope = "policy"
 ignore_case = false
 pattern = '\b(?:{months}|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b'
 
+# Every month name but May in any case; May stays case-sensitive above so the verb is not refused.
+[[term]]
+name = "month-name-any-case"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:January|February|March|April|June|July|August|September|October|November|December)\b'
+
+[[term]]
+name = "year-and-month"
+scope = "policy"
+ignore_case = false
+pattern = '(?<![\w.-])(?:19|20)\d{2}-(?:0[1-9]|1[0-2])(?![\w-])'
+
+[[term]]
+name = "fiscal-year"
+scope = "policy"
+ignore_case = true
+pattern = '(?<![A-Za-z])FY\s*-?\s*\d{2,4}\b'
+
 [[term]]
 name = "year"
 scope = "policy"
@@ -86,16 +105,29 @@ ignore_case = false
 pattern = '\b\d{1,2}/\d{1,2}/\d{2,4}\b'
 
 [[term]]
+name = "dotted-date"
+scope = "policy"
+ignore_case = false
+pattern = '\b\d{1,2}\.\d{1,2}\.(?:19|20)\d{2}\b'
+
+[[term]]
 name = "duration-in-digits"
 scope = "policy"
 ignore_case = true
-pattern = '\b\d+(?:\.\d+)?\s*-?\s*(?:days?|weeks?|months?|years?|quarters?|decades?)\b'
+pattern = '\b\d+(?:\.\d+)?\s*-?\s*(?:days?|weeks?|wks?|months?|mos?|years?|yrs?|quarters?|decades?|fortnights?)\b'
+
+# A count of hours in the hundreds or more is a calendar span (8760 hours is a year); a 24-hour soak is not.
+[[term]]
+name = "long-hour-count"
+scope = "policy"
+ignore_case = true
+pattern = '\b(?:\d{3,}|\d{1,3}(?:,\d{3})+|hundreds?|thousands?)\s*-?\s*hours?\b'
 
 [[term]]
 name = "duration-in-words"
 scope = "policy"
 ignore_case = true
-pattern = '\b(?:{number}|a|an|eleven|eighteen|twenty|thirty|a couple of|many)\s+(?:days?|weeks?|months?|years?|quarters?|decades?)\b'
+pattern = '\b(?:{number}|a|an|eleven|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|dozen|half|a couple of|couple|many)[\s-]+(?:days?|weeks?|wks?|months?|mos?|years?|yrs?|quarters?|decades?|fortnights?)\b'
 
 [[term]]
 name = "relative-period"
@@ -113,4 +145,4 @@ pattern = '\b(?:spring|summer|autumn|winter)\b'
 name = "period-word"
 scope = "policy"
 ignore_case = true
-pattern = '\b(?:annual(?:ly)?|yearly|monthly|weekly|biannual(?:ly)?|end of (?:the )?(?:year|month|quarter)|target date|sunset date|end date|cutoff date)\b'
+pattern = '\b(?:annual(?:ly)?|yearly|monthly|weekly|biannual(?:ly)?|end of (?:the )?(?:year|month|quarter)|year-?end|EOY|EOQ|EOM|fortnights?|biweekly|semiannual(?:ly)?|target date|sunset date|end date|cutoff date)\b'

@@ -9,7 +9,8 @@ Reads entitlements.toml beside this file, or with --tables-from from tools/gates
 holds always_denied, the keys no binary may carry with any reason, and one [[binary]] entry per binary: its exact
 path under the built folder, its role (app, daemon, attach or helper), its committed plist (a tracked file of the
 repository) and a reason for each key. For each listed binary it reads the signed entitlements and code directory
-flags with codesign -d and refuses:
+flags with codesign -d, once per slice of a universal binary with -a, and refuses (a refusal for a universal binary
+names the slice's architecture after the path):
   - entitlement-mismatch: a key or value that differs from the committed plist in any way, type included;
   - missing-reason: a committed key with no reason, an empty one, or one holding a placeholder word as repo-rules
     defines them, named at the key's line in the plist;
@@ -234,10 +235,19 @@ def prove_controls(rr, denied):
     print(f"{GATE}: control entitlement-mismatch refused as expected")
 
 
-def signed(rr, path, where):
-    """The binary's entitlements and whether its code directory carries the hardened runtime flag."""
+def slices(rr, path, where):
+    """The architectures a Mach-O holds, from the shared reader's lipo read; each slice is signed on its own."""
     try:
-        done = subprocess.run([CODESIGN, "-d", "--verbose=2", "--entitlements", "-", "--xml", str(path)],
+        mo = mach_o_reader()
+        return mo.Reader(MAX_FILES, MAX_BINARY_BYTES, MAX_OUTPUT_BYTES, MAX_SECONDS, place="bundle").archs(path)
+    except Exception as error:  # a reader that cannot load or a file lipo cannot read is broken, never a pass
+        raise rr.Broken(f"cannot list the slices of {rr.shown(where)}: {type(error).__name__}")
+
+
+def signed(rr, path, where, arch):
+    """One slice's entitlements and whether its code directory carries the hardened runtime flag."""
+    try:
+        done = subprocess.run([CODESIGN, "-a", arch, "-d", "--verbose=2", "--entitlements", "-", "--xml", str(path)],
                               capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         raise rr.Broken(f"codesign could not read {rr.shown(where)}")
@@ -301,9 +311,11 @@ def main(argv):
                 raise rr.Broken(f"the committed plist {rr.shown(entry['plist'])} is not tracked")
             text = rr.read_source(repo, entry["plist"])
             committed = entitlements_of(rr, text.encode("utf-8"), entry["plist"])
-            ents, runtime = signed(rr, built / entry["path"], entry["path"])
-            for rule, where in judge(rr, entry, ents, committed, text, runtime, denied):
-                found.add(f"{rule}: {where}")
+            archs = slices(rr, built / entry["path"], entry["path"])
+            for arch in archs:  # each slice carries its own entitlements and flags, so each is judged
+                ents, runtime = signed(rr, built / entry["path"], entry["path"], arch)
+                for rule, where in judge(rr, entry, ents, committed, text, runtime, denied):
+                    found.add(f"{rule}: {where} ({arch})" if len(archs) > 1 else f"{rule}: {where}")
     except rr.Broken as error:
         print(f"{GATE}: broken: {error}", file=sys.stderr)
         return 2
