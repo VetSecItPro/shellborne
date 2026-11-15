@@ -26,8 +26,8 @@ fn zero_cap_is_refused_for_every_type() {
         assert_eq!(BoundedMap::<u8, u8>::new(0, rule).err(), Some(ZeroCap));
         assert_eq!(BoundedSet::<u8>::new(0, rule).err(), Some(ZeroCap));
         assert_eq!(BoundedList::<u8>::new(0, rule).err(), Some(ZeroCap));
+        assert_eq!(ByteRing::new(0, rule).err(), Some(ZeroCap));
     }
-    assert_eq!(ByteRing::new(0).err(), Some(ZeroCap));
 }
 
 #[test]
@@ -48,10 +48,11 @@ fn cap_of_one_is_accepted_and_starts_empty() -> TestResult {
         let list = BoundedList::<u8>::new(1, rule)?;
         assert_eq!((list.cap(), list.len(), list.is_empty()), (1, 0, true));
         assert_eq!(list.evictions(), 0);
+
+        let ring = ByteRing::new(1, rule)?;
+        assert_eq!((ring.cap(), ring.len(), ring.is_empty()), (1, 0, true));
+        assert_eq!(ring.evictions(), 0);
     }
-    let ring = ByteRing::new(1)?;
-    assert_eq!((ring.cap(), ring.len(), ring.is_empty()), (1, 0, true));
-    assert_eq!(ring.evictions(), 0);
     Ok(())
 }
 
@@ -299,9 +300,9 @@ fn set_remove_frees_a_slot_without_counting_an_eviction() -> TestResult {
 
 #[test]
 fn byte_ring_holds_writes_under_the_cap() -> TestResult {
-    let mut ring = ByteRing::new(8)?;
-    assert_eq!(ring.push(b"abc"), 0);
-    assert_eq!(ring.push(b"de"), 0);
+    let mut ring = ByteRing::new(8, Eviction::EvictOldest)?;
+    assert_eq!(ring.push(b"abc"), Ok(0));
+    assert_eq!(ring.push(b"de"), Ok(0));
     assert_eq!(ring.to_vec(), b"abcde".to_vec());
     assert_eq!(ring.len(), 5);
     assert_eq!(ring.evictions(), 0);
@@ -310,13 +311,13 @@ fn byte_ring_holds_writes_under_the_cap() -> TestResult {
 
 #[test]
 fn byte_ring_keeps_the_newest_cap_bytes_after_an_overflow() -> TestResult {
-    let mut ring = ByteRing::new(8)?;
-    assert_eq!(ring.push(b"abcdef"), 0);
-    assert_eq!(ring.push(b"ghijk"), 3);
+    let mut ring = ByteRing::new(8, Eviction::EvictOldest)?;
+    assert_eq!(ring.push(b"abcdef"), Ok(0));
+    assert_eq!(ring.push(b"ghijk"), Ok(3));
     assert_eq!(ring.to_vec(), b"defghijk".to_vec());
     assert_eq!(ring.len(), 8);
     assert_eq!(ring.evictions(), 3);
-    assert_eq!(ring.push(b"lm"), 2);
+    assert_eq!(ring.push(b"lm"), Ok(2));
     assert_eq!(ring.to_vec(), b"fghijklm".to_vec());
     assert_eq!(ring.evictions(), 5);
     Ok(())
@@ -324,9 +325,9 @@ fn byte_ring_keeps_the_newest_cap_bytes_after_an_overflow() -> TestResult {
 
 #[test]
 fn byte_ring_write_longer_than_the_cap_keeps_its_tail() -> TestResult {
-    let mut ring = ByteRing::new(4)?;
-    assert_eq!(ring.push(b"xy"), 0);
-    assert_eq!(ring.push(b"0123456789"), 8);
+    let mut ring = ByteRing::new(4, Eviction::EvictOldest)?;
+    assert_eq!(ring.push(b"xy"), Ok(0));
+    assert_eq!(ring.push(b"0123456789"), Ok(8));
     assert_eq!(ring.to_vec(), b"6789".to_vec());
     assert_eq!(ring.len(), 4);
     assert_eq!(ring.evictions(), 8);
@@ -335,9 +336,9 @@ fn byte_ring_write_longer_than_the_cap_keeps_its_tail() -> TestResult {
 
 #[test]
 fn byte_ring_empty_write_changes_nothing() -> TestResult {
-    let mut ring = ByteRing::new(2)?;
-    assert_eq!(ring.push(b"ab"), 0);
-    assert_eq!(ring.push(b""), 0);
+    let mut ring = ByteRing::new(2, Eviction::EvictOldest)?;
+    assert_eq!(ring.push(b"ab"), Ok(0));
+    assert_eq!(ring.push(b""), Ok(0));
     assert_eq!(ring.to_vec(), b"ab".to_vec());
     assert_eq!(ring.evictions(), 0);
     Ok(())
@@ -401,13 +402,13 @@ fn a_large_cap_does_not_preallocate() -> TestResult {
         );
     }
 
-    let mut ring = ByteRing::new(LARGE_CAP)?;
+    let mut ring = ByteRing::new(LARGE_CAP, Eviction::EvictOldest)?;
     assert!(
         ring.allocated() <= SMALL_ALLOCATION,
         "ring: {}",
         ring.allocated()
     );
-    assert_eq!(ring.push(b"abc"), 0);
+    assert_eq!(ring.push(b"abc"), Ok(0));
     assert!(
         ring.allocated() <= SMALL_ALLOCATION,
         "ring: {}",
