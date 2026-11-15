@@ -29,9 +29,10 @@ Intel support ends when evidence says so. Any single one of these is enough:
 
 ## What you are told
 
-If that happens, you are told in two places: the notes for the last Intel release, and this page. Both name the
-condition that was met and the release that closes Intel support. That release keeps running unchanged on any Intel
-Mac where it is installed. Updates for it stop, and none of its features are taken away.
+If that happens, you are told before the last Intel release ships, never by that release itself. The notes of the
+release before it, and this page, name the condition that was met and say which coming release will be the final one
+for Intel Macs. That final release keeps running unchanged on any Intel Mac where it is installed. Updates for it stop,
+and none of its features are taken away.
 
 tools/gates/term-lint checks this page and refuses wording about calendar dates or lengths of time (Plan-Step
 P0.12.5).
