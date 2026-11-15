@@ -12,6 +12,13 @@ is judged, not only the project-level one, so an override in one target or one c
                                target-triple flag in unsafeFlags, a rustflag, a script or a workflow
     missing-deployment-target  apple/Package.swift untracked, or with no macOS platform
     archs                      an ARCHS that does not name exactly arm64 and x86_64 ($(ARCHS_STANDARD) included)
+    missing-archs              a tracked xcconfig that sets no ARCHS, itself or through an #include of a tracked
+                               xcconfig that does; or a project configuration name (Debug, Release and so on) for
+                               which no XCBuildConfiguration of that name sets ARCHS or takes a base xcconfig. A
+                               target configuration inherits the project one of the same name, so the name is the
+                               unit; the limit is that a target-only ARCHS also covers a sibling target of that
+                               name. A tree with no xcconfig and no project file (SwiftPM only) is left to --stub,
+                               which judges the slices it builds
     excluded-archs             an EXCLUDED_ARCHS naming either slice, conditional or not
     only-active-arch           ONLY_ACTIVE_ARCH = YES outside a Debug configuration
 In an xcconfig or project file the value must be the literal 26; in a script or workflow only a literal value is
@@ -30,6 +37,7 @@ import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import posixpath
 import re
 import stat
 import sys
@@ -54,6 +62,7 @@ MIN_FLAG = re.compile(r"-m(?:macosx|macos)-version-min=[\"']?(?P<v>[^\s\"',)\]]*
 TRIPLE = re.compile(r"\b(?:arm64e?|arm64_32|aarch64|x86_64h?|i386)-apple-macos(?:x)?(?P<v>[0-9][0-9.]*)")
 PLATFORM = re.compile(r"\.macOS\(")
 PLATFORM_FORM = re.compile(r"\.macOS\(\s*(?:\"(?P<s>[^\"\n]*)\"|\.v(?P<v>[0-9]+)(?:_(?P<m>[0-9]+))?)\s*\)")
+INCLUDE = re.compile(r"^\s*#include\??\s+\"(?P<path>[^\"\n]+)\"")
 SETTING = re.compile(r"^\s*\"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P<cond>(?:\[[^\]\n]*\])*)\"?\s*=\s*(?P<value>.*?)\s*;?\s*$")
 
 
@@ -132,15 +141,38 @@ def judge_setting(key, value, debug, where, found):
 
 
 def judge_xcconfig(name, text, found):
+    """Judges each setting. Returns (sets ARCHS, the tracked-name paths it includes)."""
     file_debug = pathlib.PurePosixPath(name).name.lower().startswith("debug")
+    sets_archs, includes = False, []
     for number, raw in enumerate(text.splitlines(), 1):
         line = raw.split("//", 1)[0]
+        included = INCLUDE.match(line)
+        if included:
+            includes.append(posixpath.normpath(posixpath.join(posixpath.dirname(name), included.group("path"))))
+            continue
         setting = SETTING.match(line)
         if not setting or line.lstrip().startswith("#"):
             continue
         cond = setting.group("cond").lower()
         debug = file_debug or "config=debug" in cond
+        if setting.group("key") == "ARCHS":
+            sets_archs = True
         judge_setting(setting.group("key"), setting.group("value"), debug, f"{RR.shown(name)}:{number}", found)
+    return sets_archs, includes
+
+
+def judge_xcconfig_archs(configs, found):
+    """configs maps each tracked xcconfig to (sets ARCHS, includes). One without ARCHS, itself or through a chain of
+    tracked includes, is refused as missing-archs."""
+    def covered(name, seen):
+        if name in seen or name not in configs:
+            return False
+        seen.add(name)
+        sets_archs, includes = configs[name]
+        return sets_archs or any(covered(child, seen) for child in includes)
+    for name in configs:
+        if not covered(name, set()):
+            found.add(("missing-archs", RR.shown(name)))
 
 
 def without_comments(line, state):
@@ -178,8 +210,10 @@ def without_comments(line, state):
 
 
 def judge_pbxproj(name, text, found):
-    """Every setting in every XCBuildConfiguration, with that configuration's name deciding Debug."""
+    """Every setting in every XCBuildConfiguration, with that configuration's name deciding Debug. A configuration
+    name that no XCBuildConfiguration of that name gives an ARCHS or a base xcconfig is refused as missing-archs."""
     stack, state, pending = [], {"comment": False}, None
+    names = {}
     for number, raw in enumerate(text.splitlines(), 1):
         line, braces = without_comments(raw, state)
         if pending:  # a parenthesized list value, read to its close
@@ -192,6 +226,8 @@ def judge_pbxproj(name, text, found):
             top = stack[-1]
             if re.search(r"\bisa\s*=\s*XCBuildConfiguration\s*;", line):
                 top["isa"] = True
+            if top["settings_of"] is None and re.search(r"\bbaseConfigurationReference\s*=", line):
+                top["base"] = True
             named = re.match(r"^\s*name\s*=\s*\"?([^\";]*)\"?\s*;", line)
             if named:
                 top["name"] = named.group(1)
@@ -209,8 +245,8 @@ def judge_pbxproj(name, text, found):
                 if len(stack) >= MAX_DEPTH:
                     raise RR.Broken(f"{RR.shown(name)} nests over the {MAX_DEPTH}-brace cap")
                 is_settings = bool(re.search(r"\bbuildSettings\s*=\s*\{$", before))
-                stack.append({"isa": False, "name": None, "settings": [], "settings_of": stack[-1] if is_settings
-                              and stack else None})
+                stack.append({"isa": False, "name": None, "settings": [], "base": False, "line": number,
+                              "settings_of": stack[-1] if is_settings and stack else None})
             elif stack:
                 frame = stack.pop()
                 if frame["settings_of"] is not None:
@@ -219,6 +255,12 @@ def judge_pbxproj(name, text, found):
                     debug = (frame["name"] or "").lower().startswith("debug")
                     for key, value, line_number in frame["settings"]:
                         judge_setting(key, value, debug, f"{RR.shown(name)}:{line_number}", found)
+                    first, covered = names.get(frame["name"], (frame["line"], False))
+                    covered = covered or frame["base"] or any(key == "ARCHS" for key, _, _ in frame["settings"])
+                    names[frame["name"]] = (first, covered)
+    for first, covered in names.values():
+        if not covered:
+            found.add(("missing-archs", f"{RR.shown(name)}:{first}"))
 
 
 def judge_script(name, text, found):
@@ -244,16 +286,18 @@ def judge_repo(repo, found):
     names = RR.tracked(repo)
     if PACKAGE not in names:
         found.add(("missing-deployment-target", PACKAGE))
+    xcconfigs = {}
     for name in names:
         base = pathlib.PurePosixPath(name).name
         if base == "Package.swift":
             judge_package(name, RR.read_source(repo, name), found)
         elif base.endswith(".xcconfig"):
-            judge_xcconfig(name, RR.read_source(repo, name), found)
+            xcconfigs[name] = judge_xcconfig(name, RR.read_source(repo, name), found)
         elif base.endswith(".pbxproj"):
             judge_pbxproj(name, RR.read_source(repo, name), found)
         elif is_script(repo, name):
             judge_script(name, RR.read_source(repo, name), found)
+    judge_xcconfig_archs(xcconfigs, found)
 
 
 def slice_minimums(read, path, arch):

@@ -18,6 +18,16 @@ temp folder that is deleted; its output is discarded unread. Exit 0 is reachable
 unreachable only when the control signed, and anything else (another code, a signal, a timeout, a
 prompt that waits) is broken.
 
+Codesigning identities in --keychain are listed with `security find-identity -p codesigning <keychain>`,
+without -v, because codesign still signs with an identity that list would hide as untrusted. Each listed
+identity makes a real codesign attempt, codesign found on PATH, on a copy of the fixture in a temp folder:
+`codesign --keychain <keychain> -s <hash> -f <copy>`, its output discarded unread. An identity whose name
+starts with shellborne-keyreach-control- is the control and must sign, or the run is broken; any other
+identity that signs is reachable. A listed identity with no control among them is broken, and so is a
+control certificate with no usable private key. A keychain with no identity and no control certificate
+has nothing to probe for codesigning and is said so in one line. The user keychain search list is never
+changed, so codesign sees an identity only when --keychain is already on that list.
+
 Each run plants a control item and a control EdDSA account under a random name with the prefix
 shellborne-keyreach-control- in --keychain, probes them first, and removes them even on failure. A
 control read as unreachable means a blind instrument: broken. Limit: the control EdDSA item is planted
@@ -31,6 +41,7 @@ Plan-Step: P0.11.12
 import argparse
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import signal
@@ -46,6 +57,10 @@ DEFAULT_TIMEOUT = 30.0
 MAX_NAMES_BYTES = 64 * 1024
 MAX_ENTRIES = 200
 MAX_FIELD = 512
+MAX_INVENTORY_BYTES = 256 * 1024
+MAX_IDENTITIES = 200
+IDENTITY_LINE = re.compile(r'^\s*\d+\) ([0-9A-F]{40}) "(.*)"(?: \(.*\))?$')
+COUNT_LINE = re.compile(r"^\s*(\d+) identities found$")
 FIELDS = {"item": ("service", "account"), "eddsa": ("account",), "path": ("path",)}
 
 
@@ -122,11 +137,65 @@ def run_quiet(argv, timeout):
             process.wait()
 
 
+def run_listing(argv, timeout):
+    """Runs argv with no input and stderr discarded, reading at most MAX_INVENTORY_BYTES of stdout.
+    Returns (status, text). The status is None on a timeout or an over-cap listing."""
+    with tempfile.TemporaryFile() as out:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        try:
+            status = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            status = None
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    process.kill()
+                process.wait()
+        out.seek(0)
+        data = out.read(MAX_INVENTORY_BYTES + 1)
+    if len(data) > MAX_INVENTORY_BYTES:
+        return None, ""
+    return status, data.decode("utf-8", errors="replace")
+
+
+def parse_identities(text):
+    """Reads the Matching identities section of find-identity output into (hash, name) pairs, one per hash.
+    Raises Broken when the listed lines and the stated count disagree."""
+    lines = text.splitlines()
+    try:
+        start = next(number for number, line in enumerate(lines) if line.strip() == "Matching identities")
+    except StopIteration:
+        raise Broken("the codesigning inventory has no Matching identities section") from None
+    listed = []
+    stated = None
+    for line in lines[start + 1:]:
+        counted = COUNT_LINE.match(line)
+        if counted:
+            stated = int(counted.group(1))
+            break
+        found = IDENTITY_LINE.match(line)
+        if not found:
+            raise Broken("the codesigning inventory has a line it cannot read")
+        listed.append((found.group(1), found.group(2)))
+    if stated is None or stated != len(listed):
+        raise Broken("the codesigning inventory's count does not match its listed identities")
+    if len(listed) > MAX_IDENTITIES:
+        raise Broken(f"the codesigning inventory lists {len(listed)} identities, over the {MAX_IDENTITIES} cap")
+    unique = {}
+    for digest, name in listed:
+        unique.setdefault(digest, name)
+    return list(unique.items())
+
+
 class Probe:
-    def __init__(self, security, keychain, signer, timeout):
+    def __init__(self, security, keychain, signer, codesign, timeout):
         self.security = security
         self.keychain = keychain
         self.signer = signer
+        self.codesign = codesign
         self.timeout = timeout
         self.planted = []
 
@@ -165,6 +234,36 @@ class Probe:
             raise Broken(f"security find-generic-password ended on signal {-status}")
         raise Broken(f"security find-generic-password exited {status}, neither found nor not found")
 
+    def identities(self):
+        argv = [self.security, "find-identity", "-p", "codesigning", self.keychain]
+        status, text = run_listing(argv, self.timeout)
+        if status is None:
+            raise Broken(f"security find-identity did not finish within {self.timeout:g} s or listed too much")
+        if status != 0:
+            raise Broken(f"security find-identity exited {status}, so the codesigning inventory is unknown")
+        return parse_identities(text)
+
+    def control_certificate_present(self):
+        # Without -a, find-certificate exits 44 when nothing matches; with -a it exits 0 either way.
+        status = self.security_status("find-certificate", "-c", CONTROL_PREFIX)
+        if status == 0:
+            return True
+        if status == NOT_FOUND:
+            return False
+        raise Broken(f"security find-certificate exited {status}, neither found nor not found")
+
+    def codesigns(self, digest):
+        with tempfile.TemporaryDirectory(prefix="key-reach-codesign-") as tmp:
+            copy = pathlib.Path(tmp) / FIXTURE.name
+            shutil.copyfile(FIXTURE, copy)
+            status = run_quiet([self.codesign, "--keychain", self.keychain, "-s", digest, "-f", str(copy)],
+                               self.timeout)
+        if status is None:
+            raise Broken(f"codesign did not finish within {self.timeout:g} s (a timeout or a prompt that waits)")
+        if status < 0:
+            raise Broken(f"codesign ended on signal {-status}")
+        return status
+
     def signs(self, account):
         with tempfile.TemporaryDirectory(prefix="key-reach-sign-") as tmp:
             copy = pathlib.Path(tmp) / FIXTURE.name
@@ -191,6 +290,32 @@ def path_reachable(path):
     return os.access(path, os.R_OK)
 
 
+def check_identities(probe):
+    """Returns the reachable identity lines. Raises Broken when the codesign probe cannot be trusted."""
+    listed = probe.identities()
+    controls = [(digest, name) for digest, name in listed if name.startswith(CONTROL_PREFIX)]
+    others = [(digest, name) for digest, name in listed if not name.startswith(CONTROL_PREFIX)]
+    if not controls:
+        if probe.control_certificate_present():
+            raise Broken("a control certificate is in the keychain without a usable private key")
+        if others:
+            raise Broken("codesigning identities are listed but no control identity is, so codesign is unproven")
+        say("no codesigning identity in the keychain, so nothing was probed with codesign")
+        return []
+    for digest, _name in controls:
+        status = probe.codesigns(digest)
+        if status != 0:
+            raise Broken(f"the control identity did not sign (codesign exit {status}), so the codesign probe is blind")
+    found = []
+    for digest, name in others:
+        status = probe.codesigns(digest)
+        if status == 0:
+            found.append(f"reachable identity {digest} {name}")
+        elif status != 1:
+            raise Broken(f"codesign exited {status} for identity {digest}, neither signed nor refused")
+    return found
+
+
 def check(args, probe, entries):
     """Returns the reachable lines. Raises Broken when an instrument cannot be trusted."""
     tag = secrets.token_hex(8)
@@ -202,7 +327,7 @@ def check(args, probe, entries):
         raise Broken("the control item read as unreachable, so the lookup is blind")
     if not probe.signs(control_eddsa):
         raise Broken("the control EdDSA account did not sign, so the signing probe is blind")
-    found = []
+    found = check_identities(probe)
     for service, account in entries["item"]:
         if probe.item_reachable(service, account):
             found.append(f"reachable item service {service} account {account}")
@@ -241,10 +366,17 @@ def main(argv):
     if not os.access(args.signer, os.X_OK):
         say("broken: the signer is not an executable file")
         return 2
+    codesign = shutil.which("codesign")
+    if not codesign:
+        say("broken: codesign(1) is not on PATH")
+        return 2
+    if not os.path.isfile(args.keychain):
+        say("broken: the --keychain path is not a file, and security would list it as empty")
+        return 2
     if not FIXTURE.is_file():
         say("broken: the signing fixture is missing")
         return 2
-    probe = Probe(security, args.keychain, args.signer, args.timeout)
+    probe = Probe(security, args.keychain, args.signer, codesign, args.timeout)
     previous = {number: signal.signal(number, stop) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     problems = []
     found = []

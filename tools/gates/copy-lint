@@ -13,8 +13,11 @@ Where each rule reads, in tracked files only:
   - forbidden-term and british-spelling: String Catalogs (.xcstrings), every text file under docs/, README.md and
     CONTRIBUTING.md as whole text, and the string literals of Swift sources and of crates/sb-cli/src. Phrases and
     words are matched as whole words without case.
-  - sparkle-icon: a Swift string literal or a tracked path that names a sparkle in any form other than the updater
-    framework name Sparkle, and U+2728 in any tracked text.
+  - sparkle-icon: a Swift string literal or a tracked path that names a sparkle in any case, and U+2728 in any
+    tracked text. Only references to the Sparkle updater framework are exempt: in a Package.swift, the
+    sparkle-project/Sparkle package URL and the name "Sparkle" given as a .product name or a package argument;
+    in a path, a Sparkle.framework or Sparkle.xcframework part. An import is code, not a literal, so it is never
+    read. An asset name, an SF Symbol name or a UI string is refused whatever its case.
   - ui-literal: a string literal passed straight to a known SwiftUI or AppKit initializer must be a key in one of
     the tracked String Catalogs.
 
@@ -65,7 +68,11 @@ CLI_SOURCES = "crates/sb-cli/src/"
 PROSE_FILES = ("README.md", "CONTRIBUTING.md")
 SPARKLE_CHAR = "\u2728"
 SPARKLE = re.compile(r"sparkle", re.IGNORECASE)
-FRAMEWORK = "Sparkle"  # the updater framework's name is not an icon
+FRAMEWORK = "Sparkle"  # the updater framework's name, exempt only where it names that framework
+FRAMEWORK_URL = re.compile(r"https://github\.com/sparkle-project/Sparkle(?:\.git)?")
+FRAMEWORK_ARGUMENT = re.compile(r"(?:\.product\s*\(\s*name|\bpackage)\s*:\s*$")
+FRAMEWORK_PARTS = {"Sparkle.framework", "Sparkle.xcframework"}
+MANIFEST = "Package.swift"
 UI_CALL = re.compile(
     r"(?:(?<![\w.])(?:Text|Button|Label|Toggle|TextField|SecureField|Link|Menu|Picker|Section|NavigationLink|"
     r"Stepper|DisclosureGroup|GroupBox|LabeledContent|ProgressView|ContentUnavailableView)\s*\(\s*"
@@ -80,14 +87,22 @@ ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"', "'": "'", "\\":
 CONTROLS = {
     "forbidden-term": "Title\nShellborne is a security product.\n",
     "british-spelling": "Theme\nPick a colour theme.\n",
-    "sparkle-icon": 'import SwiftUI\nlet badge = Image(systemName: "sparkles")\n// done \u2728\n',
+    "sparkle-icon": ('import SwiftUI\nlet badge = Image(systemName: "sparkles")\n// done \u2728\n'
+                     'let mode = Text("Sparkle mode")\n'),
     "ui-literal": 'import SwiftUI\nlet view = Text("Open the control pane")\n',
 }
 CONTROL_NAMES = {"forbidden-term": "docs/control.md", "british-spelling": "docs/control.md",
                  "sparkle-icon": "apple/Sources/Control/Control.swift",
                  "ui-literal": "apple/Sources/Control/Control.swift"}
-CONTROL_LINES = {"forbidden-term": {2}, "british-spelling": {2}, "sparkle-icon": {2, 3}, "ui-literal": {2}}
-SPARKLE_NAME_CONTROL = "apple/Sources/Shell/Assets.xcassets/sparkle-badge.imageset/Contents.json"
+CONTROL_LINES = {"forbidden-term": {2}, "british-spelling": {2}, "sparkle-icon": {2, 3, 4}, "ui-literal": {2}}
+SPARKLE_NAME_CONTROLS = ("apple/Sources/Shell/Assets.xcassets/sparkle-badge.imageset/Contents.json",
+                         "apple/Sources/Shell/Assets.xcassets/SparkleBadge.imageset/Contents.json")
+# Known-good: the updater framework references that must stay exempt, so the exemption is shown to work.
+FRAMEWORK_CONTROL_NAME = "apple/Package.swift"
+FRAMEWORK_CONTROL = ('let package = Package(name: "Control", dependencies: [\n'
+                     '    .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.6.4"),\n'
+                     '], targets: [.target(name: "Update", dependencies: [.product(name: "Sparkle", package: "Sparkle")])])\n')
+FRAMEWORK_PATH_CONTROL = "apple/Frameworks/Sparkle.framework/Versions/B/Sparkle"
 
 
 def reader():
@@ -266,7 +281,32 @@ def prose_hits(table, name, text, offset=0):
 
 
 def names_sparkle(text):
-    return any(m.group(0) != FRAMEWORK for m in SPARKLE.finditer(text))
+    """True when text names a sparkle in any case."""
+    return bool(SPARKLE.search(text))
+
+
+def path_names_sparkle(name):
+    """True when a tracked path names a sparkle outside a part that is the updater framework bundle. The binary
+    inside that bundle shares the framework's name, so a part exactly Sparkle after such a bundle is exempt too."""
+    parts = name.split("/")
+    for index, part in enumerate(parts):
+        if part in FRAMEWORK_PARTS:
+            continue
+        if part == FRAMEWORK and any(earlier in FRAMEWORK_PARTS for earlier in parts[:index]):
+            continue
+        if names_sparkle(part):
+            return True
+    return False
+
+
+def framework_literal(name, text, quote, content):
+    """True for a Package.swift literal that references the Sparkle updater framework: its package URL, or its
+    name given as a .product name or a package argument."""
+    if pathlib.PurePosixPath(name).name != MANIFEST:
+        return False
+    if FRAMEWORK_URL.fullmatch(content):
+        return True
+    return content == FRAMEWORK and bool(FRAMEWORK_ARGUMENT.search(text, max(0, quote - 120), quote))
 
 
 def file_hits(rr, table, name, text, keys):
@@ -279,7 +319,7 @@ def file_hits(rr, table, name, text, keys):
     if swift or cli:
         for quote, start, content in literals(rr, name, text, rust=cli):
             hits += prose_hits(table, name, content, start)
-            if swift and names_sparkle(content):
+            if swift and names_sparkle(content) and not framework_literal(name, text, quote, content):
                 hits.append(("sparkle-icon", start))
             if swift and UI_CALL.search(text, max(0, quote - 120), quote):
                 plain = unescaped(content)
@@ -306,8 +346,12 @@ def prove_controls(rr, table):
         lines = {line for found, line in file_hits(rr, table, CONTROL_NAMES[rule], text, set()) if found == rule}
         if lines != CONTROL_LINES[rule]:
             raise rr.Broken(f"the seeded {rule} control was not refused, so this gate cannot fail")
-        if rule == "sparkle-icon" and not names_sparkle(SPARKLE_NAME_CONTROL):
-            raise rr.Broken("the seeded sparkle-icon file name control was not refused, so this gate cannot fail")
+        if rule == "sparkle-icon" and not all(map(path_names_sparkle, SPARKLE_NAME_CONTROLS)):
+            raise rr.Broken("a seeded sparkle-icon file name control was not refused, so this gate cannot fail")
+        if rule == "sparkle-icon" and (
+                any(found == rule for found, _ in file_hits(rr, table, FRAMEWORK_CONTROL_NAME, FRAMEWORK_CONTROL, set()))
+                or path_names_sparkle(FRAMEWORK_PATH_CONTROL)):
+            raise rr.Broken("an updater framework reference control was refused, so the exemption is unproven")
         print(f"{GATE}: control {rule} refused as expected")
     if set(CONTROLS) != set(CONTROL_LINES):
         raise rr.Broken("a rule has no control, so it cannot be shown to fail")
@@ -323,7 +367,7 @@ def scan(rr, table, repo):
             if len(keys) > MAX_KEYS:
                 raise rr.Broken(f"the String Catalogs hold over the cap of {MAX_KEYS} keys")
     for name in names:
-        if names_sparkle(name):
+        if path_names_sparkle(name):
             found.add(f"sparkle-icon: {rr.shown(name)}:1")
         if not name.lower().endswith(table["binary"]):
             for rule, line in file_hits(rr, table, name, rr.read_source(repo, name), keys):

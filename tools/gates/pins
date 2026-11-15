@@ -14,8 +14,12 @@ Reads the tracked files of <repo> and refuses:
   - unlocked-build: a cargo command that resolves dependencies, in a workflow, a local action or a build script,
     without a locked flag;
   - unverified-download: a download in a workflow, a local action or a build script that no checksum
-    verification follows later in the same file. A git fetch from the repository's own origin is not a
-    download, whatever it fetches;
+    verification follows later in the same file. A checksum counts only as a command: one inside a comment, a
+    quoted string or an argument to another command (echo, printf, an assignment) does not. For a curl or wget,
+    or any download word that is not git, the checksum's pipeline must also name the downloaded file: the -o,
+    --output, -O or > target, else the URL's last path part, so a checksum of another file does not count. A
+    git clone or fetch has no single file, so any later checksum command counts for it. A git fetch from the
+    repository's own origin is not a download, whatever it fetches;
   - ghostty-pin: a Ghostty pin (a PIN.toml under a ghostty folder) whose commit is not 40 lowercase hex;
   - zig-hash: a build.zig.zon dependency that is not a path inside the tree and has no hash;
   - docker-digest: a Dockerfile FROM, or a workflow container or service image, not pinned by sha256 digest.
@@ -49,10 +53,18 @@ SCRIPT_NAMES = ("Makefile", "makefile", "GNUmakefile", "justfile")
 SHELL_SHEBANG = re.compile(r"^#!\s*\S*(?:/|\benv\s+)(?:ba|z|da|k)?sh\b")
 DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
 SEPARATOR = re.compile(r"&&|\|\||;|\|")
+PIPELINE_END = re.compile(r"&&|\|\||;")
+# Words that may stand before a command and still leave it in command position.
+COMMAND_PREFIXES = {"if", "then", "do", "else", "elif", "while", "until", "!", "{", "(", "time", "sudo", "command",
+                    "exec"}
+CURL_OUTPUT = {"-o", "--output"}
+WGET_OUTPUT = {"-O", "--output-document"}
 # git fetch options that take their value as the next word, so it is not read as the remote.
 FETCH_VALUE_OPTIONS = {"--depth", "--deepen", "--shallow-since", "--shallow-exclude", "--negotiation-tip", "--refmap",
                        "-o", "--server-option", "-j", "--jobs", "--upload-pack", "--recurse-submodules-default"}
 CONTROL_URL = "https://example.invalid/control.tgz"
+CONTROL_FILE = "control.tgz"
+CONTROL_HASH = "0" * 64
 
 
 def load(name, path):
@@ -128,6 +140,98 @@ def segment_after(text, index):
     return text[index:found.start() if found else len(text)]
 
 
+def shell_mask(text):
+    """(masked, code) for one logical shell line, both the length of text. masked has every quoted string, quotes
+    included, and the comment blanked; code has only the comment blanked. A comment starts at a # that begins a
+    word outside quotes."""
+    masked, code, index, quote = list(text), list(text), 0, None
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if quote == '"' and char == "\\" and index + 1 < len(text):
+                masked[index] = masked[index + 1] = " "
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            masked[index] = " "
+        elif char == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        elif char in "'\"":
+            quote = char
+            masked[index] = " "
+        elif char == "#" and (index == 0 or text[index - 1].isspace() or text[index - 1] in ";&|("):
+            for at in range(index, len(text)):
+                masked[at] = code[at] = " "
+            break
+        index += 1
+    return "".join(masked), "".join(code)
+
+
+def in_command_position(masked, start):
+    """True when only command prefix words stand between the last shell separator and start."""
+    head = masked[:start]
+    last = 0
+    for found in SEPARATOR.finditer(head):
+        last = found.end()
+    return all(word in COMMAND_PREFIXES for word in head[last:].split())
+
+
+def pipeline_text(masked, code, start):
+    """The comment-free text of the pipeline holding start: bounded by ;, && and ||, never a single |."""
+    begin = 0
+    for found in PIPELINE_END.finditer(masked[:start]):
+        begin = found.end()
+    end = PIPELINE_END.search(masked, start)
+    return code[begin:end.start() if end else len(code)]
+
+
+def download_name(word, arguments):
+    """The file a download writes, or None when it names no single file (a git clone or fetch)."""
+    tool = word.split()[0]
+    if tool == "git":
+        return None
+    words = [part.strip("\"'") for part in arguments.split()]
+    outputs = CURL_OUTPUT if tool == "curl" else WGET_OUTPUT if tool == "wget" else set()
+    url = None
+    index = 0
+    while index < len(words):
+        part = words[index]
+        if part == ">" and index + 1 < len(words):
+            return words[index + 1]
+        if part.startswith(">") and len(part) > 1:
+            return part.lstrip(">")
+        if part in outputs and index + 1 < len(words):
+            if words[index + 1] != "-":
+                return words[index + 1]
+            index += 2
+            continue
+        option = next((flag for flag in outputs if flag.startswith("--") and part.startswith(flag + "=")), None)
+        if option:
+            return part.split("=", 1)[1]
+        short = next((flag for flag in outputs if not flag.startswith("--")), None)
+        if short and part.startswith("-") and not part.startswith("--") and short[1] in part[1:]:
+            rest = part[part.index(short[1], 1) + 1:]
+            if rest:
+                return rest
+            if index + 1 < len(words) and words[index + 1] != "-":
+                return words[index + 1]
+            index += 2
+            continue
+        if url is None and not part.startswith("-"):
+            url = part
+        index += 1
+    if url is None:
+        return None
+    last = url.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    return last or None
+
+
+def names_file(text, name):
+    return bool(re.search(r"(?<![\w./-])" + re.escape(name) + r"(?![\w-])", text))
+
+
 def fetch_from_origin(arguments):
     """True when a git fetch names no remote, or the repository's own origin."""
     words = [word.strip("\"'") for word in arguments.split()]
@@ -147,6 +251,7 @@ def command_findings(lines, rules):
     """(rule, line number) for each unlocked build and unverified download in a file's command lines."""
     found, downloads, checks = [], [], []
     for number, text in lines:
+        masked, code = shell_mask(text)
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
                 rest = segment_after(text, match.end()).split()
@@ -156,11 +261,13 @@ def command_findings(lines, rules):
             for match in pattern.finditer(text):
                 if word == "git fetch" and fetch_from_origin(segment_after(text, match.end())):
                     continue
-                downloads.append((number, match.end()))
+                downloads.append((number, match.end(), download_name(word, segment_after(code, match.end()))))
         for pattern in rules["checksums"]:
-            checks += [(number, match.start()) for match in pattern.finditer(text)]
-    for number, end in downloads:
-        if not any((check_number, at) > (number, end) for check_number, at in checks):
+            checks += [(number, match.start(), pipeline_text(masked, code, match.start()))
+                       for match in pattern.finditer(masked) if in_command_position(masked, match.start())]
+    for number, end, name in downloads:
+        if not any((check_number, at) > (number, end) and (name is None or names_file(pipeline, name))
+                   for check_number, at, pipeline in checks):
             found.append(("unverified-download", number))
     return found
 
@@ -168,15 +275,28 @@ def command_findings(lines, rules):
 def prove_controls(rules):
     """Every word must refuse its own seeded line and pass its own verified or locked line."""
     first_check = rules["words"][("checksums", "commands")][0]
+    verified = f'echo "{CONTROL_HASH}  {CONTROL_FILE}" | {{check}} -'
     for word, _ in rules["downloads"]:
         bad = command_findings([(1, f"{word} {CONTROL_URL}")], rules)
-        good = command_findings([(1, f"{word} {CONTROL_URL}"), (2, f"{first_check} -")], rules)
+        good = command_findings([(1, f"{word} {CONTROL_URL}"), (2, verified.format(check=first_check))], rules)
         if ("unverified-download", 1) not in bad or good:
             raise Broken("a download word does not refuse its own seeded download")
+    first_download = rules["downloads"][0][0]
+    unchecked = [f"true # {{check}} {CONTROL_FILE}.sha256", f'echo "{{check}} {CONTROL_FILE}.sha256"',
+                 f"echo '{{check}} {CONTROL_FILE}.sha256'"]
     for check in rules["words"][("checksums", "commands")]:
-        first_download = rules["downloads"][0][0]
-        if command_findings([(1, f"{first_download} {CONTROL_URL}"), (2, f"{check} -")], rules):
+        if command_findings([(1, f"{first_download} {CONTROL_URL}"), (2, verified.format(check=check))], rules):
             raise Broken("a checksum word does not pass its own verified download")
+        for line in unchecked:
+            if ("unverified-download", 1) not in command_findings(
+                    [(1, f"{first_download} {CONTROL_URL}"), (2, line.format(check=check))], rules):
+                raise Broken("a checksum named in a comment or a quoted string counts as a check")
+    for word, _ in rules["downloads"]:
+        if word.split()[0] == "git":
+            continue
+        other = f'echo "{CONTROL_HASH}  other-{CONTROL_FILE}" | {first_check} -'
+        if ("unverified-download", 1) not in command_findings([(1, f"{word} {CONTROL_URL}"), (2, other)], rules):
+            raise Broken("a checksum of another file counts for a download")
     for word in rules["words"][("builds", "commands")]:
         if ("unlocked-build", 1) not in command_findings([(1, word)], rules):
             raise Broken("a build word does not refuse its own seeded build")
