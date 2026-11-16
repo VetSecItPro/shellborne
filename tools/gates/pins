@@ -151,7 +151,8 @@ def continues(text):
 
 def logical_lines(numbered):
     """(first line number, text) with backslash continuations joined and comment lines dropped. A backslash inside
-    a comment, or one escaped by another, continues nothing."""
+    a comment, or one escaped by another, continues nothing. The join adds nothing, as the shell's does, so a word
+    split across the lines is read whole."""
     pending, start = None, None
     for number, line in numbered:
         if pending is None:
@@ -159,7 +160,7 @@ def logical_lines(numbered):
                 continue
             pending, start = "", number
         if continues(pending + line):
-            pending += line[:-1] + " "
+            pending += line[:-1]  # the shell removes the backslash and the newline and adds nothing
             continue
         yield start, pending + line
         pending = None
@@ -453,6 +454,9 @@ def yaml_double(body):
             if int(digits, 16) > 0x10FFFF:
                 raise Broken(f"a double-quoted run value holds the escape \\{code}{digits}, beyond Unicode, which is "
                              "not valid YAML, so the workflow cannot be read")
+            if 0xD800 <= int(digits, 16) <= 0xDFFF:
+                raise Broken(f"a double-quoted run value holds the escape \\{code}{digits}, a surrogate that names no "
+                             "character, which is not valid YAML, so the workflow cannot be read")
             out.append(chr(int(digits, 16)))
             index += 2 + YAML_HEX[code]
         else:
@@ -474,10 +478,62 @@ def indent_of(line):
     return len(line) - len(line.lstrip())
 
 
+def block_indent(block, indent, header):
+    """The content indentation of a block scalar whose key sits at column indent: the key's column plus an explicit
+    indentation indicator (|2, |-2, |2-), else the indentation of the first non-empty line, as YAML detects it."""
+    found = re.match(r"[|>](?:([1-9])[+-]?|[+-]([1-9])?)?", header)
+    digit = found and (found.group(1) or found.group(2))
+    if digit:
+        return indent + int(digit)
+    return next((indent_of(text) for _, text in block if text.strip()), 0)
+
+
+def block_body(block, indent, header, kind):
+    """(line number, text) of a block scalar's lines with its indentation removed, as YAML removes it. A # comment
+    left of the indentation is a trailing comment that ends the block; any other text left of it, or after such a
+    comment, is not valid YAML."""
+    content = block_indent(block, indent, header)
+    trailing = False
+    for number, text in block:
+        if not text.strip():
+            if not trailing:
+                yield number, ""
+            continue
+        if trailing or indent_of(text) < content:
+            if text.strip().startswith("#"):
+                trailing = True
+                continue
+            raise Broken(f"line {number} of a {kind} run block sits left of the block's indentation, which is not "
+                         "valid YAML, so the workflow cannot be read")
+        yield number, text[content:]
+
+
+def folded_lines(body):
+    """A folded block's commands as YAML folds them, each at its first line: a line break between two lines at the
+    block's indentation becomes a space; a blank line, or a line indented further, keeps its breaks, so it ends the
+    command before it and a further-indented line is a command of its own."""
+    pending = None
+    for number, text in body:
+        if text and not text[:1].isspace():
+            if pending:
+                pending[1].append(text)
+            else:
+                pending = (number, [text])
+            continue
+        if pending:
+            yield pending[0], " ".join(pending[1])
+            pending = None
+        if text.strip():
+            yield number, text
+    if pending:
+        yield pending[0], " ".join(pending[1])
+
+
 def run_lines(lines):
     """(line number, text) of every command inside a workflow or action run: value, in every YAML form:
-    a literal block line by line; a folded block or a plain scalar continued on deeper lines joined with spaces, as
-    YAML joins them, at the first line; and a run value inside a flow mapping."""
+    a literal block line by line and a folded block as YAML folds it, each with the block's indentation removed;
+    a plain scalar continued on deeper lines joined with spaces, as YAML joins them, at the first line; and a run
+    value inside a flow mapping."""
     index = 0
     while index < len(lines):
         match = re.match(r"^(\s*(?:-\s+)?)(?:run|\"run\"|'run')\s*:\s*(.*)$", lines[index])
@@ -497,17 +553,8 @@ def run_lines(lines):
             while index < len(lines) and (not lines[index].strip() or indent_of(lines[index]) > indent):
                 block.append((index + 1, lines[index]))
                 index += 1
-            if not folded:
-                yield from block
-                continue
-            paragraph, first = [], None
-            for number, text in block + [(None, "")]:
-                if text.strip():
-                    first = first or number
-                    paragraph.append(text.strip())
-                elif paragraph:
-                    yield first, " ".join(paragraph)
-                    paragraph, first = [], None
+            body = list(block_body(block, indent, value, "folded" if folded else "literal"))
+            yield from (folded_lines(body) if folded else body)
             continue
         first = index + 1
         index += 1
