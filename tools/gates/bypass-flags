@@ -16,7 +16,9 @@ entry from its own list. The table holds
   allow: [[allow]] entries with path (same form as a launch path) and a reason of real words, for display-only or
     test-fixture files that may name a flag.
 It refuses, in every tracked Rust, Swift, C-family, shell, Python, JavaScript and TypeScript, TOML, JSON and YAML file
-(a file with no extension is read when it starts with #!) that no allow entry covers:
+(a file with no extension is read when it starts with #!) that no allow entry covers, except tools/gates/bypass-flags.toml
+itself, which defines the strings and is exempt in this code, not by an allow entry: CI reads the table from the base
+commit, so an entry for it could not land with the change that needs it:
   - bypass-flag: a listed flag, short flag, option with a listed value, or environment word;
 and in a file under a launch path:
   - permission-key: a listed permission key.

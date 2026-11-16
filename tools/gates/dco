@@ -6,6 +6,8 @@ Usage: dco <repo> <range>     <range> is anything git rev-list accepts: HEAD, ba
 A commit passes when the trailers git parses from its message (git interpret-trailers) include a
 `Signed-off-by:` trailer whose own value names the commit author's email. A sign-off in the body,
 or an empty sign-off followed by another line, does not count. Merge commits are checked like any other.
+Limit: a sign-off is the author's statement, not proof of who they are; the email is the one git records, which the
+author sets.
 Exit 0 clean, 1 refused, 2 broken. One line per refused commit, naming its short hash.
 Plan-Step: P0.2.4
 """

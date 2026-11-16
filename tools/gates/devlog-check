@@ -6,6 +6,8 @@ Usage: devlog-check <repo>
 For each post in docs/_posts/: it needs a title and a description; it may not carry an internal plan id;
 and a meaningful number (two or more digits, a percentage, or a time) must sit in a paragraph that also
 links to its evidence. Code blocks are skipped. The leak guards cover every post too.
+Limit: a linked number counts as evidenced; whether the link supports it is the reader's to judge, and only
+docs/_posts/ is read.
 Exit 0 clean, 1 refused, 2 broken.
 Plan-Step: P0.23.3
 """

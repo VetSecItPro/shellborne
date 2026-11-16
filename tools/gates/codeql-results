@@ -5,7 +5,8 @@ Usage: codeql-results <folder>
 
 CodeQL on its own only reports alerts. This gate reads every .sarif file in <folder> and prints one
 line per finding (rule, file and line). Every file must hold CodeQL runs that finished successfully and
-carry a results list. Exit 0 no findings, 1 findings, 2 nothing usable, which is never treated as clean.
+carry a results list. Limit: it judges only the SARIF it is handed; which queries ran and how much code CodeQL
+extracted are the workflow's to set. Exit 0 no findings, 1 findings, 2 nothing usable, which is never treated as clean.
 Plan-Step: P0.21.5
 """
 import json
