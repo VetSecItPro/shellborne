@@ -4,7 +4,8 @@ P0.11.3).
 
 Usage: deps [--tables-from <ref>] <repo>
 
-  - vulnerable-dependency: cargo-audit on Cargo.lock. SHELLBORNE_ADVISORY_DB names a local advisory
+  - vulnerable-dependency: cargo-audit on every tracked Cargo.lock (a second workspace too, each with the Cargo.toml
+    beside it; a lock with none is broken). SHELLBORNE_ADVISORY_DB names a local advisory
     database (used by tests, so they never depend on the network); otherwise the current RustSec
     database is fetched.
   - license / banned-source: cargo-deny with this folder's deny.toml, never a config from the tree. A license
@@ -19,7 +20,7 @@ Usage: deps [--tables-from <ref>] <repo>
       * every vendored folder in the table that holds a tracked file names its license file. The gate reads
         that file itself and refuses it when its text is not the declared license (one SPDX id per folder),
         or when it is any GPL.
-        OFL-1.1 passes only for font files (.ttf, .otf, .woff, .woff2, with a real font signature in
+        OFL-1.1 passes only for font files (.ttf, .otf, .ttc, .otc, .woff, .woff2, with a real font signature in
         their first bytes) and the folder's license file; any other file under an OFL-1.1 folder is
         refused. BSD-2-Clause is not matched by a text that holds the BSD-3-Clause endorsement clause.
       * every tracked font file must sit in a vendored folder from the table, and every tracked file under
@@ -50,7 +51,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 READER = HERE / "repo-rules"
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 MAX_TABLE_BYTES = 256 * 1024
-FONT_SUFFIXES = (".ttf", ".otf", ".woff", ".woff2")
+FONT_SUFFIXES = (".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2")  # .ttc and .otc are collections
 OFL = "OFL-1.1"
 PIN_KINDS = {"swiftpm", "zig", "ghostty"}
 
@@ -179,13 +180,25 @@ def lock_line(lock_text, name, version):
 
 
 def check_rust(rr, repo, names, deny_text, findings):
-    if "Cargo.lock" not in names:
+    """Every tracked Cargo.lock, each with the Cargo.toml beside it: a second workspace in the tree is audited and
+    license-checked like the root one."""
+    locks = sorted(name for name in names if name == "Cargo.lock" or name.endswith("/Cargo.lock"))
+    if not locks:
         return
     cargo = shutil.which("cargo")
     if not cargo:
         raise Broken("cargo is not installed, and this repository has a Cargo.lock")
-    lock = repo / "Cargo.lock"
-    lock_text = rr.read_source(repo, "Cargo.lock")
+    for lock_rel in locks:
+        folder = lock_rel[:-len("Cargo.lock")]
+        manifest_rel = folder + "Cargo.toml"
+        if manifest_rel not in names:
+            raise Broken(f"{rr.shown(lock_rel)} has no tracked Cargo.toml beside it, so cargo-deny cannot read it")
+        check_lock(rr, repo, cargo, lock_rel, manifest_rel, deny_text, findings)
+
+
+def check_lock(rr, repo, cargo, lock_rel, manifest_rel, deny_text, findings):
+    lock = repo / lock_rel
+    lock_text = rr.read_source(repo, lock_rel)
     audit = [cargo, "audit", "--json", "--file", str(lock)]
     db = os.environ.get("SHELLBORNE_ADVISORY_DB")
     if db:
@@ -199,14 +212,15 @@ def check_rust(rr, repo, names, deny_text, findings):
     for item in report.get("vulnerabilities", {}).get("list", []):
         package = item.get("package", {})
         advisory = item.get("advisory", {}).get("id", "advisory")
-        findings.append(("vulnerable-dependency", f"Cargo.lock ({package.get('name')} {package.get('version')}, {advisory})"))
+        findings.append(("vulnerable-dependency",
+                         f"{rr.shown(lock_rel)} ({package.get('name')} {package.get('version')}, {advisory})"))
     if len(findings) > audited:
         return  # the lock is already refused; cargo-deny would only repeat it
     with tempfile.TemporaryDirectory(prefix="deps-gate-") as folder:
         config = pathlib.Path(folder) / "deny.toml"
         config.write_text(deny_text)
         for checks, kind in ((["licenses"], "license"), (["bans", "sources"], "banned-source")):
-            deny = [cargo, "deny", "--format", "json", "--manifest-path", str(repo / "Cargo.toml"),
+            deny = [cargo, "deny", "--format", "json", "--manifest-path", str(repo / manifest_rel),
                     "--config", str(config), "--offline", "check", *checks]
             result = subprocess.run(deny, capture_output=True, text=True, cwd=repo)
             errors = []
@@ -226,9 +240,9 @@ def check_rust(rr, repo, names, deny_text, findings):
                     krate = graph.get("Krate", {}) if isinstance(graph, dict) else {}
                     number = lock_line(lock_text, krate.get("name"), krate.get("version"))
                     if number:
-                        places.append(f"Cargo.lock:{number}")
+                        places.append(f"{rr.shown(lock_rel)}:{number}")
                 code = str(fields.get("code", "error"))[:40]
-                for place in places or ["Cargo.toml"]:
+                for place in places or [rr.shown(manifest_rel)]:
                     findings.append((kind, f"{place} (cargo-deny {code})"))
 
 
