@@ -27,7 +27,8 @@ Reads the tracked files of <repo> and refuses:
     repository's own origin is not a download, whatever it fetches;
   - download-used-before-check: a downloaded file that any command names between its download and its first
     verifying checksum (it was extracted, run or copied unverified), or a download piped straight into another
-    command (curl ... | sh), which no checksum can come before; reported on the download's line. A name inside a
+    command (curl ... | sh) or run in the background (curl ... &), which no checksum can be sure to come after;
+    reported on the download's line. A name inside a
     comment, the download's own command or a verifying checksum's pipeline is not a use. A git clone or fetch names
     no single file, so this rule does not judge what reads its tree (a stated limit);
   - ghostty-pin: a Ghostty pin (a PIN.toml under a ghostty folder) whose commit is not 40 lowercase hex;
@@ -70,7 +71,7 @@ SCRIPT_NAMES = ("Makefile", "makefile", "GNUmakefile", "justfile")
 SHELL_SHEBANG = re.compile(r"^#!\s*\S*(?:/|\benv\s+)(?:ba|z|da|k)?sh\b")
 DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
 SEPARATOR = re.compile(r"&&|\|\||;|\|")
-PIPELINE_END = re.compile(r"&&|\|\||;")
+PIPELINE_END = re.compile(r"&&|\|\||;|(?<![<>&|])&(?![&>])")  # a bare & runs the command before it in the background
 SINGLE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # Words that may stand before a command and still leave it in command position.
 COMMAND_PREFIXES = {"if", "then", "do", "else", "elif", "while", "until", "!", "{", "(", "time", "sudo", "command",
@@ -140,16 +141,25 @@ def load_rules(text):
     }
 
 
+def continues(text):
+    """True when text ends in a backslash that escapes its newline: the last character, outside a comment, and not
+    itself escaped (an odd run of backslashes). A backslash followed by white space escapes that space, not the
+    newline, so it continues nothing."""
+    code = shell_mask(text)[1]
+    return (len(code) - len(code.rstrip("\\"))) % 2 == 1
+
+
 def logical_lines(numbered):
-    """(first line number, text) with backslash continuations joined and comment lines dropped."""
+    """(first line number, text) with backslash continuations joined and comment lines dropped. A backslash inside
+    a comment, or one escaped by another, continues nothing."""
     pending, start = None, None
     for number, line in numbered:
         if pending is None:
             if line.strip().startswith("#"):
                 continue
             pending, start = "", number
-        if line.rstrip().endswith("\\"):
-            pending += line.rstrip()[:-1] + " "
+        if continues(pending + line):
+            pending += line[:-1] + " "
             continue
         yield start, pending + line
         pending = None
@@ -261,8 +271,15 @@ def fetch_from_origin(arguments):
     return True
 
 
+def background(masked, at):
+    """True when the pipeline that ends at at is run in the background by a bare &."""
+    found = PIPELINE_END.match(masked, at)
+    return bool(found) and found.group() == "&"
+
+
 def pipeline_span(masked, start):
-    """(begin, end) of the pipeline holding start, bounded by ;, && and ||, never a single |."""
+    """(begin, end) of the pipeline holding start, bounded by ;, &&, || and a bare &, never a single | or a
+    redirection such as 2>&1 or &>."""
     begin = 0
     for found in PIPELINE_END.finditer(masked[:start]):
         begin = found.end()
@@ -297,10 +314,10 @@ def mentions(code, name):
 
 def command_findings(lines, rules):
     """(rule, line number) for each unlocked build and unverified download in a file's command lines."""
-    found, downloads, checks, codes = [], [], [], {}
-    for number, text in lines:
+    found, downloads, checks, codes = [], [], [], []
+    for seq, (number, text) in enumerate(lines):  # seq orders commands, since one line can hold several runs
         masked, code = shell_mask(text)
-        codes[number] = code
+        codes.append(code)
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
                 if printed(text, masked, match.start()):
@@ -319,7 +336,8 @@ def command_findings(lines, rules):
                     continue
                 _, until = pipeline_span(masked, match.end())
                 piped = bool(SINGLE_PIPE.search(masked, match.end(), until))  # curl ... | sh
-                downloads.append((number, match.start(), match.end(), until,
+                piped = piped or background(masked, until)  # curl ... &: a later checksum may read an older file
+                downloads.append((seq, number, match.start(), match.end(), until,
                                   download_name(word, segment_after(code, match.end())), piped))
         for pattern in rules["checksums"]:
             for match in pattern.finditer(masked):
@@ -327,10 +345,10 @@ def command_findings(lines, rules):
                     begin, end = pipeline_span(masked, match.start())
                     pipeline = code[begin:end]
                     if HEX_DIGEST.search(pipeline):  # a digest file made from the download proves nothing
-                        checks.append((number, match.start(), pipeline, begin, end))
-    for number, start, end, until, name, piped in downloads:
-        verifying = [(check_number, at, begin, stop) for check_number, at, pipeline, begin, stop in checks
-                     if (check_number, at) > (number, end) and (name is None or names_file(pipeline, name))]
+                        checks.append((seq, match.start(), pipeline, begin, end))
+    for seq, number, start, end, until, name, piped in downloads:
+        verifying = [(check_seq, at, begin, stop) for check_seq, at, pipeline, begin, stop in checks
+                     if (check_seq, at) > (seq, end) and (name is None or names_file(pipeline, name))]
         if not verifying:
             found.append(("unverified-download", number))
             continue
@@ -339,16 +357,16 @@ def command_findings(lines, rules):
             continue
         if name is None:
             continue
-        first_number, _, first_begin, _ = min(verifying)
+        first_seq, _, first_begin, _ = min(verifying)
 
-        def excused(line, index):
+        def excused(command, index):
             """The download's own command, or any verifying checksum's pipeline, names the file without using it."""
-            if line == number and start <= index < until:
+            if command == seq and start <= index < until:
                 return True
-            return any(line == check_line and begin <= index < stop
-                       for check_line, _, begin, stop in verifying)
-        used = any((number, end) < (line, index) < (first_number, first_begin) and not excused(line, index)
-                   for line, code in codes.items() for index in mentions(code, name))
+            return any(command == check_seq and begin <= index < stop
+                       for check_seq, _, begin, stop in verifying)
+        used = any((seq, end) < (command, index) < (first_seq, first_begin) and not excused(command, index)
+                   for command, code in enumerate(codes) for index in mentions(code, name))
         if used:
             found.append(("download-used-before-check", number))
     return found
@@ -392,6 +410,9 @@ def prove_controls(rules):
         if ("download-used-before-check", 1) not in command_findings(
                 [(1, f"{word} {CONTROL_URL} | sh"), (2, verified.format(check=first_check))], rules):
             raise Broken("a download piped into a command passes")
+        if ("download-used-before-check", 1) not in command_findings(
+                [(1, f"{word} {CONTROL_URL} &"), (2, verified.format(check=first_check))], rules):
+            raise Broken("a download run in the background passes")
         if command_findings([(1, f"{word} {CONTROL_URL}"), (2, verified.format(check=first_check)),
                              (3, f"tar -xzf {CONTROL_FILE}")], rules):
             raise Broken("a download verified before its first use is refused")
@@ -428,7 +449,11 @@ def yaml_double(body):
             index += 2
         elif code in YAML_HEX and re.fullmatch(r"[0-9A-Fa-f]+", body[index + 2:index + 2 + YAML_HEX[code]] or "x") \
                 and len(body[index + 2:index + 2 + YAML_HEX[code]]) == YAML_HEX[code]:
-            out.append(chr(int(body[index + 2:index + 2 + YAML_HEX[code]], 16)))
+            digits = body[index + 2:index + 2 + YAML_HEX[code]]
+            if int(digits, 16) > 0x10FFFF:
+                raise Broken(f"a double-quoted run value holds the escape \\{code}{digits}, beyond Unicode, which is "
+                             "not valid YAML, so the workflow cannot be read")
+            out.append(chr(int(digits, 16)))
             index += 2 + YAML_HEX[code]
         else:
             out.append(char)
