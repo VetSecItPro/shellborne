@@ -7,13 +7,16 @@ Usage: pins [--tables-from <ref>] <repo>
 Reads the tracked files of <repo> and refuses:
   - cargo-git-rev: a Cargo git dependency, in any dependency, workspace, target, patch or replace table, without a
     rev of exactly 40 lowercase hex characters; the patch tables of every tracked .cargo/config(.toml) count too;
-  - cargo-source: a [source.*] table with replace-with in a tracked .cargo/config(.toml);
+  - cargo-source: a [source.*] table with replace-with, or a top-level paths override, in a tracked
+    .cargo/config(.toml); a [source.*] git entry needs a 40-hex rev too (cargo-git-rev);
   - swiftpm-requirement: a remote .package( requirement in a Package.swift other than exact or a revision of exactly 40 lowercase hex characters, judged with string contents blanked;
   - missing-lockfile: a Cargo workspace root, or a crate outside any workspace that no other manifest names as a
     path dependency, with no tracked Cargo.lock beside it; a Package.swift with a remote dependency and no
     tracked Package.resolved beside it;
   - unlocked-build: a cargo command that resolves dependencies, in a workflow, a local action or a build script,
     without a locked flag;
+  - (a download or cargo word inside a quoted argument of echo or printf is printed, not run, and is skipped; one in
+    a quoted string a shell runs, sh -c or eval, is judged)
   - unverified-download: a download in a workflow, a local action or a build script that no checksum
     verification follows later in the same file. A checksum counts only when its pipeline holds a literal
     64-hex SHA-256 digest written in the file, so a digest file made from the download does not count. It counts only as a command: one inside a comment, a
@@ -22,6 +25,11 @@ Reads the tracked files of <repo> and refuses:
     --output, -O or > target, else the URL's last path part, so a checksum of another file does not count. A
     git clone or fetch has no single file, so any later checksum command counts for it. A git fetch from the
     repository's own origin is not a download, whatever it fetches;
+  - download-used-before-check: a downloaded file that any command names between its download and its first
+    verifying checksum (it was extracted, run or copied unverified), or a download piped straight into another
+    command (curl ... | sh), which no checksum can come before; reported on the download's line. A name inside a
+    comment, the download's own command or a verifying checksum's pipeline is not a use. A git clone or fetch names
+    no single file, so this rule does not judge what reads its tree (a stated limit);
   - ghostty-pin: a Ghostty pin (a PIN.toml under a ghostty folder) whose commit is not 40 lowercase hex;
   - zig-hash: a build.zig.zon dependency that is not a path inside the tree and has no hash;
   - docker-digest: a Dockerfile FROM, or a workflow container or service image, not pinned by sha256 digest.
@@ -31,8 +39,9 @@ proves every word refuses its own seeded line and passes its own verified or loc
 breaks the run.
 
 A build script is a tracked .sh, .bash, .zsh or .mk file, a Makefile or justfile, or a file with a shell shebang.
-Workflow commands are read from run: values only, line by line: a multi-line YAML scalar or a flow-mapping run
-value is not joined into one command (a known limit, scheduled). A cargo command is judged on its masked text (no
+Workflow commands are read from run: values only: a literal block line by line, a folded block or a plain scalar
+continued on deeper lines joined with spaces the way YAML joins them, and a run value inside a flow mapping.
+A cargo command is judged on its masked text (no
 comment, no quoted string) cut at the first bare --, so a flag in a comment or in a binary's own arguments is not a
 locked flag; cargo global options and a +toolchain may stand before the subcommand. A tracked .cargo/config or
 .cargo/config.toml is read like a manifest: a patch table needs a 40-hex rev, and a [source.*] table with
@@ -62,6 +71,7 @@ SHELL_SHEBANG = re.compile(r"^#!\s*\S*(?:/|\benv\s+)(?:ba|z|da|k)?sh\b")
 DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
 SEPARATOR = re.compile(r"&&|\|\||;|\|")
 PIPELINE_END = re.compile(r"&&|\|\||;")
+SINGLE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # Words that may stand before a command and still leave it in command position.
 COMMAND_PREFIXES = {"if", "then", "do", "else", "elif", "while", "until", "!", "{", "(", "time", "sudo", "command",
                     "exec"}
@@ -191,15 +201,6 @@ def in_command_position(masked, start):
     return all(word in COMMAND_PREFIXES for word in head[last:].split())
 
 
-def pipeline_text(masked, code, start):
-    """The comment-free text of the pipeline holding start: bounded by ;, && and ||, never a single |."""
-    begin = 0
-    for found in PIPELINE_END.finditer(masked[:start]):
-        begin = found.end()
-    end = PIPELINE_END.search(masked, start)
-    return code[begin:end.start() if end else len(code)]
-
-
 def download_name(word, arguments):
     """The file a download writes, or None when it names no single file (a git clone or fetch)."""
     tool = word.split()[0]
@@ -260,13 +261,48 @@ def fetch_from_origin(arguments):
     return True
 
 
+def pipeline_span(masked, start):
+    """(begin, end) of the pipeline holding start, bounded by ;, && and ||, never a single |."""
+    begin = 0
+    for found in PIPELINE_END.finditer(masked[:start]):
+        begin = found.end()
+    end = PIPELINE_END.search(masked, start)
+    return begin, end.start() if end else len(masked)
+
+
+PRINTERS = ("echo", "printf")  # print their arguments and run nothing
+
+
+def printed(text, masked, start):
+    """True when start is inside a quoted argument of echo or printf, which only print it; a quoted
+    string a shell runs (sh -c, bash -c, eval) is not printed, so it is still judged."""
+    if masked[start] == text[start]:
+        return False
+    head = masked[:start]
+    last = 0
+    for found in SEPARATOR.finditer(head):
+        last = found.end()
+    words = [word for word in head[last:].split() if word not in COMMAND_PREFIXES]
+    return bool(words) and words[0].rsplit("/", 1)[-1] in PRINTERS
+
+
+def mentions(code, name):
+    """Each start index where a command line names the file, also through a path (./tool.tgz, "$DIR/tool.tgz"): a use
+    is matched by the file's own name after a slash too, which fails closed."""
+    base = posixpath.basename(name.rstrip("/")) or name
+    return [found.start() for found in re.finditer(r"(?<![\w.-])" + re.escape(base) + r"(?![\w-])", code)]
+
+
 def command_findings(lines, rules):
     """(rule, line number) for each unlocked build and unverified download in a file's command lines."""
-    found, downloads, checks = [], [], []
+    found, downloads, checks, codes = [], [], [], {}
     for number, text in lines:
         masked, code = shell_mask(text)
+        codes[number] = code
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
+                if printed(text, masked, match.start()):
+                    continue
                 source = masked if masked[match.start()] == text[match.start()] else code  # a quoted command
                 rest = segment_after(source, match.end()).split()
                 rest = rest[:rest.index("--")] if "--" in rest else rest  # after -- the words are the binary's
@@ -275,19 +311,44 @@ def command_findings(lines, rules):
                     found.append(("unlocked-build", number))
         for word, pattern in rules["downloads"]:
             for match in pattern.finditer(text):
+                if printed(text, masked, match.start()):
+                    continue
                 if word in ("git fetch", "git pull") and fetch_from_origin(segment_after(text, match.end())):
                     continue
-                downloads.append((number, match.end(), download_name(word, segment_after(code, match.end()))))
+                _, until = pipeline_span(masked, match.end())
+                piped = bool(SINGLE_PIPE.search(masked, match.end(), until))  # curl ... | sh
+                downloads.append((number, match.start(), match.end(), until,
+                                  download_name(word, segment_after(code, match.end())), piped))
         for pattern in rules["checksums"]:
             for match in pattern.finditer(masked):
                 if in_command_position(masked, match.start()):
-                    pipeline = pipeline_text(masked, code, match.start())
+                    begin, end = pipeline_span(masked, match.start())
+                    pipeline = code[begin:end]
                     if HEX_DIGEST.search(pipeline):  # a digest file made from the download proves nothing
-                        checks.append((number, match.start(), pipeline))
-    for number, end, name in downloads:
-        if not any((check_number, at) > (number, end) and (name is None or names_file(pipeline, name))
-                   for check_number, at, pipeline in checks):
+                        checks.append((number, match.start(), pipeline, begin, end))
+    for number, start, end, until, name, piped in downloads:
+        verifying = [(check_number, at, begin, stop) for check_number, at, pipeline, begin, stop in checks
+                     if (check_number, at) > (number, end) and (name is None or names_file(pipeline, name))]
+        if not verifying:
             found.append(("unverified-download", number))
+            continue
+        if piped:
+            found.append(("download-used-before-check", number))
+            continue
+        if name is None:
+            continue
+        first_number, _, first_begin, _ = min(verifying)
+
+        def excused(line, index):
+            """The download's own command, or any verifying checksum's pipeline, names the file without using it."""
+            if line == number and start <= index < until:
+                return True
+            return any(line == check_line and begin <= index < stop
+                       for check_line, _, begin, stop in verifying)
+        used = any((number, end) < (line, index) < (first_number, first_begin) and not excused(line, index)
+                   for line, code in codes.items() for index in mentions(code, name))
+        if used:
+            found.append(("download-used-before-check", number))
     return found
 
 
@@ -320,6 +381,18 @@ def prove_controls(rules):
         other = f'echo "{CONTROL_HASH}  other-{CONTROL_FILE}" | {first_check} -'
         if ("unverified-download", 1) not in command_findings([(1, f"{word} {CONTROL_URL}"), (2, other)], rules):
             raise Broken("a checksum of another file counts for a download")
+    for word, _ in rules["downloads"]:  # verification comes before the first use
+        if word.split()[0] == "git":
+            continue
+        used = [(1, f"{word} {CONTROL_URL}"), (2, f"tar -xzf {CONTROL_FILE}"), (3, verified.format(check=first_check))]
+        if ("download-used-before-check", 1) not in command_findings(used, rules):
+            raise Broken("a download used before its checksum passes")
+        if ("download-used-before-check", 1) not in command_findings(
+                [(1, f"{word} {CONTROL_URL} | sh"), (2, verified.format(check=first_check))], rules):
+            raise Broken("a download piped into a command passes")
+        if command_findings([(1, f"{word} {CONTROL_URL}"), (2, verified.format(check=first_check)),
+                             (3, f"tar -xzf {CONTROL_FILE}")], rules):
+            raise Broken("a download verified before its first use is refused")
     for word in rules["words"][("builds", "commands")]:
         if ("unlocked-build", 1) not in command_findings([(1, word)], rules):
             raise Broken("a build word does not refuse its own seeded build")
@@ -327,25 +400,68 @@ def prove_controls(rules):
             raise Broken("a build word does not pass its own locked build")
 
 
+FLOW_RUN = re.compile(r"[{,]\s*run\s*:\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*'|[^,}]*)")
+KEY_LINE = re.compile(r"^\s*(?:-\s+)?[A-Za-z_][\w-]*\s*:(?:\s|$)")
+
+
+def yaml_scalar(value):
+    """A whole single- or double-quoted YAML scalar without its quotes; any other value as it is."""
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip())
+
+
 def run_lines(lines):
-    """(line number, text) of every command inside a workflow or action run: value, inline or block."""
+    """(line number, text) of every command inside a workflow or action run: value, in every YAML form:
+    a literal block line by line; a folded block or a plain scalar continued on deeper lines joined with spaces, as
+    YAML joins them, at the first line; and a run value inside a flow mapping."""
     index = 0
     while index < len(lines):
         match = re.match(r"^(\s*(?:-\s+)?)run\s*:\s*(.*)$", lines[index])
         if not match:
+            for flow in FLOW_RUN.finditer(lines[index]):
+                value = yaml_scalar(flow.group(1).strip())
+                if value:
+                    yield index + 1, value
             index += 1
             continue
         indent = len(match.group(1))  # the column of the run key; a block value sits deeper
         value = match.group(2).strip()
         if value[:1] in ("|", ">"):
+            folded = value[:1] == ">"
             index += 1
-            while index < len(lines) and (not lines[index].strip() or len(lines[index]) - len(lines[index].lstrip()) > indent):
-                yield index + 1, lines[index]
+            block = []
+            while index < len(lines) and (not lines[index].strip() or indent_of(lines[index]) > indent):
+                block.append((index + 1, lines[index]))
                 index += 1
+            if not folded:
+                yield from block
+                continue
+            paragraph, first = [], None
+            for number, text in block + [(None, "")]:
+                if text.strip():
+                    first = first or number
+                    paragraph.append(text.strip())
+                elif paragraph:
+                    yield first, " ".join(paragraph)
+                    paragraph, first = [], None
             continue
-        if value and not value.startswith("#"):
-            yield index + 1, value
+        first = index + 1
         index += 1
+        if not value or value.startswith("#"):
+            continue
+        parts = [value]
+        while (index < len(lines) and lines[index].strip() and indent_of(lines[index]) > indent
+               and not KEY_LINE.match(lines[index])):
+            parts.append(lines[index].strip())
+            index += 1
+        yield first, yaml_scalar(" ".join(parts)) if len(parts) > 1 else value
 
 
 def is_script(rr, repo, name):
@@ -429,6 +545,10 @@ def check_cargo_config(rr, repo, names, findings):
             if isinstance(table, dict) and "replace-with" in table:
                 findings.append(("cargo-source", f"{rr.shown(name)}:{locate(text, ('source', source, 'replace-with'))} "
                                                  "(a source replacement)"))
+            if isinstance(table, dict) and "git" in table and not REVISION.match(str(table.get("rev", ""))):
+                findings.append(("cargo-git-rev", f"{rr.shown(name)}:{locate(text, ('source', source, 'git'))}"))
+        if "paths" in data:  # a paths override puts local folders in place of crates
+            findings.append(("cargo-source", f"{rr.shown(name)}:{locate(text, ('paths',))} (a paths override)"))
 
 
 def check_cargo(rr, repo, names, findings):
