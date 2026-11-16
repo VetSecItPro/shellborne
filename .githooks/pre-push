@@ -19,22 +19,28 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     if expr "$local_sha" : '0*$' >/dev/null; then
         continue  # deleting a remote branch pushes no content
     fi
+    # The pushed remote's main as last fetched ($1, not a fixed name): commits on it are already published.
+    base=$(git -C "$top" merge-base "$local_sha" "refs/remotes/$remote_name/main" 2>/dev/null || true)
     if expr "$remote_sha" : '0*$' >/dev/null; then
-        range="$local_sha"  # new branch: check its whole history
+        range="$local_sha"  # new branch: the public checks read its whole history
+        if [ -n "$base" ]; then
+            private_range="$base..$local_sha"  # the private half skips what main already published
+        else
+            private_range="$range"
+        fi
     else
         range="$remote_sha..$local_sha"
+        private_range="$range"
     fi
     "$guard" commits "$top" "$range" || status=1
     "$top/tools/gates/secrets" commits "$top" "$range" || status=1
     if [ -n "$private" ]; then
-        "$private/tools/gates/leak-guard-private" commits "$top" "$range" --private "$private" || status=1
+        "$private/tools/gates/leak-guard-private" commits "$top" "$private_range" --private "$private" || status=1
         # The plan check (P0.5.9): every commit not yet on the remote's main cites a step that may start now.
         if [ ! -x "$private/tools/sb-plan" ]; then
             echo "leak-guard: refused: shellborne.privateFolder is set but sb-plan is missing" >&2
             status=1
         else
-            # Measure against the main of the remote being pushed to ($1), not a fixed name.
-            base=$(git -C "$top" merge-base "$local_sha" "refs/remotes/$remote_name/main" 2>/dev/null || true)
             if [ -n "$base" ]; then
                 plan_range="$base..$local_sha"
             else

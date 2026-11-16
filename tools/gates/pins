@@ -151,7 +151,8 @@ def continues(text):
 
 def logical_lines(numbered):
     """(first line number, text) with backslash continuations joined and comment lines dropped. A backslash inside
-    a comment, or one escaped by another, continues nothing."""
+    a comment, or one escaped by another, continues nothing. The join adds nothing, as the shell's does, so a word
+    split across the lines is read whole."""
     pending, start = None, None
     for number, line in numbered:
         if pending is None:
@@ -159,7 +160,7 @@ def logical_lines(numbered):
                 continue
             pending, start = "", number
         if continues(pending + line):
-            pending += line[:-1] + " "
+            pending += line[:-1]  # the shell removes the backslash and the newline and adds nothing
             continue
         yield start, pending + line
         pending = None
@@ -288,11 +289,85 @@ def pipeline_span(masked, start):
 
 
 PRINTERS = ("echo", "printf")  # print their arguments and run nothing
+SAFE_EXPANSION = re.compile(r"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})")  # $NAME or ${NAME}: no operator, no command
+SAFE_REDIRECT = re.compile(r"(?<![\w<>&])(?:[0-9]?>>?|&>>?)\s*/dev/(?:null|stdout|stderr)(?![\w/.-])"
+                           r"|(?<![\w<>&])[0-9]?>&[0-9-](?!\w)")  # to /dev/null or between descriptors
+HERE_STRING = re.compile(r"<<<")
+PROCESS = re.compile(r"<\(([^()]*)\)")  # a process substitution with no parenthesis inside
+NOT_PLAIN = re.compile(r"[`$<>(){};&|]")  # what remains can run, group, redirect or expand: not plain
 
 
-def printed(text, masked, start):
-    """True when start is inside a quoted argument of echo or printf, which only print it; a quoted
-    string a shell runs (sh -c, bash -c, eval) is not printed, so it is still judged."""
+def plain(text):
+    """True when text holds nothing that runs, groups, redirects or expands beyond $NAME, ${NAME} and a
+    redirection to /dev/null or between descriptors, counting quoted text too, which fails closed."""
+    return not NOT_PLAIN.search(SAFE_EXPANSION.sub(" ", SAFE_REDIRECT.sub(" ", text)))
+
+
+def plain_print(text, printers):
+    """True when text is one echo or printf the file has not redefined, with plain arguments."""
+    words = text.split()
+    return bool(words) and words[0] in printers and plain(text)
+
+
+def plain_check(text, printers):
+    """True when the checksum's own stage adds nothing but plain words, a here-string and <( ) process substitutions
+    that are each a plain print."""
+    text = PROCESS.sub(lambda found: " " if plain_print(found.group(1), printers) else found.group(), text)
+    return plain(HERE_STRING.sub(" ", text))
+
+
+def names_without_use(masked, code, index, at, begin, stop, printers):
+    """True when the mention at index, inside the checksum pipeline begin..stop whose checksum command starts at at,
+    names the file without using it. The stages of a pipeline run at once, so a stage that names the file is excused
+    only in a shape that cannot use it: the checksum's own stage, plain (plain_check), or a plain print (plain_print).
+    Anything else, however it would use the file, is not excused, which fails closed."""
+    first = begin
+    for found in SINGLE_PIPE.finditer(masked, begin, index):
+        first = found.end()
+    after = SINGLE_PIPE.search(masked, index, stop)
+    last = after.start() if after else stop
+    stage = code[first:last]
+    return plain_check(stage, printers) if first <= at < last else plain_print(stage, printers)
+
+
+CHANGED_SHELL = re.compile(r"(?<![\w${-])(?:BASH_ENV|ENV|PATH)\s*\+?[=:]|(?<![\w-])hash\s+-p(?![\w-])")
+SHELL_KEY = re.compile(r"(?<![\w-])shell\s*:(.*)")
+STANDARD_SHELL = re.compile(r"(?:bash|sh)(?:\s+(?:--noprofile|--norc|-[eux]+|-[eux]*o\s+pipefail))*(?:\s+\{0\})?")
+SOURCED = re.compile(r"(?<![\w./-])(?:source|\.)(?=\s)")
+PATH_FILE = re.compile(r"GITHUB_PATH")
+
+
+def shell_changed(text):
+    """True when a file can change which command a word runs, for the whole file: a BASH_ENV, ENV or PATH value
+    (an assignment, an export or a YAML env key), hash -p, or a workflow shell other than bash or sh with only
+    options that load nothing (--noprofile, --norc, -e, -u, -x, -o pipefail) and the {0} template."""
+    if CHANGED_SHELL.search(text):
+        return True
+    return any(not STANDARD_SHELL.fullmatch(re.sub(r"\s+#.*$", "", found.group(1)).strip().strip("'\""))
+               for found in SHELL_KEY.finditer(text))
+
+
+def shadowed(masks, codes, names):
+    """The names a file redefines as a function (name() or function name) or an alias, or loads or turns off as a
+    builtin with enable: a redefined echo can run what it is given, and a redefined checksum command can check
+    nothing, so neither is trusted anywhere in the file. A definition counts in quotes too (alias 'echo=...',
+    eval 'echo() {...}'), unless it is text that only an echo or printf prints."""
+    found = set()
+    for masked, code in zip(masks, codes):
+        for name in names:
+            word = re.escape(name)
+            pattern = (rf"(?:^|[\s;&|({{'\"])(?P<a>{word})\s*\(\s*\)|(?<![\w-])(?P<b>function)\s+{word}(?![\w-])"
+                       rf"|(?<![\w-])(?P<c>alias|enable)\b[^;&|]*?(?<![\w./-]){word}(?:=|(?![\w./-]))")
+            for match in re.finditer(pattern, code):
+                at = match.start(match.lastgroup)
+                if not printed(code, masked, at, PRINTERS):
+                    found.add(name)
+    return found
+
+
+def printed(text, masked, start, printers):
+    """True when start is inside a quoted argument of echo or printf, which only print it, unless the file redefines
+    that word; a quoted string a shell runs (sh -c, bash -c, eval) is not printed, so it is still judged."""
     if masked[start] == text[start]:
         return False
     if "$(" in text or "`" in text:  # a command substitution runs inside a printed string
@@ -302,7 +377,7 @@ def printed(text, masked, start):
     for found in SEPARATOR.finditer(head):
         last = found.end()
     words = [word for word in head[last:].split() if word not in COMMAND_PREFIXES]
-    return bool(words) and words[0].rsplit("/", 1)[-1] in PRINTERS
+    return bool(words) and words[0].rsplit("/", 1)[-1] in printers
 
 
 def mentions(code, name):
@@ -312,15 +387,22 @@ def mentions(code, name):
     return [found.start() for found in re.finditer(r"(?<![\w.-])" + re.escape(base) + r"(?![\w-])", code)]
 
 
-def command_findings(lines, rules):
-    """(rule, line number) for each unlocked build and unverified download in a file's command lines."""
-    found, downloads, checks, codes = [], [], [], []
+def command_findings(lines, rules, changed=False):
+    """(rule, line number) for each unlocked build and unverified download in a file's command lines. changed says
+    the file can change which command a word runs (shell_changed), so no printing or checksum word is trusted."""
+    found, downloads, checks = [], [], []
+    masks, codes = map(list, zip(*(shell_mask(text) for _, text in lines))) if lines else ([], [])
+    checkers = {word.split()[0] for word in rules["words"][("checksums", "commands")]}
+    untrusted = shadowed(masks, codes, set(PRINTERS) | checkers)
+    if changed or any(in_command_position(masked, found.start()) for masked in masks for found in SOURCED.finditer(masked)):
+        untrusted = set(PRINTERS) | checkers  # a sourced script or a changed shell or PATH can redefine any of them
+    path_from = next((seq for seq, code in enumerate(codes) if PATH_FILE.search(code)), None)  # later steps only
+    printers = tuple(word for word in PRINTERS if word not in untrusted)
     for seq, (number, text) in enumerate(lines):  # seq orders commands, since one line can hold several runs
-        masked, code = shell_mask(text)
-        codes.append(code)
+        masked, code = masks[seq], codes[seq]
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
-                if printed(text, masked, match.start()):
+                if printed(text, masked, match.start(), printers):
                     continue
                 source = masked if masked[match.start()] == text[match.start()] else code  # a quoted command
                 rest = segment_after(source, match.end()).split()
@@ -330,7 +412,7 @@ def command_findings(lines, rules):
                     found.append(("unlocked-build", number))
         for word, pattern in rules["downloads"]:
             for match in pattern.finditer(text):
-                if printed(text, masked, match.start()):
+                if printed(text, masked, match.start(), printers):
                     continue
                 if word in ("git fetch", "git pull") and fetch_from_origin(segment_after(text, match.end())):
                     continue
@@ -341,7 +423,8 @@ def command_findings(lines, rules):
                                   download_name(word, segment_after(code, match.end())), piped))
         for pattern in rules["checksums"]:
             for match in pattern.finditer(masked):
-                if in_command_position(masked, match.start()):
+                if (in_command_position(masked, match.start()) and masked[match.start():].split()[0] not in untrusted
+                        and (path_from is None or seq <= path_from)):
                     begin, end = pipeline_span(masked, match.start())
                     pipeline = code[begin:end]
                     if HEX_DIGEST.search(pipeline):  # a digest file made from the download proves nothing
@@ -357,15 +440,17 @@ def command_findings(lines, rules):
             continue
         if name is None:
             continue
-        first_seq, _, first_begin, _ = min(verifying)
+        first_seq, _, _, first_stop = min(verifying)  # a use inside the first check's own pipeline counts too
 
         def excused(command, index):
-            """The download's own command, or any verifying checksum's pipeline, names the file without using it."""
+            """The download's own command, or a verifying checksum's pipeline in a stage that only prints text or is
+            the checksum itself, names the file without using it."""
             if command == seq and start <= index < until:
                 return True
             return any(command == check_seq and begin <= index < stop
-                       for check_seq, _, begin, stop in verifying)
-        used = any((seq, end) < (command, index) < (first_seq, first_begin) and not excused(command, index)
+                       and names_without_use(masks[command], codes[command], index, at, begin, stop, printers)
+                       for check_seq, at, begin, stop in verifying)
+        used = any((seq, end) < (command, index) < (first_seq, first_stop) and not excused(command, index)
                    for command, code in enumerate(codes) for index in mentions(code, name))
         if used:
             found.append(("download-used-before-check", number))
@@ -453,6 +538,9 @@ def yaml_double(body):
             if int(digits, 16) > 0x10FFFF:
                 raise Broken(f"a double-quoted run value holds the escape \\{code}{digits}, beyond Unicode, which is "
                              "not valid YAML, so the workflow cannot be read")
+            if 0xD800 <= int(digits, 16) <= 0xDFFF:
+                raise Broken(f"a double-quoted run value holds the escape \\{code}{digits}, a surrogate that names no "
+                             "character, which is not valid YAML, so the workflow cannot be read")
             out.append(chr(int(digits, 16)))
             index += 2 + YAML_HEX[code]
         else:
@@ -474,10 +562,65 @@ def indent_of(line):
     return len(line) - len(line.lstrip())
 
 
+def block_indent(block, indent, header):
+    """The content indentation of a block scalar whose key sits at column indent: the key's column plus an explicit
+    indentation indicator (|2, |-2, |2-), else the indentation of the first non-empty line, as YAML detects it."""
+    found = re.fullmatch(r"[|>](?:([1-9])[+-]?|[+-]([1-9])?)?(?:\s+#.*)?", header)
+    if not found:
+        raise Broken("a block run value's header is not a valid YAML block header (| or >, then at most one "
+                     "indentation digit and one chomping sign, then only a comment), so the workflow cannot be read")
+    digit = found.group(1) or found.group(2)
+    if digit:
+        return indent + int(digit)
+    return next((indent_of(text) for _, text in block if text.strip()), 0)
+
+
+def block_body(block, indent, header, kind):
+    """(line number, text) of a block scalar's lines with its indentation removed, as YAML removes it. A # comment
+    left of the indentation is a trailing comment that ends the block; any other text left of it, or after such a
+    comment, is not valid YAML."""
+    content = block_indent(block, indent, header)
+    trailing = False
+    for number, text in block:
+        if not text.strip():
+            if not trailing:
+                yield number, ""
+            continue
+        if trailing or indent_of(text) < content:
+            if text.strip().startswith("#"):
+                trailing = True
+                continue
+            raise Broken(f"line {number} of a {kind} run block sits left of the block's indentation, which is not "
+                         "valid YAML, so the workflow cannot be read")
+        yield number, text[content:]
+
+
+def folded_lines(body):
+    """A folded block's commands as YAML folds them, each at its first line: a line break between two lines at the
+    block's indentation becomes a space; a blank line, or a line indented further, keeps its breaks, so it ends the
+    command before it and a further-indented line is a command of its own."""
+    pending = None
+    for number, text in body:
+        if text and not text[:1].isspace():
+            if pending:
+                pending[1].append(text)
+            else:
+                pending = (number, [text])
+            continue
+        if pending:
+            yield pending[0], " ".join(pending[1])
+            pending = None
+        if text.strip():
+            yield number, text
+    if pending:
+        yield pending[0], " ".join(pending[1])
+
+
 def run_lines(lines):
     """(line number, text) of every command inside a workflow or action run: value, in every YAML form:
-    a literal block line by line; a folded block or a plain scalar continued on deeper lines joined with spaces, as
-    YAML joins them, at the first line; and a run value inside a flow mapping."""
+    a literal block line by line and a folded block as YAML folds it, each with the block's indentation removed;
+    a plain scalar continued on deeper lines joined with spaces, as YAML joins them, at the first line; and a run
+    value inside a flow mapping."""
     index = 0
     while index < len(lines):
         match = re.match(r"^(\s*(?:-\s+)?)(?:run|\"run\"|'run')\s*:\s*(.*)$", lines[index])
@@ -497,17 +640,8 @@ def run_lines(lines):
             while index < len(lines) and (not lines[index].strip() or indent_of(lines[index]) > indent):
                 block.append((index + 1, lines[index]))
                 index += 1
-            if not folded:
-                yield from block
-                continue
-            paragraph, first = [], None
-            for number, text in block + [(None, "")]:
-                if text.strip():
-                    first = first or number
-                    paragraph.append(text.strip())
-                elif paragraph:
-                    yield first, " ".join(paragraph)
-                    paragraph, first = [], None
+            body = list(block_body(block, indent, value, "folded" if folded else "literal"))
+            yield from (folded_lines(body) if folded else body)
             continue
         first = index + 1
         index += 1
@@ -842,7 +976,7 @@ def main(argv):
                 images = []
             else:
                 continue
-            for rule, number in command_findings(commands, rules):
+            for rule, number in command_findings(commands, rules, shell_changed(rr.read_source(repo, name))):
                 findings.append((rule, f"{rr.shown(name)}:{number}"))
             for number in images:
                 findings.append(("docker-digest", f"{rr.shown(name)}:{number} (an image with no sha256 digest)"))
