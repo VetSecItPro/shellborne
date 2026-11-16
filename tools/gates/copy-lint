@@ -97,7 +97,7 @@ APPKIT_IMPORT = re.compile(r"^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|pr
 APPKIT_SINK = re.compile(
     r"(?:\bNS(?:MenuItem|Menu|Button|Alert|Window)\s*\(\s*title\s*:\s*"
     r"|\bNSTextField\s*\(\s*(?:labelWithString|wrappingLabelWithString|string)\s*:\s*"
-    r"|\.(?:title|stringValue|toolTip|placeholderString|messageText|informativeText|label)\s*=\s*)$")
+    r"|\.(?:title|stringValue|toolTip|placeholderString|messageText|informativeText|label)\s*(?:/\*.*?\*/\s*)*=\s*)$")
 RUST_RAW = re.compile(r'[bc]?r(#*)"')
 SWIFT_RAW = re.compile(r'(#+)("""|")')
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"', "'": "'", "\\": "\\"}

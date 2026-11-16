@@ -81,6 +81,7 @@ BRACKET = re.compile(r"\[['\"]([\w-]+)['\"]\]")
 PR_TOKEN = re.compile(r"pull_request(?![\w-])")
 RUN_KEY = re.compile(r"(?:^[\s?-]*|[{,\[]\s*|\?\s+)(['\"]?)run\1\s*:")
 CHECKOUT_KEY = re.compile(r"(?:^[\s?-]*|[{,\[]\s*)(['\"]?)(ref|repository)\1\s*:", re.IGNORECASE)
+FLOW_WITH = re.compile(r"[{,]\s*(?:with|\"with\"|'with')\s*:")
 EXPLICIT_ANY = re.compile(r"^\s*(?:-\s+)?\?(?:\s|$)")
 EXPLICIT_KEY = re.compile(r"\?\s+['\"]?(ref|repository)['\"]?(?![\w-])", re.IGNORECASE)
 
@@ -192,6 +193,9 @@ def with_expression(lines):
     indented past the key's column: an action input can run as a script (actions/github-script's script:), and the
     head handed to an action is no longer data. Whole lines are read, comments included."""
     for index, line in enumerate(lines):
+        flow = FLOW_WITH.search(line)
+        if flow and "${{" in line[flow.end():]:  # a with mapping inside a flow-mapping step
+            return True
         found = re.match(r"^(\s*)(?:-\s+)?(?:with|\"with\"|'with')\s*:(.*)$", line)
         if not found:
             continue

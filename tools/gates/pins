@@ -278,6 +278,8 @@ def printed(text, masked, start):
     string a shell runs (sh -c, bash -c, eval) is not printed, so it is still judged."""
     if masked[start] == text[start]:
         return False
+    if "$(" in text or "`" in text:  # a command substitution runs inside a printed string
+        return False
     head = masked[:start]
     last = 0
     for found in SEPARATOR.finditer(head):
@@ -404,10 +406,40 @@ FLOW_RUN = re.compile(r"[{,]\s*(?:run|\"run\"|'run')\s*:\s*(\"(?:[^\"\\]|\\.)*\"
 KEY_LINE = re.compile(r"^\s*(?:-\s+)?[A-Za-z_][\w-]*\s*:(?:\s|$)")
 
 
+YAML_ESCAPES = {"0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t", "n": "\n", "v": "\v", "f": "\f",
+                "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\x85", "_": "\xa0",
+                "L": "\u2028", "P": "\u2029"}
+YAML_HEX = {"x": 2, "u": 4, "U": 8}
+
+
+def yaml_double(body):
+    """A double-quoted YAML scalar's escapes decoded as YAML defines them, so the gate reads the command GitHub runs;
+    an escape YAML does not define is kept as written."""
+    out, index = [], 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\" or index + 1 >= len(body):
+            out.append(char)
+            index += 1
+            continue
+        code = body[index + 1]
+        if code in YAML_ESCAPES:
+            out.append(YAML_ESCAPES[code])
+            index += 2
+        elif code in YAML_HEX and re.fullmatch(r"[0-9A-Fa-f]+", body[index + 2:index + 2 + YAML_HEX[code]] or "x") \
+                and len(body[index + 2:index + 2 + YAML_HEX[code]]) == YAML_HEX[code]:
+            out.append(chr(int(body[index + 2:index + 2 + YAML_HEX[code]], 16)))
+            index += 2 + YAML_HEX[code]
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
 def yaml_scalar(value):
     """A whole single- or double-quoted YAML scalar without its quotes; any other value as it is."""
     if len(value) >= 2 and value[0] == value[-1] == '"':
-        return value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        return yaml_double(value[1:-1])
     if len(value) >= 2 and value[0] == value[-1] == "'":
         return value[1:-1].replace("''", "'")
     return value
@@ -461,7 +493,7 @@ def run_lines(lines):
                and not KEY_LINE.match(lines[index])):
             parts.append(lines[index].strip())
             index += 1
-        yield first, yaml_scalar(" ".join(parts)) if len(parts) > 1 else value
+        yield first, yaml_scalar(" ".join(parts)) if len(parts) > 1 or value[:1] in "\"'" else value
 
 
 def is_script(rr, repo, name):
