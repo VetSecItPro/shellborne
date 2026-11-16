@@ -289,6 +289,7 @@ def pipeline_span(masked, start):
 
 
 PRINTERS = ("echo", "printf")  # print their arguments and run nothing
+REDIRECTED = re.compile(r"[<>]\s*[^\s<>|;&]*$")  # the word ending here follows < or >, through quotes or a path
 
 
 def names_without_use(masked, code, index, at, begin, stop):
@@ -300,8 +301,8 @@ def names_without_use(masked, code, index, at, begin, stop):
         first = found.end()
     after = SINGLE_PIPE.search(masked, index, stop)
     last = after.start() if after else stop
-    if code[:index].rstrip().endswith((">", "<")):
-        return False  # a redirection's target is written or read by the stage itself
+    if REDIRECTED.search(code[:index]):
+        return False  # a redirection's target (> "tool.tgz", < ./tool.tgz) is written or read by the stage itself
     for start, end, inner in substitutions(code):
         if start <= index < end:
             words = code[inner:end].split()
