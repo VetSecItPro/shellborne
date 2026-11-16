@@ -37,7 +37,7 @@ The linker's -platform_version macos N and -macos(x)_version_min N (bare, throug
 -apple-darwinN triple (Darwin 25 is macOS 26; an unversioned triple names no version) and fish's set with an export
 flag are read too. A project file is read whole, comments removed, split on
 braces and semicolons outside quoted strings, so an object written on one line is judged like one split over lines.
-A script or workflow line is judged with its # comment blanked. A minimum-version flag in a Swift file is judged only on code (comments and string literals blanked) and inside the
+A script or workflow line is judged with its # comment blanked, after its backslash continuations are joined, and each workflow or action run value is judged again as YAML joins it (pins reads both the same way). A minimum-version flag in a Swift file is judged only on code (comments and string literals blanked) and inside the
 string literals of an unsafeFlags call.
 """
 import importlib.machinery
@@ -52,6 +52,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 SOURCE_READER = HERE / "repo-rules"
 SHARED = HERE / "mach-o-reader"
+COMMAND_READER = HERE / "pins"  # the one reader of shell continuations and YAML run values
 GATE = "build-settings"
 PACKAGE = "apple/Package.swift"
 SLICES = {"arm64", "x86_64"}
@@ -97,6 +98,7 @@ def load(name, path):
 
 RR = load("repo_rules", SOURCE_READER)
 MO = load("mach_o_reader", SHARED)
+COMMANDS = load("pins_commands", COMMAND_READER)
 BROKEN = (RR.Broken, MO.Broken)
 
 
@@ -446,8 +448,18 @@ def without_comment(line):
     return line
 
 
+def script_lines(name, text):
+    """(first line number, text) of every logical line, continuations joined, plus, in a workflow or action, every
+    run value as YAML joins it, so a flag split across lines is read whole."""
+    physical = text.splitlines()
+    lines = list(COMMANDS.logical_lines(enumerate(physical, 1)))
+    if name.startswith((".github/workflows/", ".github/actions/")):
+        lines += list(COMMANDS.logical_lines(COMMANDS.run_lines(physical)))
+    return lines
+
+
 def judge_script(name, text, found):
-    for number, line in enumerate(text.splitlines(), 1):
+    for number, line in script_lines(name, text):
         line = without_comment(line)
         if any(not exact_26(v.rstrip(".")) for v in literal_assignments(line)) or flag_findings(line):
             found.add(("deployment-target", f"{RR.shown(name)}:{number}"))

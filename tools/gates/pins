@@ -70,7 +70,7 @@ SCRIPT_NAMES = ("Makefile", "makefile", "GNUmakefile", "justfile")
 SHELL_SHEBANG = re.compile(r"^#!\s*\S*(?:/|\benv\s+)(?:ba|z|da|k)?sh\b")
 DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
 SEPARATOR = re.compile(r"&&|\|\||;|\|")
-PIPELINE_END = re.compile(r"&&|\|\||;")
+PIPELINE_END = re.compile(r"&&|\|\||;|(?<![<>&|])&(?![&>])")  # a bare & runs the command before it in the background
 SINGLE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # Words that may stand before a command and still leave it in command position.
 COMMAND_PREFIXES = {"if", "then", "do", "else", "elif", "while", "until", "!", "{", "(", "time", "sudo", "command",
@@ -262,7 +262,8 @@ def fetch_from_origin(arguments):
 
 
 def pipeline_span(masked, start):
-    """(begin, end) of the pipeline holding start, bounded by ;, && and ||, never a single |."""
+    """(begin, end) of the pipeline holding start, bounded by ;, &&, || and a bare &, never a single | or a
+    redirection such as 2>&1 or &>."""
     begin = 0
     for found in PIPELINE_END.finditer(masked[:start]):
         begin = found.end()
@@ -297,10 +298,10 @@ def mentions(code, name):
 
 def command_findings(lines, rules):
     """(rule, line number) for each unlocked build and unverified download in a file's command lines."""
-    found, downloads, checks, codes = [], [], [], {}
-    for number, text in lines:
+    found, downloads, checks, codes = [], [], [], []
+    for seq, (number, text) in enumerate(lines):  # seq orders commands, since one line can hold several runs
         masked, code = shell_mask(text)
-        codes[number] = code
+        codes.append(code)
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
                 if printed(text, masked, match.start()):
@@ -319,7 +320,7 @@ def command_findings(lines, rules):
                     continue
                 _, until = pipeline_span(masked, match.end())
                 piped = bool(SINGLE_PIPE.search(masked, match.end(), until))  # curl ... | sh
-                downloads.append((number, match.start(), match.end(), until,
+                downloads.append((seq, number, match.start(), match.end(), until,
                                   download_name(word, segment_after(code, match.end())), piped))
         for pattern in rules["checksums"]:
             for match in pattern.finditer(masked):
@@ -327,10 +328,10 @@ def command_findings(lines, rules):
                     begin, end = pipeline_span(masked, match.start())
                     pipeline = code[begin:end]
                     if HEX_DIGEST.search(pipeline):  # a digest file made from the download proves nothing
-                        checks.append((number, match.start(), pipeline, begin, end))
-    for number, start, end, until, name, piped in downloads:
-        verifying = [(check_number, at, begin, stop) for check_number, at, pipeline, begin, stop in checks
-                     if (check_number, at) > (number, end) and (name is None or names_file(pipeline, name))]
+                        checks.append((seq, match.start(), pipeline, begin, end))
+    for seq, number, start, end, until, name, piped in downloads:
+        verifying = [(check_seq, at, begin, stop) for check_seq, at, pipeline, begin, stop in checks
+                     if (check_seq, at) > (seq, end) and (name is None or names_file(pipeline, name))]
         if not verifying:
             found.append(("unverified-download", number))
             continue
@@ -339,16 +340,16 @@ def command_findings(lines, rules):
             continue
         if name is None:
             continue
-        first_number, _, first_begin, _ = min(verifying)
+        first_seq, _, first_begin, _ = min(verifying)
 
-        def excused(line, index):
+        def excused(command, index):
             """The download's own command, or any verifying checksum's pipeline, names the file without using it."""
-            if line == number and start <= index < until:
+            if command == seq and start <= index < until:
                 return True
-            return any(line == check_line and begin <= index < stop
-                       for check_line, _, begin, stop in verifying)
-        used = any((number, end) < (line, index) < (first_number, first_begin) and not excused(line, index)
-                   for line, code in codes.items() for index in mentions(code, name))
+            return any(command == check_seq and begin <= index < stop
+                       for check_seq, _, begin, stop in verifying)
+        used = any((seq, end) < (command, index) < (first_seq, first_begin) and not excused(command, index)
+                   for command, code in enumerate(codes) for index in mentions(code, name))
         if used:
             found.append(("download-used-before-check", number))
     return found

@@ -96,8 +96,9 @@ APPKIT_IMPORT = re.compile(r"^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|pr
                            r"(?:AppKit|Cocoa)\b", re.MULTILINE)  # a scoped import (import class AppKit.NSButton) too
 APPKIT_SINK = re.compile(
     r"(?:\bNS(?:MenuItem|Menu|Button|Alert|Window)\s*\(\s*title\s*:\s*"
+    r"|\bNSButton\s*\(\s*(?:checkboxWithTitle|radioButtonWithTitle)\s*:\s*"
     r"|\bNSTextField\s*\(\s*(?:labelWithString|wrappingLabelWithString|string)\s*:\s*"
-    r"|\.(?:title|stringValue|toolTip|placeholderString|messageText|informativeText|label)\s*(?:/\*.*?\*/\s*)*=\s*)$")
+    r"|\.(?:title|stringValue|toolTip|placeholderString|messageText|informativeText|label)\s*=\s*)$")  # matched on the squeezed view, where comments are blanked
 RUST_RAW = re.compile(r'[bc]?r(#*)"')
 SWIFT_RAW = re.compile(r'(#+)("""|")')
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"', "'": "'", "\\": "\\"}
@@ -241,12 +242,15 @@ def opened_string(text, index, rust):
     return None
 
 
-def literals(rr, name, text, rust):
-    """Each string literal outside a comment: (offset of its opening quote, offset of its content, content)."""
+def literals(rr, name, text, rust, skipped=None):
+    """Each string literal outside a comment: (offset of its opening quote, offset of its content, content). When
+    skipped is a list, the (kind, begin, end) of every comment and literal is appended to it."""
     out, index, size = [], 0, len(text)
+    skipped = [] if skipped is None else skipped
     while index < size:
         if text.startswith("//", index):
             end = text.find("\n", index)
+            skipped.append(("comment", index, size if end < 0 else end))
             index = size if end < 0 else end
             continue
         if text.startswith("/*", index):
@@ -260,6 +264,7 @@ def literals(rr, name, text, rust):
                     at += 1
             if depth:
                 raise rr.Broken(f"{rr.shown(name)} has a block comment that never closes, so it cannot be read")
+            skipped.append(("comment", index, at))
             index = at
             continue
         found = opened_string(text, index, rust)
@@ -271,6 +276,7 @@ def literals(rr, name, text, rust):
                     raise rr.Broken(f"{rr.shown(name)} has a string that never closes, so it cannot be read")
                 at += 2 if escapes and text[at] == "\\" else 1
             out.append((index, start, text[start:at]))
+            skipped.append(("literal", index, at + len(close)))
             index = at + len(close)
             continue
         if rust and text[index] == "'":  # a character literal, so a quote inside it opens no string
@@ -324,12 +330,35 @@ def path_names_sparkle(name):
 
 def framework_literal(name, text, quote, content):
     """True for a Package.swift literal that references the Sparkle updater framework: its package URL, or its
-    name given as a .product name or a package argument."""
+    name given as a .product name or a package argument. text is the squeezed view and quote an offset in it."""
     if pathlib.PurePosixPath(name).name != MANIFEST:
         return False
     if FRAMEWORK_URL.fullmatch(content):
         return True
-    return content == FRAMEWORK and bool(FRAMEWORK_ARGUMENT.search(text, max(0, quote - 120), quote))
+    return content == FRAMEWORK and bool(FRAMEWORK_ARGUMENT.search(text, max(0, quote - LOOK_BACK), quote))
+
+
+LOOK_BACK = 120  # characters of squeezed code before a literal: longer than any sink, and whitespace never counts
+
+
+def squeezed(text, skipped):
+    """The code with comments blanked, literals replaced by a placeholder and every run of white space cut to one
+    space, plus where each offset of text lands in it, so a sink is found however far whitespace or comments push
+    it from its literal."""
+    marks = list(text)
+    for kind, begin, end in skipped:
+        for at in range(begin, end):
+            marks[at] = " " if kind == "comment" else "\0"
+    out, where = [], [0] * (len(text) + 1)
+    for at, char in enumerate(marks):
+        where[at] = len(out)
+        if char.isspace():
+            if out and out[-1] == " ":
+                continue
+            char = " "
+        out.append(char)
+    where[len(text)] = len(out)
+    return "".join(out), where
 
 
 def file_hits(rr, table, name, text, keys):
@@ -341,13 +370,17 @@ def file_hits(rr, table, name, text, keys):
     if lowered.endswith(".xcstrings") or name.startswith("docs/") or lowered.endswith(".md"):
         hits += prose_hits(table, name, text)
     if swift or cli:
-        for quote, start, content in literals(rr, name, text, rust=cli):
+        skipped = []
+        found = literals(rr, name, text, rust=cli, skipped=skipped)
+        view, where = squeezed(text, skipped) if swift else ("", [])
+        for quote, start, content in found:
             hits += prose_hits(table, name, content, start)
-            if swift and names_sparkle(content) and not framework_literal(name, text, quote, content):
+            at = where[quote] if swift else 0
+            if swift and names_sparkle(content) and not framework_literal(name, view, at, content):
                 hits.append(("sparkle-icon", start))
-            if swift and appkit and APPKIT_SINK.search(text, max(0, quote - 120), quote):
+            if swift and appkit and APPKIT_SINK.search(view, max(0, at - LOOK_BACK), at):
                 hits.append(("appkit-unlocalized", start))
-            elif swift and UI_CALL.search(text, max(0, quote - 120), quote):
+            elif swift and UI_CALL.search(view, max(0, at - LOOK_BACK), at):
                 plain = unescaped(content)
                 if plain and plain not in keys:
                     hits.append(("ui-literal", start))
