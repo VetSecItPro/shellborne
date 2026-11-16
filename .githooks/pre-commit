@@ -7,9 +7,18 @@ if [ ! -x "$guard" ]; then
     echo "leak-guard: refused: the guard is missing at tools/gates/leak-guard" >&2
     exit 1
 fi
+private=$(git config --get shellborne.privateFolder)
+if [ -n "$private" ] && [ ! -x "$private/tools/gates/leak-guard-private" ]; then
+    echo "leak-guard: refused: shellborne.privateFolder is set but its guard is missing" >&2
+    exit 1
+fi
 status=0
 "$guard" staged "$top" || status=1
 "$top/tools/gates/secrets" staged "$top" || status=1
+if [ -n "$private" ]; then
+    # The private comparison runs at commit too, so copied private text is refused before it is in any commit.
+    "$private/tools/gates/leak-guard-private" staged "$top" --private "$private" || status=1
+fi
 posts=$(git diff --cached --name-only --diff-filter=ACMR -- docs/_posts)
 if [ -n "$posts" ] && [ -x "$top/tools/gates/devlog-check" ]; then
     # Check the entries as staged, not as they are on disk.
