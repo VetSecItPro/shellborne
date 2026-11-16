@@ -16,13 +16,15 @@ Checks every tracked file in .github/workflows/ (.yml or .yaml) and every tracke
     (an explicit `permissions: {}` counts), or `write-all` anywhere;
   - untrusted-trigger: `pull_request_target` or `workflow_run`, which hand secrets or a write token
     to code from an untrusted pull request. The one exception is a pull_request_target workflow that opts in
-    with `# untrusted-trigger: base-only` and keeps its terms (see base_only below). In such a workflow the whole
+    with `# untrusted-trigger: base-only`, is .github/workflows/plan-attestation.yml exactly (the marker at any other
+    path is refused), and keeps its terms (see base_only below). In such a workflow the whole
     text, comments included, may hold no secrets reference in any form or case (secrets.X, secrets['X'],
     toJSON(secrets)), no head_ref (GITHUB_HEAD_REF included), no pull request head in dotted or bracket form except
     the head SHA as a whole env value, no pull/ ref, no `ref` or `repository` key in block, flow or explicit form,
     no YAML escape (\\x, \\u, \\U, or a backslash at a line end) that could spell one of those names, and no
     `${{` expression inside a run value, on its line or on the deeper lines after it, because pull request text
-    there is script injection. A step's env may still hold expressions. These terms keep pull request code from
+    there is script injection, and none inside a with: block, at any depth or in flow form, since an action input
+    can run as a script and a head handed to an action is no longer data. A step's env may still hold expressions. These terms keep pull request code from
     being checked out by the workflow, but they cannot stop a run step from executing content it fetched as data,
     such as a head commit whose SHA arrives through an env variable; a change to a base-only workflow relies on
     the owner's review;
@@ -69,6 +71,7 @@ PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
 DIGEST = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
 UNTRUSTED = re.compile(r"\b(pull_request_target|workflow_run)\b")
 BASE_ONLY = "# untrusted-trigger: base-only"
+BASE_ONLY_PATH = ".github/workflows/plan-attestation.yml"  # the one workflow the exception exists for
 HEAD_AS_DATA = re.compile(r"^\s+[A-Z_]+:\s*\$\{\{\s*github\.event\.pull_request\.head\.sha\s*\}\}\s*$")
 SECRETS_WORD = re.compile(r"(?<![\w-])secrets(?![\w-])", re.IGNORECASE)
 BASE_ONLY_WORDS = re.compile(r"head_ref|pull/", re.IGNORECASE)
@@ -182,13 +185,34 @@ def run_expression(lines):
     return False
 
 
-def base_only(lines):
+def with_expression(lines):
+    """True when a `${{` expression stands inside a with: block, on its line (a flow mapping) or on any later line
+    indented past the key's column: an action input can run as a script (actions/github-script's script:), and the
+    head handed to an action is no longer data. Whole lines are read, comments included."""
+    for index, line in enumerate(lines):
+        found = re.match(r"^(\s*)(?:-\s+)?with\s*:(.*)$", line)
+        if not found:
+            continue
+        if "${{" in found.group(2):
+            return True
+        column = line.index("with")  # the key's own column, also when it opens a list item (- with:)
+        for later in lines[index + 1:]:
+            if later.strip() and indent(later) <= column:
+                break
+            if "${{" in later:
+                return True
+    return False
+
+
+def base_only(lines, rel):
     """True when a pull_request_target workflow opts in to the base-only exception and keeps its terms: a
     read-only token, no secrets in any form, no head_ref, no pull/ ref, no checkout of another ref or
     repository in any YAML form, no escape that could spell a name, the head only as its SHA in an env value,
     and never workflow_run. GitHub then runs the base branch's copy and no pull request code runs. Comments
     are read too, so a stray quote cannot hide a reference behind a hash."""
     text = "\n".join(lines)
+    if rel != BASE_ONLY_PATH:  # the exception exists for one workflow, never claimed by another
+        return False
     if BASE_ONLY not in lines or "workflow_run" in text or SECRETS_WORD.search(text) or BASE_ONLY_WORDS.search(text):
         return False
     if any(YAML_ESCAPE.search(line) for line in lines):
@@ -206,7 +230,7 @@ def base_only(lines):
         return False
     if any(CHECKOUT_KEY.search(line) or EXPLICIT_KEY.search(line) for line in lines):
         return False
-    if run_expression(lines):
+    if run_expression(lines) or with_expression(lines):
         return False
     return not any(names_head(line) and not HEAD_AS_DATA.match(line) for line in lines)
 
@@ -333,7 +357,7 @@ def check_file(rel, text, is_workflow, patterns, findings):
     lines = text.splitlines()
     shown = rel
     if is_workflow:
-        exempt = base_only(lines)
+        exempt = base_only(lines, rel)
         if not any(re.match(r"^permissions\s*:", line) for line in lines):
             findings.append(("permissions", f"{shown} (no top-level permissions block)"))
         for number in jobs_without_permissions(lines):
