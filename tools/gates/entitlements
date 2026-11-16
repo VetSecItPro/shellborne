@@ -14,6 +14,9 @@ names the slice's architecture after the path):
   - entitlement-mismatch: a key or value that differs from the committed plist in any way, type included;
   - missing-reason: a committed key with no reason, an empty one, or one holding a placeholder word as repo-rules
     defines them, named at the key's line in the plist;
+  - value-unreviewed: a committed key whose value is not true (a list, string, number or dictionary can widen) and
+    whose values entry does not hold the SHA-256 of that value as plistlib writes it in XML with sorted keys, so a
+    reason covers the value it was written for, never a wider one;
   - helper-without-sandbox: a helper whose built or committed entitlements do not turn App Sandbox on;
   - app-with-sandbox: an app whose built or committed entitlements turn App Sandbox on;
   - no-hardened-runtime: a binary signed without the hardened runtime flag;
@@ -32,6 +35,7 @@ or plist and never prints a reason or a value. Each run first proves the gate re
 extra key; if it does not, the gate is broken. Limit: a global event tap is a privacy grant, not an entitlement, so a
 source rule in repo-rules refuses it instead. Exit 0 clean, 1 refused, 2 broken or not run.
 """
+import hashlib
 import importlib.machinery
 import importlib.util
 import os
@@ -49,6 +53,7 @@ CONTROL = ('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
 
 HERE = pathlib.Path(__file__).resolve().parent
 READER = HERE / "repo-rules"
+SHA256 = re.compile(r"[0-9a-f]{64}")
 TABLE_NAME = "entitlements.toml"
 GATE = "entitlements"
 CODESIGN = "/usr/bin/codesign"
@@ -152,12 +157,17 @@ def load_table(rr, raw):
         raise rr.Broken(f"{TABLE_NAME} must list between 1 and {MAX_BINARIES} [[binary]] entries")
     seen = set()
     for entry in binaries:
-        if (not isinstance(entry, dict) or set(entry) != {"path", "role", "plist", "reasons"}
+        values = entry.get("values", {}) if isinstance(entry, dict) else None
+        if (not isinstance(entry, dict) or not {"path", "role", "plist", "reasons"} <= set(entry)
+                or set(entry) - {"path", "role", "plist", "reasons", "values"}
                 or not relative(entry["path"]) or entry["role"] not in ROLES or not relative(entry["plist"])
                 or not isinstance(entry["reasons"], dict)
-                or not all(isinstance(k, str) and isinstance(v, str) for k, v in entry["reasons"].items())):
+                or not all(isinstance(k, str) and isinstance(v, str) for k, v in entry["reasons"].items())
+                or not isinstance(values, dict)
+                or not all(isinstance(k, str) and isinstance(v, str) and SHA256.fullmatch(v) for k, v in values.items())):
             raise rr.Broken(f"{TABLE_NAME}: a [[binary]] entry needs exactly a relative path, a role (app, daemon, "
-                            "attach or helper), a relative plist and a table of reasons")
+                            "attach or helper), a relative plist, a table of reasons and, optionally, a table of "
+                            "value hashes (64 lowercase hex)")
         if entry["path"] in seen:
             raise rr.Broken(f"{TABLE_NAME}: the binary {rr.shown(entry['path'])} is listed twice")
         seen.add(entry["path"])
@@ -181,6 +191,11 @@ def same(left, right):
     return left == right
 
 
+def value_hash(value):
+    """SHA-256 of a value as plistlib writes it in XML with sorted keys: what a values entry records."""
+    return hashlib.sha256(plistlib.dumps(value, fmt=plistlib.FMT_XML, sort_keys=True)).hexdigest()
+
+
 def key_line(text, key):
     """The 1-based line of the key in the committed plist, or None when the text does not show it plainly."""
     for number, line in enumerate(text.splitlines(), 1):
@@ -197,9 +212,11 @@ def judge(rr, entry, built, committed, committed_text, runtime, denied):
     if not same(built, committed):
         found.append(("entitlement-mismatch", binary))
     for key in committed:
+        line = key_line(committed_text, key)
         if not real_reason(rr, entry["reasons"].get(key)):
-            line = key_line(committed_text, key)
             found.append(("missing-reason", f"{plist}:{line}" if line else plist))
+        elif committed[key] is not True and entry.get("values", {}).get(key) != value_hash(committed[key]):
+            found.append(("value-unreviewed", f"{plist}:{line}" if line else plist))
     if entry["role"] == "helper" and not (built.get(SANDBOX) is True and committed.get(SANDBOX) is True):
         found.append(("helper-without-sandbox", binary))
     if entry["role"] == "app" and (built.get(SANDBOX) is True or committed.get(SANDBOX) is True):
