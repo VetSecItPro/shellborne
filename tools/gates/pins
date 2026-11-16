@@ -140,15 +140,23 @@ def load_rules(text):
     }
 
 
+def continues(text):
+    """True when text ends in a backslash that escapes its newline: outside a comment, and not itself escaped by an
+    odd run of backslashes before it."""
+    code = shell_mask(text)[1].rstrip()
+    return (len(code) - len(code.rstrip("\\"))) % 2 == 1
+
+
 def logical_lines(numbered):
-    """(first line number, text) with backslash continuations joined and comment lines dropped."""
+    """(first line number, text) with backslash continuations joined and comment lines dropped. A backslash inside
+    a comment, or one escaped by another, continues nothing."""
     pending, start = None, None
     for number, line in numbered:
         if pending is None:
             if line.strip().startswith("#"):
                 continue
             pending, start = "", number
-        if line.rstrip().endswith("\\"):
+        if continues(pending + line):
             pending += line.rstrip()[:-1] + " "
             continue
         yield start, pending + line
