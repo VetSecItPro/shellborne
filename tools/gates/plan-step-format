@@ -4,7 +4,7 @@
 Usage: PR_BODY=<pull request body> plan-step-format
 
 A Plan-Step line names a sub-step id (for example P2.4.1 or PR1.2.3), a plan change (CHANGE-0006) or
-EXT for an outside contributor's pull request. This gate checks only the shape; it never reads a plan.
+EXT for an outside contributor's pull request. Limit: this gate checks only the shape; it never reads a plan, so whether a cited step may start is judged elsewhere.
 It runs a known-good case and three known-bad cases first and refuses to report if any comes out wrong.
 Exit 0 clean, 1 refused, 2 broken.
 Plan-Step: P0.5.9

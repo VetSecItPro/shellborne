@@ -6,7 +6,8 @@ Usage: PR_BODY=<pull request body> pr-fields [--clone <dir> --range <base>..<hea
 The fields are a Plan-Step line, an AI tool used line with a value, a Verified by running line with
 something under it or after it, and a Tier line of 1, 2 or 3. With the clone and range, the paths of every
 commit in the range are read against tier1-paths.txt beside this gate: a change touching a listed path is
-Tier 1 work, so a Tier line of 2 or 3 is refused as tier-understated. Exit 0 clean, 1 refused, 2 broken.
+Tier 1 work, so a Tier line of 2 or 3 is refused as tier-understated. Limit: it proves the fields are there and well formed,
+not that what they say is true; a Verified by running line is the author's claim. Exit 0 clean, 1 refused, 2 broken.
 """
 import json
 import os

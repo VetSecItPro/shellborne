@@ -11,6 +11,8 @@ The tier comes from the body's single Tier line; Tier 3 is exempt. Over the rang
   - once code has landed, a tests-only commit that edits an existing test needs a Test-Fix: line.
 Test files are anything under a tests/ or Tests/ folder, test_*.py and *_test.rs. Product code is
 everything else except tools/, .github/, .githooks/ and docs/, whose tests live in the private folder.
+Limit: it judges order and file kinds by path, not whether a test exercises the change or can fail; that is the
+review's to judge.
 Exit 0 clean, 1 refused, 2 broken.
 """
 import os

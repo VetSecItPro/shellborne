@@ -7,7 +7,8 @@ Checks every tracked file under a protected path, plus a sample path for each pr
 has no file yet, and resolves each the way GitHub does: the last matching rule wins, a single `*`
 never crosses a `/`, and a rule ending in a literal name or `/` also covers everything below it.
 The gate refuses when the winning rule does not name <owner>, so neither a later broad rule nor a
-narrow rule for one file can take a protected path away. Exit 0 clean, 1 refused, 2 broken.
+narrow rule for one file can take a protected path away. Limit: it proves the file names the owner, not that a
+review is required; that is a branch-protection setting this gate does not read. Exit 0 clean, 1 refused, 2 broken.
 Plan-Step: P0.2.5
 """
 import pathlib

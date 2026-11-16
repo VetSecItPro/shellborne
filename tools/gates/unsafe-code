@@ -18,7 +18,8 @@ Rust (when the root Cargo.toml exists), settings first, each read as TOML:
     clippy::restriction) set below deny;
   - [profile.dev] and [profile.release] set panic = "abort", and no profile sets panic = "unwind";
   - every workspace member has [lints] workspace = true, and a tracked Cargo.toml outside the workspace is refused;
-  - the FFI crate crates/sb-engine-vt carries its own table, equal to the workspace table except unsafe_code;
+  - the FFI crate crates/sb-engine-vt carries its own table, equal to the workspace table except unsafe_code,
+    which it must state as allow, its one reviewed exception (a missing entry is refused, not inherited);
   - the root clippy.toml disallows the std collections and std::sync::mpsc::channel, holds no test exemption
     (allow-unwrap-in-tests and the like) and no arithmetic allowance, and is the only clippy.toml in the tree;
   - no Cargo config file cargo reads from the repo upward, or from CARGO_HOME, sets rustflags that allow, warn or
@@ -360,6 +361,9 @@ def check_members(rr, repo, root, workspace_lints, tracked, found):
             elif without_unsafe_code(lints_table(lints)) != without_unsafe_code(lints_table(workspace_lints)):
                 found.add(("rust", f"{rr.shown(name)}: the FFI crate's lint table differs from the workspace "
                                    "table in more than unsafe_code"))
+            elif ((lints_table(lints).get("rust") or {}).get("unsafe_code") or (None,))[0] != "allow":
+                found.add(("rust", f"{rr.shown(name)}: the FFI crate's unsafe_code entry must exist and be allow, "
+                                   "its one reviewed exception"))
         elif lints != {"workspace": True}:
             found.add(("rust", f"{rr.shown(name)}: lacks [lints] workspace = true"))
     for name in tracked:

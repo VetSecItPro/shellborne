@@ -39,7 +39,7 @@ TABLE_REF_PATH = "tools/gates/schedule-terms.toml"
 REF = re.compile(r"[A-Za-z0-9._/@^~{}-]+")
 MAX_TERMS = 500
 MAX_PATTERN_CHARS = 2000
-CONTROLS = {  # (sentences each scope must refuse, sentences it must pass)
+CONTROLS = {  # the fallback for a table with no [controls]: (sentences each scope must refuse, must pass)
     "plan": (("Ship by 2027-03-01.", "Done on March 1, 2027.", "Finish within 3 weeks.", "Allow two months for this.",
               "Lands in Q2 2027.", "The deadline is the beta.", "Timebox the spike to a day.",
               "Due by the end of the stage."),
@@ -106,6 +106,26 @@ def words(data, path):
     return {"{months}": "|".join(months), "{number}": "|".join(number)}
 
 
+def table_controls(data, path):
+    """The table's own [controls.plan] and [controls.policy], each a refuse and a pass list of sentences, so terms and
+    controls always come from one commit; a table with no [controls], such as a base commit's from before
+    this change, uses the built-in CONTROLS, which is the behavior before it."""
+    if "controls" not in data:
+        return CONTROLS
+    table = data["controls"]
+    if not isinstance(table, dict) or set(table) != set(SCOPES):
+        raise Broken(f"{path.name}: [controls] must hold exactly {' and '.join(sorted(SCOPES))}")
+    out = {}
+    for each in SCOPES:
+        entry = table[each]
+        if (not isinstance(entry, dict) or set(entry) != {"refuse", "pass"}
+                or not all(isinstance(entry[k], list) and entry[k] and all(isinstance(x, str) and x for x in entry[k])
+                           for k in ("refuse", "pass"))):
+            raise Broken(f"{path.name}: [controls.{each}] must hold non-empty refuse and pass lists of sentences")
+        out[each] = (tuple(entry["refuse"]), tuple(entry["pass"]))
+    return out
+
+
 def load_terms(path=TABLE, scope="policy", data=None):
     """[(name, compiled pattern)] binding the scope: plan terms for the plan, plan and policy terms for the policy.
     Broken for a missing, malformed or empty table, or one that fails its own controls."""
@@ -114,8 +134,9 @@ def load_terms(path=TABLE, scope="policy", data=None):
     path = pathlib.Path(path)
     if data is None:
         data = read_table(path)
-    if set(data) != {"words", "term"}:
-        raise Broken(f"{path.name} must hold exactly a [words] table and [[term]] entries")
+    if set(data) not in ({"words", "term"}, {"words", "term", "controls"}):
+        raise Broken(f"{path.name} must hold exactly a [words] table, [[term]] entries and, optionally, [controls]")
+    controls = table_controls(data, path)
     expand = words(data, path)
     entries = data["term"]
     if not isinstance(entries, list) or not entries or len(entries) > MAX_TERMS:
@@ -142,7 +163,7 @@ def load_terms(path=TABLE, scope="policy", data=None):
     if not terms["plan"]:
         raise Broken(f"{path.name} holds no plan term, so the plan's lint could not fail")
     bound = {"plan": terms["plan"], "policy": terms["plan"] + terms["policy"]}
-    for each, (bad, good) in CONTROLS.items():
+    for each, (bad, good) in controls.items():
         if any(not hits(bound[each], sentence) for sentence in bad):
             raise Broken(f"{path.name} fails its own control: a known-bad {each} sentence passes")
         if any(hits(bound[each], sentence) for sentence in good):

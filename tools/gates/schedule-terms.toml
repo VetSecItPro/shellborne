@@ -146,3 +146,53 @@ name = "period-word"
 scope = "policy"
 ignore_case = true
 pattern = '\b(?:annual(?:ly)?|yearly|monthly|weekly|biannual(?:ly)?|end of (?:the )?(?:year|month|quarter)|year-?end|EOY|EOQ|EOM|fortnights?|biweekly|semiannual(?:ly)?|target date|sunset date|end date|cutoff date)\b'
+
+# The sentences each scope must refuse and must pass, proven on every run before any file is read. They live here
+# beside the terms, so a change that adds a term and its control lands as one, read from one commit.
+
+[controls.plan]
+refuse = [
+    "Ship by 2027-03-01.",
+    "Done on March 1, 2027.",
+    "Finish within 3 weeks.",
+    "Allow two months for this.",
+    "Lands in Q2 2027.",
+    "The deadline is the beta.",
+    "Timebox the spike to a day.",
+    "Due by the end of the stage.",
+]
+pass = [
+    "The page lists shipped features with no target date, and a soak runs for 24 hours.",
+]
+
+[controls.policy]
+refuse = [
+    "Support ends in September 2027.",
+    "We drop it in September.",
+    "Support continues through 2028.",
+    "Support ends in Q3.",
+    "Support ends in 6 months.",
+    "Support continues for two years.",
+    "Support ends on 2027-09-15.",
+    "Support ends by the end of next year.",
+    "The deadline is set.",
+    "Support ends 2027-09.",
+    "Support ends in FY2027.",
+    "Support ends 15.09.2027.",
+    "Support ends at year-end.",
+    "Support ends at EOY.",
+    "Support ends in 2 yrs.",
+    "Support ends in 6mo.",
+    "Support ends in a fortnight.",
+    "Support continues for fifteen months.",
+    "Support continues for a two-year window.",
+    "Support ends in september.",
+    "Support ends in SEPTEMBER.",
+    "Support ends in Q3FY27.",
+    "Support ends after 8760 hours.",
+    "Support continues for two\nyears.",
+]
+pass = [
+    "Support ends on evidence, not on a date, and a 24-hour soak on the iMac stays a release gate.",
+    "You may need a 72 hours soak, and each build is universal.",
+]

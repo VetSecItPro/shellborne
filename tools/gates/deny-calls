@@ -13,7 +13,8 @@ Reads deny-calls.toml beside this file, or with --tables-from from tools/gates/ 
   - ai-host: a listed AI API host name, or any name under it, anywhere in the text of any tracked text file: source,
     manifests, scripts, property lists, configuration. Docs (.md, .markdown, .txt, .rst, .adoc and anything under
     docs/) and this gate's own table are never read for it, and a binary file is not text and is skipped;
-  - unlisted-update-host: any host in a URL, or set as a host, inside the update module's paths other than the
+  - unlisted-update-host: any host in a URL (with a scheme, or scheme-relative: //host followed by a dotted name), or
+    set as a host, inside the update module's paths other than the
     configured update host, matched exactly. The update module may name that host and no other.
 Names are matched as whole names: a package compared without case and with - and _ the same, a module name exactly
 as listed, so a crate called sentryless or a module called SentryFreeKit passes. Source means tracked .rs, .swift,
@@ -70,6 +71,10 @@ RUST_PATH = re.compile(r"(?<![\w:])(?:::)?([A-Za-z_][A-Za-z0-9_]*)\s*::")
 C_IMPORT = re.compile(r"#\s*(?:include|import)\s*[<\"]([A-Za-z_][A-Za-z0-9_]*)/|@import\s+([A-Za-z_][A-Za-z0-9_]*)")
 URL_HOST = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://(?:[^/\s\"'@]*@)?(\[[^\]\s]*\]|[^/\s\"'?#:\\]+)")
 HOST_FIELD = re.compile(r"\bhost\s*[:=]\s*\"([^\"\\]+)\"")
+# A scheme-relative URL (//host/path), which a URL API resolves against its base's scheme; the host must be a dotted
+# name right after the slashes, so a // comment is not one.
+RELATIVE_HOST = re.compile(r"(?<![A-Za-z0-9+.:/-])//([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+                           r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)(?=[/\"'?#:\s]|$)")
 TOML_HEADER = re.compile(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$")
 TOML_KEY = re.compile(r"^\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_-]+))\s*(?:\.\s*[A-Za-z0-9_-]+\s*)?=")
 TOML_PACKAGE = re.compile(r"\bpackage\s*=\s*[\"']([^\"']+)[\"']")
@@ -357,7 +362,7 @@ def source_findings(name, text, table, update):
         if any(pattern.search(line) for pattern in table["ai_hosts"]):
             found.append(("ai-host", number))
         if update:
-            hosts = URL_HOST.findall(line) + HOST_FIELD.findall(line)
+            hosts = URL_HOST.findall(line) + HOST_FIELD.findall(line) + RELATIVE_HOST.findall(line)
             if any(host.lower().rstrip(".") not in table["update_hosts"] for host in hosts):
                 found.append(("unlisted-update-host", number))
     return found

@@ -29,8 +29,12 @@ never a pass; so is a control certificate with no usable private key. The user k
 changed, and codesign sees an identity only when --keychain is already on that list, so a --keychain off the
 list is broken too.
 
-Each run plants a control item and a control EdDSA account under a random name with the prefix
-shellborne-keyreach-control- in --keychain, probes them first, and removes them even on failure. A
+Before anything is written, security show-keychain-info must open --keychain, since security handed a
+file that is not a keychain writes to the default one. Each run then deletes and plants a control item
+and a control EdDSA account under the fixed names shellborne-keyreach-control-item and
+shellborne-keyreach-control-eddsa in --keychain, probes them first, and removes them even on failure; a
+run killed before its cleanup leaves them for the next run to delete, and a run holds an exclusive lock for
+its keychain, so a second run at once is broken. A
 control read as unreachable means a blind instrument: broken. Limit: the control EdDSA item is planted
 by attributes only, so a real signer that looks keys up under its own service reads the control as
 unreachable and the run is broken, never a pass.
@@ -48,10 +52,11 @@ Plan-Step: P0.11.12
 """
 import argparse
 import errno
+import fcntl
+import hashlib
 import os
 import pathlib
 import re
-import secrets
 import shutil
 import signal
 import subprocess
@@ -60,6 +65,10 @@ import tempfile
 import tomllib
 
 CONTROL_PREFIX = "shellborne-keyreach-control-"
+# Fixed names, so every run removes what a killed run left before planting; a random name could never
+# be found again, and a run killed before its cleanup left its controls in the login keychain.
+CONTROL_ITEM = CONTROL_PREFIX + "item"
+CONTROL_EDDSA = CONTROL_PREFIX + "eddsa"
 SECURITY = "/usr/bin/security"
 CODESIGN = "/usr/bin/codesign"
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -217,6 +226,15 @@ def parse_identities(text):
     return list(unique.items())
 
 
+def hold_keychain(keychain):
+    """An exclusive lock for one keychain, held until the process exits, so two runs never share the fixed control
+    names: a second run is broken, never a pass. Raises OSError when another run holds it."""
+    digest = hashlib.sha256(os.path.realpath(keychain).encode()).hexdigest()[:16]
+    handle = open(os.path.join(tempfile.gettempdir(), f"shellborne-keyreach-{digest}.lock"), "a")
+    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return handle
+
+
 class Probe:
     def __init__(self, security, keychain, signer, codesign, timeout):
         self.security = security
@@ -231,6 +249,20 @@ class Probe:
         if status is None:
             raise Broken(f"security {args[0]} did not finish within {self.timeout:g} s")
         return status
+
+    def require_keychain(self):
+        """Handed a file that is not a keychain, security writes to the default keychain, so nothing is
+        written until security opens --keychain as one."""
+        status = self.security_status("show-keychain-info")
+        if status != 0:
+            raise Broken(f"security cannot open --keychain as a keychain (exit {status}), and a write would land in the "
+                         "default keychain")
+
+    def clear(self, service, account):
+        """Remove a control a killed run left: deleted, or already absent."""
+        status = self.security_status("delete-generic-password", "-s", service, "-a", account)
+        if status not in (0, NOT_FOUND):
+            raise Broken(f"could not clear the control {service} before planting (security exit {status})")
 
     def plant(self, service, account):
         self.planted.append((service, account))
@@ -356,11 +388,13 @@ def check_identities(probe):
 
 def check(args, probe, entries):
     """Returns the reachable lines. Raises Broken when an instrument cannot be trusted."""
-    tag = secrets.token_hex(8)
-    control_item = (f"{CONTROL_PREFIX}item-{tag}", f"{CONTROL_PREFIX}item-{tag}")
-    control_eddsa = f"{CONTROL_PREFIX}eddsa-{tag}"
+    probe.require_keychain()
+    control_item = (CONTROL_ITEM, CONTROL_ITEM)
+    control_eddsa = CONTROL_EDDSA
+    for service, account in (control_item, (CONTROL_EDDSA, CONTROL_EDDSA)):
+        probe.clear(service, account)  # what a killed run left, before this run plants its own
     probe.plant(*control_item)
-    probe.plant(f"{CONTROL_PREFIX}eddsa-{tag}", control_eddsa)
+    probe.plant(CONTROL_EDDSA, control_eddsa)
     if not probe.item_reachable(*control_item):
         raise Broken("the control item read as unreachable, so the lookup is blind")
     if not probe.signs(control_eddsa):
@@ -419,6 +453,11 @@ def run(argv):
         return 2
     if not FIXTURE.is_file():
         say("broken: the signing fixture is missing")
+        return 2
+    try:
+        lock = hold_keychain(args.keychain)
+    except OSError:
+        say("broken: another key-reach-check run holds this keychain, and the fixed control names cannot be shared")
         return 2
     probe = Probe(SECURITY, args.keychain, args.signer, CODESIGN, args.timeout)
     previous = {number: signal.signal(number, stop) for number in SIGNALS}
