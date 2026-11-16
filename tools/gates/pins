@@ -291,6 +291,21 @@ def pipeline_span(masked, start):
 PRINTERS = ("echo", "printf")  # print their arguments and run nothing
 
 
+def names_without_use(masked, code, index, at, begin, stop):
+    """True when the mention at index, inside the checksum pipeline begin..stop whose checksum command starts at at,
+    names the file without using it: it is in the checksum's own stage, or in a stage that only prints text. The
+    stages of a pipeline run at once, so any other stage uses the file before the check ends."""
+    first = begin
+    for found in SINGLE_PIPE.finditer(masked, begin, index):
+        first = found.end()
+    after = SINGLE_PIPE.search(masked, index, stop)
+    last = after.start() if after else stop
+    if first <= at < last:
+        return True
+    words = code[first:last].split()
+    return bool(words) and words[0] in PRINTERS
+
+
 def printed(text, masked, start):
     """True when start is inside a quoted argument of echo or printf, which only print it; a quoted
     string a shell runs (sh -c, bash -c, eval) is not printed, so it is still judged."""
@@ -315,10 +330,11 @@ def mentions(code, name):
 
 def command_findings(lines, rules):
     """(rule, line number) for each unlocked build and unverified download in a file's command lines."""
-    found, downloads, checks, codes = [], [], [], []
+    found, downloads, checks, codes, masks = [], [], [], [], []
     for seq, (number, text) in enumerate(lines):  # seq orders commands, since one line can hold several runs
         masked, code = shell_mask(text)
         codes.append(code)
+        masks.append(masked)
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
                 if printed(text, masked, match.start()):
@@ -358,15 +374,17 @@ def command_findings(lines, rules):
             continue
         if name is None:
             continue
-        first_seq, _, first_begin, _ = min(verifying)
+        first_seq, _, _, first_stop = min(verifying)  # a use inside the first check's own pipeline counts too
 
         def excused(command, index):
-            """The download's own command, or any verifying checksum's pipeline, names the file without using it."""
+            """The download's own command, or a verifying checksum's pipeline in a stage that only prints text or is
+            the checksum itself, names the file without using it."""
             if command == seq and start <= index < until:
                 return True
             return any(command == check_seq and begin <= index < stop
-                       for check_seq, _, begin, stop in verifying)
-        used = any((seq, end) < (command, index) < (first_seq, first_begin) and not excused(command, index)
+                       and names_without_use(masks[command], codes[command], index, at, begin, stop)
+                       for check_seq, at, begin, stop in verifying)
+        used = any((seq, end) < (command, index) < (first_seq, first_stop) and not excused(command, index)
                    for command, code in enumerate(codes) for index in mentions(code, name))
         if used:
             found.append(("download-used-before-check", number))
