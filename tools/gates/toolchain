@@ -5,8 +5,9 @@ report the pinned versions (plan step P0.12.1).
 Usage: toolchain [--rustc <path>] [--zig <path>] [--xcodebuild <path>] [--xcrun <path>] <repo>
 
 Reads two tracked files of <repo>:
-  - rust-toolchain.toml at the root: [toolchain] with an exact three-part channel and a targets list that holds
-    both aarch64-apple-darwin and x86_64-apple-darwin;
+  - rust-toolchain.toml at the root: [toolchain] with an exact three-part channel, a targets list that holds
+    both aarch64-apple-darwin and x86_64-apple-darwin, and a components list that holds clippy, which
+    tools/gates/unsafe-code runs (a fresh runner installs only what the pin names);
   - tools/gates/toolchain.toml, the toolchain record: [ghostty] commit (40 lowercase hex) and reason, [zig]
     version (exact three parts), [zig.sha256] aarch64-macos and x86_64-macos (64 lowercase hex each), and [xcode]
     version, build and sdk as xcodebuild -version and xcrun --show-sdk-version print them.
@@ -16,8 +17,8 @@ record.
 Rules, each named in its refusal:
   - floating: a channel name, a dated nightly, a partial version, a range or wildcard, latest, a short hash, a
     tag or a branch where an exact pin belongs, or a checksum that is not 64 hex characters;
-  - missing: a pin file that is absent or untracked, a missing field or a targets list without both Apple
-    targets; nothing is defaulted;
+  - missing: a pin file that is absent or untracked, a missing field, a targets list without both Apple
+    targets or a components list without clippy; nothing is defaulted;
   - mismatch: a tool reports a version other than its pin, or the compiler's sysroot lacks a pinned target;
   - not-rustup: the rustc that will actually run is not inside rustup's toolchains folder ($RUSTUP_HOME, by
     default ~/.rustup) in the folder for the pinned version, or the sysroot it reports is not, so a compiler rustup
@@ -56,6 +57,7 @@ RUST_FILE = "rust-toolchain.toml"
 RECORD = "tools/gates/toolchain.toml"
 PIN = "third_party/ghostty/PIN.toml"
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
+COMPONENTS = ("clippy",)  # unsafe-code runs clippy
 ZIG_PLATFORMS = ("aarch64-macos", "x86_64-macos")
 TOOLS = ("rustc", "zig", "xcodebuild", "xcrun")
 OUTPUT_CAP = 64 * 1024  # bytes of output kept from one tool run; more breaks the run
@@ -168,6 +170,12 @@ def read_rust(run, repo):
     if not isinstance(targets, list) or not all(t in targets for t in TARGETS):
         run.refuse("missing", where(rr, RUST_FILE, lines, "toolchain", "targets" if "targets" in section else None),
                    "the targets list does not hold both Apple targets")
+    components = section.get("components")
+    if not isinstance(components, list) or not all(c in components for c in COMPONENTS):
+        run.refuse("missing", where(rr, RUST_FILE, lines, "toolchain",
+                                    "components" if "components" in section else None),
+                   "the components list does not hold clippy, which unsafe-code runs; a fresh runner installs only "
+                   "what the pin names")
     if channel is None:
         return None
     return channel, where(rr, RUST_FILE, lines, "toolchain", "channel"), where(
