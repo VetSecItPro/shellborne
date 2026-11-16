@@ -92,7 +92,8 @@ UI_CALL = re.compile(
     r"|\bString\s*\(\s*localized\s*:\s*|\bNSLocalizedString\s*\(\s*)$")
 # AppKit takes a plain String and shows it as written, so a literal handed straight to one of
 # these is unlocalized whatever the catalog holds; String(localized:) and NSLocalizedString are the way through.
-APPKIT_IMPORT = re.compile(r"^\s*(?:@\w+\s+)*import\s+(?:AppKit|Cocoa)\b", re.MULTILINE)
+APPKIT_IMPORT = re.compile(r"^\s*(?:@\w+\s+)*import\s+(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?"
+                           r"(?:AppKit|Cocoa)\b", re.MULTILINE)  # a scoped import (import class AppKit.NSButton) too
 APPKIT_SINK = re.compile(
     r"(?:\bNS(?:MenuItem|Menu|Button|Alert|Window)\s*\(\s*title\s*:\s*"
     r"|\bNSTextField\s*\(\s*(?:labelWithString|wrappingLabelWithString|string)\s*:\s*"

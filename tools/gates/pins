@@ -400,7 +400,7 @@ def prove_controls(rules):
             raise Broken("a build word does not pass its own locked build")
 
 
-FLOW_RUN = re.compile(r"[{,]\s*run\s*:\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*'|[^,}]*)")
+FLOW_RUN = re.compile(r"[{,]\s*(?:run|\"run\"|'run')\s*:\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*'|[^,}]*)")
 KEY_LINE = re.compile(r"^\s*(?:-\s+)?[A-Za-z_][\w-]*\s*:(?:\s|$)")
 
 
@@ -423,7 +423,7 @@ def run_lines(lines):
     YAML joins them, at the first line; and a run value inside a flow mapping."""
     index = 0
     while index < len(lines):
-        match = re.match(r"^(\s*(?:-\s+)?)run\s*:\s*(.*)$", lines[index])
+        match = re.match(r"^(\s*(?:-\s+)?)(?:run|\"run\"|'run')\s*:\s*(.*)$", lines[index])
         if not match:
             for flow in FLOW_RUN.finditer(lines[index]):
                 value = yaml_scalar(flow.group(1).strip())

@@ -26,6 +26,7 @@ prints source. Each run first proves the gate still refuses its own seeded funct
 not, the gate is broken. Exit 0 clean, 1 refused, 2 broken.
 """
 import bisect
+import collections
 import importlib.machinery
 import importlib.util
 import pathlib
@@ -185,7 +186,8 @@ def unexplained(rr, name, text):
     else:
         for match in SWIFT_EXPORT.finditer(code):
             items.append((line_of(match.start()), line_of(match.start("fn"))))
-    shared = {start for start in (s for s, _ in items) if sum(1 for other, _ in items if other == start) > 1}
+    starts = collections.Counter(start for start, _ in items)
+    shared = {start for start, count in starts.items() if count > 1}
     # one comment explains one function only, so functions that share a line are never explained
     return sorted({report + 1 for start, report in items
                    if start in shared or not explained(rr, bare_lines, code_lines, start)})

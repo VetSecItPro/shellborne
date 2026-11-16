@@ -70,8 +70,9 @@ TRIPLE = re.compile(r"\b(?:arm64e?|arm64_32|aarch64|x86_64h?|i386)-apple-macos(?
 # The linker's spellings, bare, through -Wl, or after -Xlinker; a versioned darwin triple (Darwin 25 is
 # macOS 26); and fish's set with an export flag.
 LINK_SEP = r"(?:\s+-Xlinker\s+|\s+|,)"
-LD_PLATFORM = re.compile(r"-platform_version" + LINK_SEP + r"(?:macos|1)" + LINK_SEP + r"(?P<v>[0-9][0-9.]*)")
-LD_MIN = re.compile(r"-macos(?:x)?_version_min(?:" + LINK_SEP + r"|=)(?P<v>[0-9][0-9.]*)")
+QUOTED_VERSION = r"(?P<q>['\"]?)(?P<v>[0-9][0-9.]*)(?P=q)"  # a shell removes matched quotes before the linker reads it
+LD_PLATFORM = re.compile(r"-platform_version" + LINK_SEP + r"(['\"]?)(?:macos|1)\1" + LINK_SEP + QUOTED_VERSION)
+LD_MIN = re.compile(r"-macos(?:x)?_version_min(?:" + LINK_SEP + r"|=)" + QUOTED_VERSION)
 DARWIN = re.compile(r"\b(?:arm64e?|arm64_32|aarch64|x86_64h?|i386)-apple-darwin(?P<d>[0-9]+)")
 DARWIN_FOR_26 = "25"
 FISH = re.compile(r"\bset\s+(?:(?:-[A-Za-z]+|--export|--global|--universal)\s+)+" + NAME + r"\s+[\"']?(?P<v>[^\s\"';]+)")
@@ -425,15 +426,23 @@ def judge_pbxproj(name, text, found):
 def without_comment(line):
     """The line with its # comment blanked: a # that begins a word outside quotes, as shell, YAML, Python, Ruby, Perl
     and make read it (a target named in a comment runs nothing)."""
-    quote = None
-    for index, char in enumerate(line):
-        if quote:
-            if char == quote:
+    quote, index = None, 0
+    while index < len(line):
+        char = line[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\":  # outside quotes and inside double quotes a backslash escapes the next character
+            index += 2
+            continue
+        elif quote == '"':
+            if char == '"':
                 quote = None
         elif char in "'\"":
             quote = char
         elif char == "#" and (index == 0 or line[index - 1].isspace()):
             return line[:index]
+        index += 1
     return line
 
 
