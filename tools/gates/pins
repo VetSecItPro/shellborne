@@ -300,10 +300,57 @@ def names_without_use(masked, code, index, at, begin, stop):
         first = found.end()
     after = SINGLE_PIPE.search(masked, index, stop)
     last = after.start() if after else stop
+    if code[:index].rstrip().endswith((">", "<")):
+        return False  # a redirection's target is written or read by the stage itself
+    for start, end, inner in substitutions(code):
+        if start <= index < end:
+            words = code[inner:end].split()
+            if not words or words[0] not in PRINTERS:
+                return False  # a substitution runs its command before the stage around it can finish
     if first <= at < last:
         return True
     words = code[first:last].split()
     return bool(words) and words[0] in PRINTERS
+
+
+def substitutions(code):
+    """(start, end, inner start) of every command substitution ($( ) and backticks) and process substitution (<( )
+    and >( )) in one shell line, outside single quotes; one left open runs to the end of the line. A $( ) inside
+    double quotes still runs, so double quotes do not hide one."""
+    spans, stack, tick, quote, index = [], [], None, None, 0
+    while index < len(code):
+        char = code[index]
+        if quote == "'":
+            quote = None if char == "'" else quote
+        elif char == "\\":
+            index += 2
+            continue
+        elif code.startswith("$(", index) or (quote is None and code.startswith(("<(", ">("), index)):
+            stack.append((index, quote, True))
+            quote = None
+            index += 2
+            continue
+        elif char == "(" and quote is None:
+            stack.append((index, quote, False))  # a group or subshell: its ) is not a substitution's
+        elif char == ")" and quote is None and stack:
+            start, quote, substitution = stack.pop()
+            if substitution:
+                spans.append((start, index + 1, start + 2))
+        elif char == "`":
+            if tick is None:
+                tick = index
+            else:
+                spans.append((tick, index + 1, tick + 1))
+                tick = None
+        elif char in "'\"" and quote is None:
+            quote = char
+        elif char == '"' and quote == '"':
+            quote = None
+        index += 1
+    spans += [(start, len(code), start + 2) for start, _, substitution in stack if substitution]
+    if tick is not None:
+        spans.append((tick, len(code), tick + 1))
+    return spans
 
 
 def printed(text, masked, start):
@@ -499,8 +546,11 @@ def indent_of(line):
 def block_indent(block, indent, header):
     """The content indentation of a block scalar whose key sits at column indent: the key's column plus an explicit
     indentation indicator (|2, |-2, |2-), else the indentation of the first non-empty line, as YAML detects it."""
-    found = re.match(r"[|>](?:([1-9])[+-]?|[+-]([1-9])?)?", header)
-    digit = found and (found.group(1) or found.group(2))
+    found = re.fullmatch(r"[|>](?:([1-9])[+-]?|[+-]([1-9])?)?(?:\s+#.*)?", header)
+    if not found:
+        raise Broken("a block run value's header is not a valid YAML block header (| or >, then at most one "
+                     "indentation digit and one chomping sign, then only a comment), so the workflow cannot be read")
+    digit = found.group(1) or found.group(2)
     if digit:
         return indent + int(digit)
     return next((indent_of(text) for _, text in block if text.strip()), 0)
