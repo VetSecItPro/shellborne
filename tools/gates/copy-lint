@@ -25,7 +25,12 @@ Where each rule reads, in tracked files only:
     direct child of a Sources folder (apple/Sources/App/... is target apple/Sources/App), and only catalogs inside
     that folder count. A file with no such ancestor counts the catalogs in its own folder tree (its folder, any
     folder below it, and any folder above it up to the repository root). A key in an unrelated target's catalog
-    does not help.
+    does not help. String(localized:) and NSLocalizedString count as such calls, so their literals are keys too.
+  - appkit-unlocalized: in a Swift file that imports AppKit or Cocoa, a literal handed straight to an AppKit title,
+    label or message (NSButton, NSMenuItem, NSMenu,
+    NSAlert or NSWindow title:, NSTextField's label initializers, or an assignment to .title, .stringValue, .toolTip,
+    .placeholderString, .messageText, .informativeText or .label), whatever the catalog holds: AppKit shows a String
+    as written, so AppKit copy goes through String(localized:) or NSLocalizedString.
 
 Files are listed and read through the repo-rules reader, with its caps: tracked regular files only, opened without
 following a link, a byte cap per file and an entry cap on the listing. A file with a listed binary suffix is not
@@ -84,8 +89,14 @@ UI_CALL = re.compile(
     r"(?:(?<![\w.])(?:Text|Button|Label|Toggle|TextField|SecureField|Link|Menu|Picker|Section|NavigationLink|"
     r"Stepper|DisclosureGroup|GroupBox|LabeledContent|ProgressView|ContentUnavailableView)\s*\(\s*"
     r"|\.(?:navigationTitle|help|alert|confirmationDialog|accessibilityLabel|accessibilityHint)\s*\(\s*"
-    r"|\bNS(?:MenuItem|Menu|Button|Alert)\s*\(\s*title\s*:\s*"
-    r"|\bNSTextField\s*\(\s*(?:labelWithString|wrappingLabelWithString|string)\s*:\s*)$")
+    r"|\bString\s*\(\s*localized\s*:\s*|\bNSLocalizedString\s*\(\s*)$")
+# AppKit takes a plain String and shows it as written, so a literal handed straight to one of
+# these is unlocalized whatever the catalog holds; String(localized:) and NSLocalizedString are the way through.
+APPKIT_IMPORT = re.compile(r"^\s*(?:@\w+\s+)*import\s+(?:AppKit|Cocoa)\b", re.MULTILINE)
+APPKIT_SINK = re.compile(
+    r"(?:\bNS(?:MenuItem|Menu|Button|Alert|Window)\s*\(\s*title\s*:\s*"
+    r"|\bNSTextField\s*\(\s*(?:labelWithString|wrappingLabelWithString|string)\s*:\s*"
+    r"|\.(?:title|stringValue|toolTip|placeholderString|messageText|informativeText|label)\s*=\s*)$")
 RUST_RAW = re.compile(r'[bc]?r(#*)"')
 SWIFT_RAW = re.compile(r'(#+)("""|")')
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"', "'": "'", "\\": "\\"}
@@ -97,11 +108,14 @@ CONTROLS = {
     "sparkle-icon": ('import SwiftUI\nlet badge = Image(systemName: "sparkles")\n// done \u2728\n'
                      'let mode = Text("Sparkle mode")\n'),
     "ui-literal": 'import SwiftUI\nlet view = Text("Open the control pane")\n',
+    "appkit-unlocalized": 'import AppKit\nlet open = NSButton(title: "Open", target: nil, action: nil)\n',
 }
 CONTROL_NAMES = {"forbidden-term": "docs/control.md", "british-spelling": "docs/control.md",
                  "sparkle-icon": "apple/Sources/Control/Control.swift",
-                 "ui-literal": "apple/Sources/Control/Control.swift"}
-CONTROL_LINES = {"forbidden-term": {2}, "british-spelling": {2}, "sparkle-icon": {2, 3, 4}, "ui-literal": {2}}
+                 "ui-literal": "apple/Sources/Control/Control.swift",
+                 "appkit-unlocalized": "apple/Sources/Control/Control.swift"}
+CONTROL_LINES = {"forbidden-term": {2}, "british-spelling": {2}, "sparkle-icon": {2, 3, 4}, "ui-literal": {2},
+                 "appkit-unlocalized": {2}}
 SPARKLE_NAME_CONTROLS = ("apple/Sources/Shell/Assets.xcassets/sparkle-badge.imageset/Contents.json",
                          "apple/Sources/Shell/Assets.xcassets/SparkleBadge.imageset/Contents.json")
 # Known-good: the updater framework references that must stay exempt, so the exemption is shown to work.
@@ -322,6 +336,7 @@ def file_hits(rr, table, name, text, keys):
     hits = [("sparkle-icon", m.start()) for m in re.finditer(SPARKLE_CHAR, text)]
     lowered = name.lower()
     swift, cli = lowered.endswith(".swift"), name.startswith(CLI_SOURCES) and lowered.endswith(".rs")
+    appkit = swift and bool(APPKIT_IMPORT.search(text))  # the AppKit sinks are read only where AppKit is imported
     if lowered.endswith(".xcstrings") or name.startswith("docs/") or lowered.endswith(".md"):
         hits += prose_hits(table, name, text)
     if swift or cli:
@@ -329,7 +344,9 @@ def file_hits(rr, table, name, text, keys):
             hits += prose_hits(table, name, content, start)
             if swift and names_sparkle(content) and not framework_literal(name, text, quote, content):
                 hits.append(("sparkle-icon", start))
-            if swift and UI_CALL.search(text, max(0, quote - 120), quote):
+            if swift and appkit and APPKIT_SINK.search(text, max(0, quote - 120), quote):
+                hits.append(("appkit-unlocalized", start))
+            elif swift and UI_CALL.search(text, max(0, quote - 120), quote):
                 plain = unescaped(content)
                 if plain and plain not in keys:
                     hits.append(("ui-literal", start))
