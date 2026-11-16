@@ -449,7 +449,11 @@ def yaml_double(body):
             index += 2
         elif code in YAML_HEX and re.fullmatch(r"[0-9A-Fa-f]+", body[index + 2:index + 2 + YAML_HEX[code]] or "x") \
                 and len(body[index + 2:index + 2 + YAML_HEX[code]]) == YAML_HEX[code]:
-            out.append(chr(int(body[index + 2:index + 2 + YAML_HEX[code]], 16)))
+            digits = body[index + 2:index + 2 + YAML_HEX[code]]
+            if int(digits, 16) > 0x10FFFF:
+                raise Broken(f"a double-quoted run value holds the escape \\{code}{digits}, beyond Unicode, which is "
+                             "not valid YAML, so the workflow cannot be read")
+            out.append(chr(int(digits, 16)))
             index += 2 + YAML_HEX[code]
         else:
             out.append(char)

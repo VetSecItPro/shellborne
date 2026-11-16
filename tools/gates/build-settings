@@ -99,7 +99,7 @@ def load(name, path):
 RR = load("repo_rules", SOURCE_READER)
 MO = load("mach_o_reader", SHARED)
 COMMANDS = load("pins_commands", COMMAND_READER)
-BROKEN = (RR.Broken, MO.Broken)
+BROKEN = (RR.Broken, MO.Broken, COMMANDS.Broken)  # every reader this gate loads names its own broken read
 
 
 def exact_26(value):
