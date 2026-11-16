@@ -33,10 +33,11 @@ file, MAX_DEPTH nested braces in a project file, MAX_FILES entries walked, MAX_B
 bytes from one tool run, MAX_SECONDS for the stub read, and at most MAX_FINDINGS refusals kept, the rest counted.
 Exit 0 clean, 1 refused, 2 broken or not run.
 
-Known limit (scheduled): a deployment target spelled as -platform_version, -macos_version_min or an -apple-darwinN
-triple, or set with the fish form `set -gx`, is not read. A project file is read whole, comments removed, split on
+The linker's -platform_version macos N and -macos(x)_version_min N (bare, through -Wl, or after -Xlinker), a versioned
+-apple-darwinN triple (Darwin 25 is macOS 26; an unversioned triple names no version) and fish's set with an export
+flag are read too. A project file is read whole, comments removed, split on
 braces and semicolons outside quoted strings, so an object written on one line is judged like one split over lines.
-A minimum-version flag in a Swift file is judged only on code (comments and string literals blanked) and inside the
+A script or workflow line is judged with its # comment blanked. A minimum-version flag in a Swift file is judged only on code (comments and string literals blanked) and inside the
 string literals of an unsafeFlags call.
 """
 import importlib.machinery
@@ -66,6 +67,14 @@ NAME = "MACOSX_DEPLOYMENT" + "_TARGET"  # split so this file's own text never re
 ASSIGNED = re.compile(NAME + r"(?:\[[^\]\n]*\])*[\"'\]]*\s*[:=]\s*(?:\{[^}\n]*?\bvalue\s*=\s*)?[\"']?(?P<v>[^\s\"';,}]*)")
 MIN_FLAG = re.compile(r"-m(?:macosx|macos)-version-min=[\"']?(?P<v>[^\s\"',)\]]*)")
 TRIPLE = re.compile(r"\b(?:arm64e?|arm64_32|aarch64|x86_64h?|i386)-apple-macos(?:x)?(?P<v>[0-9][0-9.]*)")
+# The linker's spellings, bare, through -Wl, or after -Xlinker; a versioned darwin triple (Darwin 25 is
+# macOS 26); and fish's set with an export flag.
+LINK_SEP = r"(?:\s+-Xlinker\s+|\s+|,)"
+LD_PLATFORM = re.compile(r"-platform_version" + LINK_SEP + r"(?:macos|1)" + LINK_SEP + r"(?P<v>[0-9][0-9.]*)")
+LD_MIN = re.compile(r"-macos(?:x)?_version_min(?:" + LINK_SEP + r"|=)(?P<v>[0-9][0-9.]*)")
+DARWIN = re.compile(r"\b(?:arm64e?|arm64_32|aarch64|x86_64h?|i386)-apple-darwin(?P<d>[0-9]+)")
+DARWIN_FOR_26 = "25"
+FISH = re.compile(r"\bset\s+(?:(?:-[A-Za-z]+|--export|--global|--universal)\s+)+" + NAME + r"\s+[\"']?(?P<v>[^\s\"';]+)")
 PLATFORM = re.compile(r"\.macOS\(")
 PLATFORM_FORM = re.compile(r"\.macOS\(\s*(?:\"(?P<s>[^\"\n]*)\"|\.v(?P<v>[0-9]+)(?:_(?P<m>[0-9]+))?)\s*\)")
 INCLUDE = re.compile(r"^\s*#include\??\s+\"(?P<path>[^\"\n]+)\"")
@@ -103,13 +112,14 @@ def tokens(value):
 def flag_findings(line):
     """A raw minimum-version flag or versioned target triple on a line, wherever it appears, whose literal version is
     not 26. A flag that takes its version from a setting is skipped, since the setting itself is judged."""
-    return any(not exact_26(m.group("v").rstrip(".")) for pattern in (MIN_FLAG, TRIPLE) for m in pattern.finditer(line)
-               if m.group("v")[:1].isdigit())
+    return (any(not exact_26(m.group("v").rstrip(".")) for pattern in (MIN_FLAG, TRIPLE, LD_PLATFORM, LD_MIN)
+                for m in pattern.finditer(line) if m.group("v")[:1].isdigit())
+            or any(m.group("d") != DARWIN_FOR_26 for m in DARWIN.finditer(line)))
 
 
 def literal_assignments(line):
     """Each literal value assigned to the deployment target on a script or workflow line; a reference is skipped."""
-    return [m.group("v") for m in ASSIGNED.finditer(line) if m.group("v")[:1].isdigit()]
+    return [m.group("v") for pattern in (ASSIGNED, FISH) for m in pattern.finditer(line) if m.group("v")[:1].isdigit()]
 
 
 LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"  # what str.splitlines splits on
@@ -412,8 +422,24 @@ def judge_pbxproj(name, text, found):
             found.add(("missing-archs", f"{RR.shown(name)}:{first}"))
 
 
+def without_comment(line):
+    """The line with its # comment blanked: a # that begins a word outside quotes, as shell, YAML, Python, Ruby, Perl
+    and make read it (a target named in a comment runs nothing)."""
+    quote = None
+    for index, char in enumerate(line):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
+
+
 def judge_script(name, text, found):
     for number, line in enumerate(text.splitlines(), 1):
+        line = without_comment(line)
         if any(not exact_26(v.rstrip(".")) for v in literal_assignments(line)) or flag_findings(line):
             found.add(("deployment-target", f"{RR.shown(name)}:{number}"))
 
