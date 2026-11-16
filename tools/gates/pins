@@ -27,7 +27,8 @@ Reads the tracked files of <repo> and refuses:
     repository's own origin is not a download, whatever it fetches;
   - download-used-before-check: a downloaded file that any command names between its download and its first
     verifying checksum (it was extracted, run or copied unverified), or a download piped straight into another
-    command (curl ... | sh), which no checksum can come before; reported on the download's line. A name inside a
+    command (curl ... | sh) or run in the background (curl ... &), which no checksum can be sure to come after;
+    reported on the download's line. A name inside a
     comment, the download's own command or a verifying checksum's pipeline is not a use. A git clone or fetch names
     no single file, so this rule does not judge what reads its tree (a stated limit);
   - ghostty-pin: a Ghostty pin (a PIN.toml under a ghostty folder) whose commit is not 40 lowercase hex;
@@ -141,9 +142,10 @@ def load_rules(text):
 
 
 def continues(text):
-    """True when text ends in a backslash that escapes its newline: outside a comment, and not itself escaped by an
-    odd run of backslashes before it."""
-    code = shell_mask(text)[1].rstrip()
+    """True when text ends in a backslash that escapes its newline: the last character, outside a comment, and not
+    itself escaped (an odd run of backslashes). A backslash followed by white space escapes that space, not the
+    newline, so it continues nothing."""
+    code = shell_mask(text)[1]
     return (len(code) - len(code.rstrip("\\"))) % 2 == 1
 
 
@@ -157,7 +159,7 @@ def logical_lines(numbered):
                 continue
             pending, start = "", number
         if continues(pending + line):
-            pending += line.rstrip()[:-1] + " "
+            pending += line[:-1] + " "
             continue
         yield start, pending + line
         pending = None
@@ -269,6 +271,12 @@ def fetch_from_origin(arguments):
     return True
 
 
+def background(masked, at):
+    """True when the pipeline that ends at at is run in the background by a bare &."""
+    found = PIPELINE_END.match(masked, at)
+    return bool(found) and found.group() == "&"
+
+
 def pipeline_span(masked, start):
     """(begin, end) of the pipeline holding start, bounded by ;, &&, || and a bare &, never a single | or a
     redirection such as 2>&1 or &>."""
@@ -328,6 +336,7 @@ def command_findings(lines, rules):
                     continue
                 _, until = pipeline_span(masked, match.end())
                 piped = bool(SINGLE_PIPE.search(masked, match.end(), until))  # curl ... | sh
+                piped = piped or background(masked, until)  # curl ... &: a later checksum may read an older file
                 downloads.append((seq, number, match.start(), match.end(), until,
                                   download_name(word, segment_after(code, match.end())), piped))
         for pattern in rules["checksums"]:
@@ -401,6 +410,9 @@ def prove_controls(rules):
         if ("download-used-before-check", 1) not in command_findings(
                 [(1, f"{word} {CONTROL_URL} | sh"), (2, verified.format(check=first_check))], rules):
             raise Broken("a download piped into a command passes")
+        if ("download-used-before-check", 1) not in command_findings(
+                [(1, f"{word} {CONTROL_URL} &"), (2, verified.format(check=first_check))], rules):
+            raise Broken("a download run in the background passes")
         if command_findings([(1, f"{word} {CONTROL_URL}"), (2, verified.format(check=first_check)),
                              (3, f"tar -xzf {CONTROL_FILE}")], rules):
             raise Broken("a download verified before its first use is refused")
