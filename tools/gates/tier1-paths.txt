@@ -6,6 +6,7 @@ tools/gates/
 .githooks/
 tools/signing/
 tools/install-hooks
+tools/fetch-pinned
 crates/sb-engine-vt/
 crates/sb-wire/
 crates/sb-host/

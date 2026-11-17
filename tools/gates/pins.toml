@@ -1,17 +1,22 @@
-# Rule words for the pin gate (tools/gates/pins). Each entry is a command, matched as whole words, with any
-# run of white space between its words. In CI the gate reads this file from the base commit, so a pull
-# request cannot drop a word to pass its own download or build step.
+# Rule words for the pin gate (tools/gates/pins). Each entry is a command, matched as whole words with any run
+# of white space and any options between its words; download words also ignore case. In CI the gate reads this
+# file from the base commit, so a pull request cannot drop a word, or move the helper, to pass its own step.
 # Plan-Step: P0.11.5
 
-# A download: refused unless a checksum verification follows it in the same file. A git fetch from the
-# repository's own origin is not a download.
+# A download word, a package manager's install included (none is pinned by hash here): refused in every file a
+# build runs, except the one helper below, which places a fetched file
+# only when its SHA-256 matches. Matched on the raw text, case ignored; a fetch or pull of the repository's own
+# origin passes. In CI this table is read from the base commit, so a pull request cannot drop a word or move the
+# helper to pass its own fetch.
 [downloads]
-commands = ["curl", "wget", "git clone", "git fetch", "git pull"]
-
-# A checksum verification that counts after a download.
-[checksums]
-commands = ["sha256sum -c", "sha256sum --check", "shasum -a 256 -c", "shasum -a 256 --check",
-            "shasum --algorithm 256 -c", "shasum --algorithm 256 --check"]
+commands = ["curl", "wget", "wget2", "aria2c", "git clone", "git fetch", "git pull", "git submodule update",
+            "git remote add", "git remote set-url", "remote.origin.url", "insteadOf", "gh release download", "gh run download",
+            "gh repo clone", "urlopen", "urlretrieve", "Invoke-WebRequest", "Invoke-RestMethod", "rsync",
+            "pip install", "pip3 install", "pipx", "uvx", "uv pip install", "uv tool install", "npm install", "npm i",
+            "npm ci", "npx", "yarn add", "yarn install", "pnpm add", "pnpm install", "pnpm dlx", "gem install",
+            "go install", "go get", "brew install", "apt-get install", "apt install", "port install",
+            "conda install", "mint install"]
+helper = "tools/fetch-pinned"
 
 # A cargo command that resolves dependencies: refused without one of the locked flags. Cargo's built-in
 # one-letter aliases (b, c, t, r, d) are the same commands as build, check, test, run and doc.

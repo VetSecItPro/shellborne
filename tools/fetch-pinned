@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Fetch one file over https and place it only when its SHA-256 matches (plan step P0.11.5).
+
+Usage: fetch-pinned <https-url> <sha256> <destination>
+
+This is the one way a build brings a file in from the network; the pin gate refuses every other fetch in a file a
+build runs. The file streams into a new temporary file beside the destination, hashed in this program as it is
+written and capped in size, and is renamed onto the destination only when the digest matches. On any failure the
+temporary file is removed and the destination is left as it was, so the destination name never holds an unverified
+file and no later command can use one, whatever order a script runs in.
+
+Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
+digest is 64 hex digits; the destination is inside the folder the helper runs in, its folder exists and resolves
+inside that folder, and it is not a link or a folder. Exit 0 placed, 1 refused (fetch failed, too large, or digest
+mismatch), 2 malformed arguments. Nothing is written for exit 1 or 2.
+"""
+import hashlib
+import http.client
+import os
+import pathlib
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+MAX_BYTES = 512 * 1024 * 1024
+TIMEOUT_SECONDS = 120
+CHUNK = 1024 * 1024
+HEX64 = re.compile(r"[0-9A-Fa-f]{64}")
+
+
+class Refused(Exception):
+    """The file was not placed."""
+
+
+class Malformed(Refused):
+    """The arguments are wrong; nothing was fetched."""
+
+
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() != "https":
+            raise Refused("a redirect leaves https")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def https_only_opener():
+    return urllib.request.build_opener(HttpsOnlyRedirect)
+
+
+def check_url(url):
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() != "https" or not parts.hostname:
+        raise Malformed("the URL must be https with a host")
+    if parts.username is not None or parts.password is not None:
+        raise Malformed("the URL must not carry a user name or password")
+
+
+def check_destination(dest, root):
+    if not dest or dest in (".", ".."):
+        raise Malformed("the destination must name a file")
+    root = pathlib.Path(root).resolve()
+    path = pathlib.Path(dest)
+    path = path if path.is_absolute() else root / path
+    parent = path.parent
+    if not parent.is_dir():
+        raise Malformed("the destination's folder does not exist")
+    real_parent = parent.resolve()
+    if real_parent != root and root not in real_parent.parents:
+        raise Malformed("the destination is outside the folder the helper runs in")
+    target = real_parent / path.name
+    if path.name in ("", ".", "..") or target.is_symlink() or target.is_dir():
+        raise Malformed("the destination must be a plain file name, not a link or a folder")
+    return target
+
+
+def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES):
+    """Place url's body at dest only when its SHA-256 is digest; raise Refused otherwise."""
+    check_url(url)
+    if not HEX64.fullmatch(digest or ""):
+        raise Malformed("the digest must be 64 hex digits")
+    target = check_destination(dest, root if root is not None else os.getcwd())
+    if open_url is None:
+        opener = https_only_opener()
+
+        def open_url(address):
+            return opener.open(address, timeout=TIMEOUT_SECONDS)
+    handle, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".part", dir=target.parent)
+    placed = False
+    try:
+        hasher, size = hashlib.sha256(), 0
+        with os.fdopen(handle, "wb") as out:
+            try:
+                with open_url(url) as body:
+                    while chunk := body.read(CHUNK):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise Refused(f"the body passes the cap of {max_bytes} bytes")
+                        hasher.update(chunk)
+                        out.write(chunk)
+            except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
+                raise Refused(f"the fetch failed: {error}") from None
+            out.flush()
+            os.fsync(out.fileno())
+        found = hasher.hexdigest()
+        if found != digest.lower():
+            raise Refused(f"digest mismatch: expected {digest.lower()}, got {found}")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, target)
+        placed = True
+    finally:
+        if not placed:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    return target
+
+
+def main(argv):
+    if len(argv) != 4:
+        print("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", file=sys.stderr)
+        return 2
+    try:
+        fetch_pinned(argv[1], argv[2], argv[3])
+    except Malformed as error:
+        print(f"fetch-pinned: malformed: {error}", file=sys.stderr)
+        return 2
+    except Refused as error:
+        print(f"fetch-pinned: refused: {error}", file=sys.stderr)
+        return 1
+    print(f"fetch-pinned: placed {argv[3]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
