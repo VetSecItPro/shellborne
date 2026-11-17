@@ -19,6 +19,10 @@ file at every instant, and even a run killed outright leaves nothing unverified 
 only reads, so a run killed before that change leaves the destination as it found it. The cost: a file that matches
 is briefly absent from the name while it is checked.
 
+The command-line run has one commit point, where the verified file is in place: an interrupt before it is rolled
+back, and from it on interrupts are ignored and the run reports the placement, so exit 1 never comes with a file
+written, and exit 0 always does.
+
 Every line the helper prints is printable ASCII: any other character in a name, an operating-system message or text
 a server sent is shown as an escape, so no input can break or forge a log line. Every exception, an interrupt
 included, ends as one such line, and the helper's own last-resort report prints one line without any chained text.
@@ -217,7 +221,21 @@ class Deadline:
         self.armed = False
 
 
-def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS):
+class Outcome:
+    """The command-line run's record of its one commit point. commit() is called once the verified file is in place
+    and the deadline is disarmed: it ignores interrupts from then on, then records the run as placed, so no interrupt
+    can land after the record and before the report. An interrupt before it rolls the placement back."""
+
+    def __init__(self):
+        self.placed = False
+
+    def commit(self):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        self.placed = True
+
+
+def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
+                 outcome=None):
     """Place url's body at dest only when its SHA-256 is digest; raise Refused otherwise. A file already at dest
     is kept only when a copy of it, hashed as that copy, matches, with no fetch; any other file there is removed
     first, so whatever is at dest when this returns, or refuses once the arguments are checked, has been verified.
@@ -234,7 +252,7 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
     previous = signal.signal(signal.SIGALRM, deadline.expired)
     signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
     try:
-        place(url, digest.lower(), folder, name, open_url, max_bytes, deadline)
+        place(url, digest.lower(), folder, name, open_url, max_bytes, deadline, outcome)
     finally:
         deadline.disarm()
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -317,6 +335,16 @@ def same_file(info, other):
     return identity(info) == identity(other)
 
 
+def commit(deadline, outcome, pending, temporary):
+    """The one commit point: the verified file is in place. The deadline is disarmed first, then the command-line
+    run's outcome ignores interrupts and records the placement, and only then does the cleanup give up the file, so
+    an interrupt before this point is rolled back and none can come after it."""
+    deadline.disarm()
+    if outcome is not None:
+        outcome.commit()
+    placed(pending, temporary)
+
+
 def placed(pending, temporary):
     """A renamed temporary file is the destination now, so its old name is no longer this run's to clean up."""
     pending[:] = [entry for entry in pending if entry[0] != temporary]
@@ -392,7 +420,7 @@ def set_aside(folder, name, pending):
     return entry
 
 
-def place(url, digest, folder, name, open_url, max_bytes, deadline=None):
+def place(url, digest, folder, name, open_url, max_bytes, deadline=None, outcome=None):
     """Everything here works through the folder handle, never through the path again. A file already at the
     destination is first set aside, then copied through a temporary file and hashed as that copy, so success never
     rests on an inode read from a name; the deadline stays armed until placement is verified; one cleanup owns
@@ -428,8 +456,7 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None):
                 remove_own(folder, aside[0], aside[1])  # the verified copy replaces it, so the original goes first
                 pending.remove(aside)
                 if settle(folder, temporary, copy, found, digest, name):
-                    deadline.disarm()  # verified and in place: from here the run succeeds
-                    placed(pending, temporary)
+                    commit(deadline, outcome, pending, temporary)
                     return
             discard(folder, pending)  # the file set aside and its copy did not verify: both go before the fetch
         if open_url is None:
@@ -444,8 +471,7 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None):
             raise Refused(f"the fetch failed: {error}") from None
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
-        deadline.disarm()  # verified and in place: from here the run succeeds
-        placed(pending, temporary)
+        commit(deadline, outcome, pending, temporary)
     except BaseException as error:
         failure = error
         raise
@@ -504,26 +530,34 @@ def last_resort(kind, value, trace):
         pass
 
 
+def refusal(error):
+    """(exit status, the one line) for an exception that ended a run before its commit point."""
+    if isinstance(error, Malformed):
+        return 2, f"fetch-pinned: malformed: {described(error)}"
+    if isinstance(error, Refused):
+        return 1, f"fetch-pinned: refused: {described(error)}"
+    if isinstance(error, OSError):  # any operating-system failure is a refusal; nothing unverified is left in place
+        return 1, f"fetch-pinned: refused: {error.strerror or described(error)}"
+    return 1, f"fetch-pinned: refused: {type(error).__name__}: {described(error)}"  # an interrupt included
+
+
 def main(argv):
     sys.excepthook = last_resort
     if len(argv) != 4:
         say("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", sys.stderr)
         return 2
+    outcome = Outcome()
     try:
-        fetch_pinned(argv[1], argv[2], argv[3])
-    except Malformed as error:
-        say(f"fetch-pinned: malformed: {described(error)}", sys.stderr)
-        return 2
-    except Refused as error:
-        say(f"fetch-pinned: refused: {described(error)}", sys.stderr)
-        return 1
-    except OSError as error:  # any operating-system failure is a refusal; nothing unverified is left in place
-        say(f"fetch-pinned: refused: {error.strerror or described(error)}", sys.stderr)
-        return 1
-    except BaseException as error:  # anything else, an interrupt included, is a refusal on one escaped line
-        say(f"fetch-pinned: refused: {type(error).__name__}: {described(error)}", sys.stderr)
-        return 1
-    say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
+        fetch_pinned(argv[1], argv[2], argv[3], outcome=outcome)
+    except BaseException as error:
+        if not outcome.placed:  # before the commit point: rolled back, so the run is refused
+            status, line = refusal(error)
+            say(line, sys.stderr)
+            return status
+    try:  # past the commit point the file is verified and in place, so even a report that fails is exit 0
+        say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
+    except BaseException:
+        pass
     return 0
 
 
