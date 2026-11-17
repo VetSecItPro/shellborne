@@ -110,11 +110,13 @@ def word_pattern(command):
 
 def fetch_pattern(command):
     """A download entry as whole words in raw text, case ignored: no word character or hyphen may touch it, so a
-    path (/usr/bin/x) or a dotted config key (a.b.word) before it and a suffix (.exe) after it still match, and any
+    path (/usr/bin/x), a dotted config key (a.b.word) or a one-letter option (-Mword) before it and a suffix (.exe)
+    after it still match, and any
     number of options with an optional value may stand between the words of a multi-word entry."""
     words = command.split()
     body = re.escape(words[0]) + "".join(OPTIONS + r"\s+" + re.escape(word) for word in words[1:])
-    return re.compile(r"(?<![\w-])" + body + r"(?![\w-])", re.IGNORECASE)
+    # A word may also stand glued to a one-letter option, as a module name follows ruby -r, perl -M or python3 -m.
+    return re.compile(r"(?:(?<![\w-])|(?<=[^\w-]-[A-Za-z]))" + body + r"(?![\w-])", re.IGNORECASE)
 
 
 def load_rules(text):
@@ -125,6 +127,11 @@ def load_rules(text):
     shape = {"downloads": {"commands"}, "builds": {"commands", "locked"}}
     optional = {"downloads": {"helper"}, "builds": set()}
     keys = set(data) - {"checksums"}  # a base table from before the helper still holds its checksum words
+    if "checksums" in data:  # only in its exact historical shape: a table with one non-empty list of words
+        legacy = data["checksums"]
+        if (not isinstance(legacy, dict) or set(legacy) != {"commands"} or not isinstance(legacy["commands"], list)
+                or not legacy["commands"] or not all(isinstance(v, str) and v.strip() for v in legacy["commands"])):
+            raise Broken(f"{TABLE}: a [checksums] section is read only in its historical shape, commands = [words]")
     if keys != set(shape) or any(not isinstance(data[key], dict) or not fields <= set(data[key]) <= fields | optional[key]
                                  for key, fields in shape.items()):
         raise Broken(f"{TABLE} must hold [downloads] and [builds] with their word lists, so no rule is left without "

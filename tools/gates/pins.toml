@@ -3,8 +3,8 @@
 # file from the base commit, so a pull request cannot drop a word, or move the helper, to pass its own step.
 # Plan-Step: P0.11.5
 
-# A download word, a package manager's install included (none is pinned by hash here): refused in every file a
-# build runs, except the one helper below, which places a fetched file
+# A download word, a package manager's install or a network client library or tool included (none is pinned by
+# hash here; a library whose name is also an English word or serves Unix sockets is named by its network calls): refused in every file a build runs, except the one helper below, which places a fetched file
 # only when its SHA-256 matches. Matched on the raw text, case ignored; a fetch or pull of the repository's own
 # origin passes. In CI this table is read from the base commit, so a pull request cannot drop a word or move the
 # helper to pass its own fetch.
@@ -15,7 +15,12 @@ commands = ["curl", "wget", "wget2", "aria2c", "git clone", "git fetch", "git pu
             "pip install", "pip3 install", "pipx", "uvx", "uv pip install", "uv tool install", "npm install", "npm i",
             "npm ci", "npx", "yarn add", "yarn install", "pnpm add", "pnpm install", "pnpm dlx", "gem install",
             "go install", "go get", "brew install", "apt-get install", "apt install", "port install",
-            "conda install", "mint install"]
+            "conda install", "mint install",
+            "urllib", "urllib3", "http.client", "httpx", "aiohttp", "import requests", "from requests", "requests.get",
+            "requests.post", "requests.request", "requests.Session", "socket.create_connection", "AF_INET", "AF_INET6",
+            "pycurl", "/dev/tcp",
+            "/dev/udp", "nc", "ncat", "socat", "telnet", "s_client", "Net::HTTP", "open-uri", "LWP", "HTTP::Tiny",
+            "WebClient", "reqwest", "ureq", "hyper", "TcpStream", "URLSession", "URLRequest"]
 helper = "tools/fetch-pinned"
 
 # A cargo command that resolves dependencies: refused without one of the locked flags. Cargo's built-in

@@ -13,18 +13,18 @@ kept only when it already matches, with no fetch; any other file there is remove
 
 Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
 digest is 64 hex digits; the destination is inside the folder the helper runs in, its folder exists and resolves
-inside that folder, and it is absent or a regular file (not a link, folder or special file). Exit 0 placed, 1 refused (fetch failed, too large, or digest
+inside that folder through real folders only (no link anywhere in the path, checked folder by folder and held
+open through the write), and it is absent or a regular file (not a link, folder or special file). Exit 0 placed, 1 refused (fetch failed, too large, or digest
 mismatch), 2 malformed arguments. Nothing is written for exit 1 or 2.
 """
 import hashlib
 import http.client
 import os
-import pathlib
 import re
+import secrets
 import signal
 import stat
 import sys
-import tempfile
 import threading
 import urllib.error
 import urllib.parse
@@ -64,40 +64,61 @@ def check_url(url):
         raise Malformed("the URL must not carry a user name or password")
 
 
-def check_destination(dest, root):
-    if not dest or dest in (".", ".."):
+FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def open_destination(dest, root):
+    """(folder handle, file name) for dest. The folder is reached from root one part at a time with links refused,
+    and every later step works through that handle, so no link or swapped folder can move the file outside root
+    between the check and the write. The destination itself must be absent or a regular file."""
+    root = os.path.realpath(root)
+    if not dest:
         raise Malformed("the destination must name a file")
-    root = pathlib.Path(root).resolve()
-    path = pathlib.Path(dest)
-    path = path if path.is_absolute() else root / path
-    parent = path.parent
-    if not parent.is_dir():
-        raise Malformed("the destination's folder does not exist")
-    real_parent = parent.resolve()
-    if real_parent != root and root not in real_parent.parents:
+    path = os.path.normpath(dest if os.path.isabs(dest) else os.path.join(root, dest))
+    if not path.startswith(root + os.sep):
         raise Malformed("the destination is outside the folder the helper runs in")
-    target = real_parent / path.name
-    if path.name in ("", ".", ".."):
-        raise Malformed("the destination must be a plain file name")
+    parts = path[len(root) + 1:].split(os.sep)
+    if any(part in ("", ".", "..") for part in parts):
+        raise Malformed("the destination must be a plain path to a file")
     try:
-        info = os.lstat(target)
-    except FileNotFoundError:
-        return target
-    if not stat.S_ISREG(info.st_mode):
-        raise Malformed("the destination must be absent or a regular file, not a link, folder or special file")
-    return target
+        folder = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as error:
+        raise Malformed(f"the folder the helper runs in cannot be opened: {error.strerror}") from None
+    try:
+        for part in parts[:-1]:
+            try:
+                inner = os.open(part, FOLDER, dir_fd=folder)
+            except OSError:
+                raise Malformed("every folder in the destination path must exist and be a real folder, not a link")
+            os.close(folder)
+            folder = inner
+        try:
+            info = os.stat(parts[-1], dir_fd=folder, follow_symlinks=False)
+        except FileNotFoundError:
+            return folder, parts[-1]
+        if not stat.S_ISREG(info.st_mode):
+            raise Malformed("the destination must be absent or a regular file, not a link, folder or special file")
+        return folder, parts[-1]
+    except BaseException:
+        os.close(folder)
+        raise
 
 
-def file_digest(path, max_bytes):
-    """The SHA-256 of a file already at the destination, or None when it is over the cap."""
-    hasher, size = hashlib.sha256(), 0
-    with open(path, "rb") as handle:
-        while chunk := handle.read(CHUNK):
+def file_digest(folder, name, max_bytes):
+    """The SHA-256 of the regular file already at the destination, or None when it is over the cap."""
+    handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            raise Refused("the destination changed into something other than a regular file")
+        hasher, size = hashlib.sha256(), 0
+        while chunk := os.read(handle, CHUNK):
             size += len(chunk)
             if size > max_bytes:
                 return None
             hasher.update(chunk)
-    return hasher.hexdigest()
+        return hasher.hexdigest()
+    finally:
+        os.close(handle)
 
 
 def expired(signum, frame):
@@ -112,29 +133,38 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
         raise Malformed("the digest must be 64 hex digits")
-    target = check_destination(dest, root if root is not None else os.getcwd())
     if threading.current_thread() is not threading.main_thread():
         raise Malformed("the helper runs its deadline on the main thread only")
+    folder, name = open_destination(dest, root if root is not None else os.getcwd())
     previous = signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
     try:
-        return place(url, digest.lower(), target, open_url, max_bytes)
+        place(url, digest.lower(), folder, name, open_url, max_bytes)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+        os.close(folder)
+    return dest
 
 
-def place(url, digest, target, open_url, max_bytes):
-    if os.path.lexists(target):
-        if file_digest(target, max_bytes) == digest:
-            return target
-        os.unlink(target)  # an unverified file never stays at the destination
+def place(url, digest, folder, name, open_url, max_bytes):
+    """Everything here works through the folder handle, never through the path again."""
+    try:
+        os.stat(name, dir_fd=folder, follow_symlinks=False)
+        present = True
+    except FileNotFoundError:
+        present = False
+    if present:
+        if file_digest(folder, name, max_bytes) == digest:
+            return
+        os.unlink(name, dir_fd=folder)  # an unverified file never stays at the destination
     if open_url is None:
         opener = https_only_opener()
 
         def open_url(address):
             return opener.open(address, timeout=TIMEOUT_SECONDS)
-    handle, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".part", dir=target.parent)
+    temporary = f".{name}.{secrets.token_hex(8)}.part"
+    handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
     placed = False
     try:
         hasher, size = hashlib.sha256(), 0
@@ -151,20 +181,19 @@ def place(url, digest, target, open_url, max_bytes):
                 raise Refused(f"the fetch failed: {error}") from None
             out.flush()
             os.fsync(out.fileno())
+            os.fchmod(out.fileno(), 0o644)
         signal.setitimer(signal.ITIMER_REAL, 0)  # nothing after this point waits on the network
         found = hasher.hexdigest()
         if found != digest:
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, target)
+        os.rename(temporary, name, src_dir_fd=folder, dst_dir_fd=folder)
         placed = True
     finally:
         if not placed:
             try:
-                os.unlink(temporary)
+                os.unlink(temporary, dir_fd=folder)
             except FileNotFoundError:
                 pass
-    return target
 
 
 def main(argv):
