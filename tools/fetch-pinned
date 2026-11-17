@@ -8,14 +8,23 @@ build runs. The file streams into a new temporary file beside the destination, h
 written and capped in size, and is renamed onto the destination only when the digest matches. On any failure the
 temporary file is removed and the destination is left as it was, so the destination name never holds an unverified
 file and no later command can use one, whatever order a script runs in. A file already at the destination is
-kept only when it already matches, with no fetch; any other file there is removed before the fetch. One deadline
-(15 minutes) covers the whole request, connection, redirects and body.
+kept only when it already matches, with no fetch; any other file there is removed before the fetch, and so is a
+file the helper could not finish copying, whatever went wrong. One deadline (15 minutes) covers the whole request,
+connection, redirects and body.
+
+Kept permissions are the mode bits only: a verified copy of a file already there keeps its mode, but not its ACLs,
+flags or extended attributes, so a caller that needs those sets them after placement.
+
+Threat model: the helper defends against an untrusted network and against stale, partial or wrong files at the
+destination. It does not defend against another process writing in the destination folder during the run; such a
+process already holds the build's trust. The cleanup removes a temporary name, or the file it found at the
+destination and could not verify, only while that name still holds that same file.
 
 Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
 digest is 64 hex digits; the destination is inside the folder the helper runs in, its folder exists and resolves
 inside that folder through real folders only (no link anywhere in the path, checked folder by folder and held
-open through the write), and it is absent or a regular file (not a link, folder or special file). Exit 0 placed, 1 refused (fetch failed, too large, or digest
-mismatch), 2 malformed arguments. Nothing is written for exit 1 or 2.
+open through the write), and it is absent or a regular file (not a link, folder or special file). Exit 0 placed,
+1 refused (fetch failed, too large, or digest mismatch), 2 malformed arguments. Nothing is written for exit 1 or 2.
 """
 import hashlib
 import http.client
@@ -145,15 +154,36 @@ def remove(folder, name):
         pass
 
 
+def identity(info):
+    return info.st_dev, info.st_ino
+
+
+def remove_own(folder, name, own):
+    """Remove name only while it still holds the file this run made or read (own is its device and inode). A name
+    whose file is not known yet (own is None: the run was cut off between creating it and recording it) is removed
+    as it stands: in that instant it holds this run's new file unless another process raced it, which the threat
+    model leaves out."""
+    if own is not None:
+        try:
+            if identity(os.stat(name, dir_fd=folder, follow_symlinks=False)) != own:
+                return
+        except FileNotFoundError:
+            return
+    remove(folder, name)
+
+
 def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644):
     """Write what read() yields into a new temporary file beside the destination, hashing as it goes, under the
-    cap; return (temporary name, SHA-256, open handle). The name joins pending before the file exists and the
-    handle joins handles, so the caller's one cleanup removes and closes them on any failure, however late, and
-    the handle stays open so placement can prove it installs this very file."""
+    cap; return (temporary name, SHA-256, open handle). The name joins pending before the file exists, with the
+    file's identity recorded as soon as it does, and the handle joins handles, so the caller's one cleanup removes
+    and closes them on any failure, however late, and the handle stays open so placement can prove it installs
+    this very file."""
     temporary = f".{name}.{secrets.token_hex(8)}.part"
-    pending.append(temporary)
+    entry = [temporary, None]
+    pending.append(entry)
     handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
     handles.append(handle)
+    entry[1] = identity(os.fstat(handle))
     hasher, size = hashlib.sha256(), 0
     while chunk := read(CHUNK):
         size += len(chunk)
@@ -169,7 +199,12 @@ def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644):
 
 
 def same_file(info, other):
-    return (info.st_dev, info.st_ino) == (other.st_dev, other.st_ino)
+    return identity(info) == identity(other)
+
+
+def placed(pending, temporary):
+    """A renamed temporary file is the destination now, so its old name is no longer this run's to clean up."""
+    pending[:] = [entry for entry in pending if entry[0] != temporary]
 
 
 def settle(folder, temporary, handle, found, digest, name):
@@ -203,8 +238,9 @@ def changed(folder, name):
 def place(url, digest, folder, name, open_url, max_bytes):
     """Everything here works through the folder handle, never through the path again. A file already at the
     destination is copied through a temporary file and hashed as that copy, so success never rests on an inode
-    read from the name; the deadline stays armed until this returns; one cleanup owns every temporary file."""
-    pending, handles = [], []
+    read from the name; the deadline stays armed until this returns; one cleanup owns every temporary file and the
+    unverified file found at the destination, and removes each only while it still holds that same file."""
+    pending, handles, unverified = [], [], None
     try:
         try:
             info = os.stat(name, dir_fd=folder, follow_symlinks=False)
@@ -213,14 +249,23 @@ def place(url, digest, folder, name, open_url, max_bytes):
         if info is not None:
             if not stat.S_ISREG(info.st_mode):
                 raise changed(folder, name)
+            unverified = identity(info)  # from here until it is verified, any failure removes it
             try:
                 handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
-            except OSError:
+            except OSError as error:
+                try:
+                    now = os.stat(name, dir_fd=folder, follow_symlinks=False)
+                except FileNotFoundError:
+                    now = None
+                if now is not None and stat.S_ISREG(now.st_mode):  # still a file, just not readable: unverified
+                    raise Refused(f"the file at the destination cannot be read: {error.strerror}") from None
                 raise changed(folder, name) from None
             try:
-                if not stat.S_ISREG(os.fstat(handle).st_mode):
+                found_info = os.fstat(handle)
+                if not stat.S_ISREG(found_info.st_mode):
                     raise changed(folder, name)
-                mode = stat.S_IMODE(os.fstat(handle).st_mode)  # the copy keeps the existing file's permissions
+                unverified = identity(found_info)  # the file actually opened, should the name have changed
+                mode = stat.S_IMODE(found_info.st_mode)  # the copy keeps the existing file's mode bits
                 try:
                     temporary, found, copy = to_temporary(folder, name, lambda size: os.read(handle, size),
                                                           max_bytes, pending, handles, mode)
@@ -229,8 +274,11 @@ def place(url, digest, folder, name, open_url, max_bytes):
             finally:
                 os.close(handle)
             if temporary is not None and settle(folder, temporary, copy, found, digest, name):
+                placed(pending, temporary)
+                unverified = None
                 return
-            remove(folder, name)  # an unverified file never stays at the destination
+            remove_own(folder, name, unverified)  # an unverified file never stays at the destination
+            unverified = None
         if open_url is None:
             opener = https_only_opener()
 
@@ -243,12 +291,15 @@ def place(url, digest, folder, name, open_url, max_bytes):
             raise Refused(f"the fetch failed: {error}") from None
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
+        placed(pending, temporary)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)  # the cleanup is never cut short; a refusal in flight still rises
         for handle in handles:
             os.close(handle)
-        for temporary in pending:  # a renamed file is gone from this name, so only leftovers are removed
-            remove(folder, temporary)
+        for temporary, own in pending:  # only leftovers this run made, each while it still holds that file
+            remove_own(folder, temporary, own)
+        if unverified is not None:  # a file found at the destination that a failure kept from being verified
+            remove_own(folder, name, unverified)
 
 
 def main(argv):
