@@ -45,10 +45,16 @@ class Malformed(Refused):
     """The arguments are wrong; nothing was fetched."""
 
 
+class TooLarge(Refused):
+    """The bytes passed the cap."""
+
+
 class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urllib.parse.urlsplit(newurl).scheme.lower() != "https":
-            raise Refused("a redirect leaves https")
+        try:
+            check_url(newurl)  # the same rule as the first URL: https, a host, no user name or password
+        except Malformed as error:
+            raise Refused(f"a redirect target is not allowed: {error}") from None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -104,32 +110,17 @@ def open_destination(dest, root):
         raise
 
 
-def file_digest(folder, name, max_bytes):
-    """The SHA-256 of the regular file already at the destination, or None when it is over the cap."""
-    handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
-    try:
-        if not stat.S_ISREG(os.fstat(handle).st_mode):
-            raise Refused("the destination changed into something other than a regular file")
-        hasher, size = hashlib.sha256(), 0
-        while chunk := os.read(handle, CHUNK):
-            size += len(chunk)
-            if size > max_bytes:
-                return None
-            hasher.update(chunk)
-        return hasher.hexdigest()
-    finally:
-        os.close(handle)
-
-
 def expired(signum, frame):
     raise Refused("the fetch passed its deadline")
 
 
 def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS):
     """Place url's body at dest only when its SHA-256 is digest; raise Refused otherwise. A file already at dest
-    is kept only when it already matches, with no fetch; any other file there is removed first, so whatever is at
-    dest when this returns or raises has been verified. One deadline covers everything after the arguments are
-    checked: reading a file already there, the connection, redirects and the body."""
+    is kept only when a copy of it, hashed as that copy, matches, with no fetch; any other file there is removed
+    first, so whatever is at dest when this returns or raises has been verified. One deadline covers everything
+    after the arguments are checked: reading a file already there, the connection, redirects, the body and the
+    placement; only the final removal of leftover temporary files runs with it cancelled, so it is never cut
+    short."""
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
         raise Malformed("the digest must be 64 hex digits")
@@ -147,53 +138,117 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
     return dest
 
 
-def place(url, digest, folder, name, open_url, max_bytes):
-    """Everything here works through the folder handle, never through the path again."""
+def remove(folder, name):
     try:
-        os.stat(name, dir_fd=folder, follow_symlinks=False)
-        present = True
+        os.unlink(name, dir_fd=folder)
     except FileNotFoundError:
-        present = False
-    if present:
-        if file_digest(folder, name, max_bytes) == digest:
-            return
-        os.unlink(name, dir_fd=folder)  # an unverified file never stays at the destination
-    if open_url is None:
-        opener = https_only_opener()
+        pass
 
-        def open_url(address):
-            return opener.open(address, timeout=TIMEOUT_SECONDS)
+
+def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644):
+    """Write what read() yields into a new temporary file beside the destination, hashing as it goes, under the
+    cap; return (temporary name, SHA-256, open handle). The name joins pending before the file exists and the
+    handle joins handles, so the caller's one cleanup removes and closes them on any failure, however late, and
+    the handle stays open so placement can prove it installs this very file."""
     temporary = f".{name}.{secrets.token_hex(8)}.part"
+    pending.append(temporary)
     handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
-    placed = False
+    handles.append(handle)
+    hasher, size = hashlib.sha256(), 0
+    while chunk := read(CHUNK):
+        size += len(chunk)
+        if size > max_bytes:
+            raise TooLarge(f"the bytes pass the cap of {max_bytes}")
+        hasher.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            view = view[os.write(handle, view):]
+    os.fsync(handle)
+    os.fchmod(handle, mode)
+    return temporary, hasher.hexdigest(), handle
+
+
+def same_file(info, other):
+    return (info.st_dev, info.st_ino) == (other.st_dev, other.st_ino)
+
+
+def settle(folder, temporary, handle, found, digest, name):
+    """Rename the temporary file onto the destination only when its digest matches, and only when the name still
+    holds the file this helper wrote and hashed, before and after the rename."""
+    if found != digest:
+        return False
+    written = os.fstat(handle)
+    if not same_file(os.stat(temporary, dir_fd=folder, follow_symlinks=False), written):
+        raise Refused("the temporary file was replaced before it was placed")
+    os.rename(temporary, name, src_dir_fd=folder, dst_dir_fd=folder)
+    if not same_file(os.stat(name, dir_fd=folder, follow_symlinks=False), written):
+        remove(folder, name)
+        raise Refused("the destination was replaced while it was placed")
+    return True
+
+
+def changed(folder, name):
+    """The destination stopped being a regular file during the run: a link or special file there is removed
+    through the held folder, so nothing unverified stays at the name; a folder is left, since it holds no
+    fetched bytes and removing a tree is not this helper's to do."""
     try:
-        hasher, size = hashlib.sha256(), 0
-        with os.fdopen(handle, "wb") as out:
+        info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+    except FileNotFoundError:
+        return Refused("the destination changed during the run")
+    if not stat.S_ISDIR(info.st_mode):
+        remove(folder, name)
+    return Refused("the destination changed during the run into something other than a regular file")
+
+
+def place(url, digest, folder, name, open_url, max_bytes):
+    """Everything here works through the folder handle, never through the path again. A file already at the
+    destination is copied through a temporary file and hashed as that copy, so success never rests on an inode
+    read from the name; the deadline stays armed until this returns; one cleanup owns every temporary file."""
+    pending, handles = [], []
+    try:
+        try:
+            info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if not stat.S_ISREG(info.st_mode):
+                raise changed(folder, name)
             try:
-                with open_url(url) as body:
-                    while chunk := body.read(CHUNK):
-                        size += len(chunk)
-                        if size > max_bytes:
-                            raise Refused(f"the body passes the cap of {max_bytes} bytes")
-                        hasher.update(chunk)
-                        out.write(chunk)
-            except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
-                raise Refused(f"the fetch failed: {error}") from None
-            out.flush()
-            os.fsync(out.fileno())
-            os.fchmod(out.fileno(), 0o644)
-        signal.setitimer(signal.ITIMER_REAL, 0)  # nothing after this point waits on the network
-        found = hasher.hexdigest()
-        if found != digest:
+                handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+            except OSError:
+                raise changed(folder, name) from None
+            try:
+                if not stat.S_ISREG(os.fstat(handle).st_mode):
+                    raise changed(folder, name)
+                mode = stat.S_IMODE(os.fstat(handle).st_mode)  # the copy keeps the existing file's permissions
+                try:
+                    temporary, found, copy = to_temporary(folder, name, lambda size: os.read(handle, size),
+                                                          max_bytes, pending, handles, mode)
+                except TooLarge:
+                    temporary = None  # over the cap, so it is not the pinned file
+            finally:
+                os.close(handle)
+            if temporary is not None and settle(folder, temporary, copy, found, digest, name):
+                return
+            remove(folder, name)  # an unverified file never stays at the destination
+        if open_url is None:
+            opener = https_only_opener()
+
+            def open_url(address):
+                return opener.open(address, timeout=TIMEOUT_SECONDS)
+        try:
+            with open_url(url) as body:
+                temporary, found, written = to_temporary(folder, name, body.read, max_bytes, pending, handles)
+        except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
+            raise Refused(f"the fetch failed: {error}") from None
+        if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
-        os.rename(temporary, name, src_dir_fd=folder, dst_dir_fd=folder)
-        placed = True
     finally:
-        if not placed:
-            try:
-                os.unlink(temporary, dir_fd=folder)
-            except FileNotFoundError:
-                pass
+        signal.setitimer(signal.ITIMER_REAL, 0)  # the cleanup is never cut short; a refusal in flight still rises
+        for handle in handles:
+            os.close(handle)
+        for temporary in pending:  # a renamed file is gone from this name, so only leftovers are removed
+            remove(folder, temporary)
 
 
 def main(argv):
@@ -207,6 +262,9 @@ def main(argv):
         return 2
     except Refused as error:
         print(f"fetch-pinned: refused: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:  # any operating-system failure is a refusal; nothing unverified is left in place
+        print(f"fetch-pinned: refused: {error.strerror or error}", file=sys.stderr)
         return 1
     print(f"fetch-pinned: placed {argv[3]}")
     return 0
