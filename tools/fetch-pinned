@@ -13,9 +13,15 @@ wrong; and a file this run renamed into place is removed if a refusal comes befo
 command can use an unverified file, whatever order a script runs in. One deadline (15 minutes) covers the whole
 request, connection, redirects and body.
 
-The helper's first step on the destination renames whatever is there aside, so from then on the name is empty or
-holds a verified file at every instant, and even a run killed outright leaves nothing unverified there. The cost:
-a file that matches is briefly absent from the name while it is checked.
+The helper's first change to the destination takes whatever is there off the name: it renames it aside, or, when
+that rename fails or the run is refused before it, removes it. From then on the name is empty or holds a verified
+file at every instant, and even a run killed outright leaves nothing unverified there. Before that change the helper
+only reads, so a run killed before that change leaves the destination as it found it. The cost: a file that matches
+is briefly absent from the name while it is checked.
+
+Every line the helper prints is printable ASCII: any other character in a name, an operating-system message or text
+a server sent is shown as an escape, so no input can break or forge a log line. Every exception, an interrupt
+included, ends as one such line, and the helper's own last-resort report prints one line without any chained text.
 
 Kept permissions are the mode bits only: a verified copy of a file already there keeps its mode, but not its ACLs,
 flags or extended attributes, so a caller that needs those sets them after placement.
@@ -28,13 +34,13 @@ whatever an earlier one raised, and any name the helper could not remove is name
 
 Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
 digest is 64 hex digits; the destination is inside the folder the helper runs in (an absolute path may spell that
-folder as the shell's $PWD when it resolves there), its folder exists and resolves
-inside that folder through real folders only (no link anywhere in the path, checked folder by folder and held
-open through the write), it is absent or a regular file (not a link, folder or special file), it is valid UTF-8 and
-plainly names a file (no trailing slash, no empty, . or .. part; a leading ./ is allowed), and its name leaves room
-for the temporary name beside it. Exit 0 placed; 1 refused (the fetch failed or passed its deadline, the bytes
-passed the cap or did not match the digest, or the helper could not clear the destination or its temporary
-files); 2 malformed arguments. Nothing is written for exit 1 or 2.
+folder as the shell's $PWD when it resolves there), its folder exists and resolves inside that folder through real
+folders only (no link anywhere in the path, checked folder by folder and held open through the write), it is absent
+or a regular file (not a link, folder or special file), it is valid UTF-8 with no control character and plainly
+names a file (no trailing slash, no empty, . or .. part; a leading ./ is allowed), and its name leaves room for the
+temporary name beside it. Exit 0 placed; 1 refused (the fetch failed or passed its deadline, the bytes passed the
+cap or did not match the digest, the run was interrupted, or the helper could not clear the destination or its
+temporary files); 2 malformed arguments. Nothing is written for exit 1 or 2.
 """
 import hashlib
 import http.client
@@ -57,6 +63,7 @@ DEADLINE_SECONDS = 900
 CHUNK = 1024 * 1024
 HEX64 = re.compile(r"[0-9A-Fa-f]{64}")
 PRINTABLE = re.compile(r"[\x21-\x7e]+")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 LABEL = re.compile(r"(?!-)[A-Za-z0-9_-]{1,63}(?<!-)")
 
 
@@ -136,8 +143,8 @@ def open_destination(dest, root):
     root = os.path.realpath(root)
     if not dest:
         raise Malformed("the destination must name a file")
-    if "\x00" in dest:
-        raise Malformed("the destination must not hold a null byte")
+    if CONTROL.search(dest):
+        raise Malformed("the destination must not hold a control character")
     try:
         dest.encode("utf-8")
     except UnicodeEncodeError:
@@ -150,10 +157,10 @@ def open_destination(dest, root):
     shell = os.path.normpath(os.environ.get("PWD") or ".")  # the shell's spelling of the same folder, if it is one
     if os.path.isabs(shell) and os.path.realpath(shell) == root:
         prefixes.append(shell)
-    inside = [prefix for prefix in prefixes if path.startswith(prefix + os.sep)]
-    if not inside:
+    inside = [prefix for prefix in prefixes if path != prefix and os.path.commonpath([prefix, path]) == prefix]
+    if not inside:  # compared part by part, so / as the folder holds its paths and /a/work never holds /a/workshop
         raise Malformed("the destination is outside the folder the helper runs in")
-    parts = path[len(inside[0]) + 1:].split(os.sep)
+    parts = os.path.relpath(path, inside[0]).split(os.sep)
     if any(part in ("", ".", "..") for part in parts):
         raise Malformed("the destination must be a plain path to a file")
     try:
@@ -357,11 +364,12 @@ def settle(folder, temporary, handle, found, digest, name):
 
 
 def set_aside(folder, name, pending):
-    """The helper's first step on the destination: rename whatever is there aside to a temporary name, in one atomic
+    """The helper's first change to the destination: rename whatever is there aside to a temporary name, in one atomic
     rename, before anything reads it, so from here the name is empty or holds a verified file at every instant, even
-    if the run is killed. Return the pending entry for it, or None when the name is empty. A folder is renamed back
-    and refused, since it holds no fetched bytes and removing a tree is not this helper's to do; a link or special
-    file is refused, and the cleanup removes it."""
+    if the run is killed. When the rename fails, the file is removed where it stands, or the refusal names it; a
+    refusal before this step has the cleanup remove it the same way. Return the pending entry for it, or None when
+    the name is empty. A folder is renamed back and refused, since it holds no fetched bytes and removing a tree is
+    not this helper's to do; a link or special file is refused, and the cleanup removes it."""
     entry = [temporary_name(name), None]
     pending.append(entry)
     try:
@@ -466,22 +474,56 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None):
             raise Refused(f"could not remove {', '.join(left)}{reason}") from failure
 
 
+def shown(text):
+    """One line of printable ASCII: a backslash, a control character or any non-ASCII character becomes an escape."""
+    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape").decode("ascii")
+                   for c in str(text))
+
+
+def say(text, stream):
+    """The one place the helper prints, so no message can skip the escaping."""
+    print(shown(text), file=stream)
+
+
+def described(error):
+    """An exception's text, or its type's name when even making the text fails, so a report never raises."""
+    try:
+        return str(error)
+    except Exception:
+        return type(error).__name__
+
+
+def last_resort(kind, value, trace):
+    """Python's report for an exception that escapes main (an interrupt during a report, say) would print chained text
+    unescaped; this prints one escaped line with the exception's type only. It never raises, since Python answers a
+    report that raises with its own full report. The run still never exits 0: Python exits 1, or 130 for an
+    interrupt."""
+    try:
+        say(f"fetch-pinned: refused: {getattr(kind, '__name__', 'error')}", sys.stderr)
+    except BaseException:
+        pass
+
+
 def main(argv):
+    sys.excepthook = last_resort
     if len(argv) != 4:
-        print("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", file=sys.stderr)
+        say("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", sys.stderr)
         return 2
     try:
         fetch_pinned(argv[1], argv[2], argv[3])
     except Malformed as error:
-        print(f"fetch-pinned: malformed: {error}", file=sys.stderr)
+        say(f"fetch-pinned: malformed: {described(error)}", sys.stderr)
         return 2
     except Refused as error:
-        print(f"fetch-pinned: refused: {error}", file=sys.stderr)
+        say(f"fetch-pinned: refused: {described(error)}", sys.stderr)
         return 1
     except OSError as error:  # any operating-system failure is a refusal; nothing unverified is left in place
-        print(f"fetch-pinned: refused: {error.strerror or error}", file=sys.stderr)
+        say(f"fetch-pinned: refused: {error.strerror or described(error)}", sys.stderr)
         return 1
-    print(f"fetch-pinned: placed {argv[3]}")
+    except BaseException as error:  # anything else, an interrupt included, is a refusal on one escaped line
+        say(f"fetch-pinned: refused: {type(error).__name__}: {described(error)}", sys.stderr)
+        return 1
+    say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
     return 0
 
 
