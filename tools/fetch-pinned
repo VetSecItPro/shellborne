@@ -143,77 +143,93 @@ def remove(folder, name):
         pass
 
 
-def to_temporary(folder, name, read, max_bytes):
+def to_temporary(folder, name, read, max_bytes, pending):
     """Write what read() yields into a new temporary file beside the destination, hashing as it goes, under the
-    cap; return (temporary name, SHA-256). The temporary file is removed on any failure."""
+    cap; return (temporary name, SHA-256). The name joins pending before the file exists, so the caller's one
+    cleanup removes it on any failure, however late."""
     temporary = f".{name}.{secrets.token_hex(8)}.part"
+    pending.append(temporary)
     handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
-    try:
-        hasher, size = hashlib.sha256(), 0
-        with os.fdopen(handle, "wb") as out:
-            while chunk := read(CHUNK):
-                size += len(chunk)
-                if size > max_bytes:
-                    raise TooLarge(f"the bytes pass the cap of {max_bytes}")
-                hasher.update(chunk)
-                out.write(chunk)
-            out.flush()
-            os.fsync(out.fileno())
-            os.fchmod(out.fileno(), 0o644)
-        return temporary, hasher.hexdigest()
-    except BaseException:
-        remove(folder, temporary)
-        raise
+    hasher, size = hashlib.sha256(), 0
+    with os.fdopen(handle, "wb") as out:
+        while chunk := read(CHUNK):
+            size += len(chunk)
+            if size > max_bytes:
+                raise TooLarge(f"the bytes pass the cap of {max_bytes}")
+            hasher.update(chunk)
+            out.write(chunk)
+        out.flush()
+        os.fsync(out.fileno())
+        os.fchmod(out.fileno(), 0o644)
+    return temporary, hasher.hexdigest()
 
 
 def settle(folder, temporary, found, digest, name):
-    """Rename the temporary file onto the destination only when its digest matches; otherwise remove it."""
+    """Rename the temporary file onto the destination only when its digest matches."""
     if found != digest:
-        remove(folder, temporary)
         return False
-    try:
-        os.rename(temporary, name, src_dir_fd=folder, dst_dir_fd=folder)
-    except BaseException:
-        remove(folder, temporary)
-        raise
+    os.rename(temporary, name, src_dir_fd=folder, dst_dir_fd=folder)
     return True
+
+
+def changed(folder, name):
+    """The destination stopped being a regular file during the run: a link or special file there is removed
+    through the held folder, so nothing unverified stays at the name; a folder is left, since it holds no
+    fetched bytes and removing a tree is not this helper's to do."""
+    try:
+        info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+    except FileNotFoundError:
+        return Refused("the destination changed during the run")
+    if not stat.S_ISDIR(info.st_mode):
+        remove(folder, name)
+    return Refused("the destination changed during the run into something other than a regular file")
 
 
 def place(url, digest, folder, name, open_url, max_bytes):
     """Everything here works through the folder handle, never through the path again. A file already at the
     destination is copied through a temporary file and hashed as that copy, so success never rests on an inode
-    read from the name; the deadline stays armed until this returns."""
+    read from the name; the deadline stays armed until this returns; one cleanup owns every temporary file."""
+    pending = []
     try:
-        os.stat(name, dir_fd=folder, follow_symlinks=False)
-        present = True
-    except FileNotFoundError:
-        present = False
-    if present:
-        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
         try:
-            if not stat.S_ISREG(os.fstat(handle).st_mode):
-                raise Refused("the destination changed into something other than a regular file")
+            info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if not stat.S_ISREG(info.st_mode):
+                raise changed(folder, name)
             try:
-                temporary, found = to_temporary(folder, name, lambda size: os.read(handle, size), max_bytes)
-            except TooLarge:
-                temporary = None  # over the cap, so it is not the pinned file
-        finally:
-            os.close(handle)
-        if temporary is not None and settle(folder, temporary, found, digest, name):
-            return
-        remove(folder, name)  # an unverified file never stays at the destination
-    if open_url is None:
-        opener = https_only_opener()
+                handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+            except OSError:
+                raise changed(folder, name) from None
+            try:
+                if not stat.S_ISREG(os.fstat(handle).st_mode):
+                    raise changed(folder, name)
+                try:
+                    temporary, found = to_temporary(folder, name, lambda size: os.read(handle, size), max_bytes,
+                                                    pending)
+                except TooLarge:
+                    temporary = None  # over the cap, so it is not the pinned file
+            finally:
+                os.close(handle)
+            if temporary is not None and settle(folder, temporary, found, digest, name):
+                return
+            remove(folder, name)  # an unverified file never stays at the destination
+        if open_url is None:
+            opener = https_only_opener()
 
-        def open_url(address):
-            return opener.open(address, timeout=TIMEOUT_SECONDS)
-    try:
-        with open_url(url) as body:
-            temporary, found = to_temporary(folder, name, body.read, max_bytes)
-    except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
-        raise Refused(f"the fetch failed: {error}") from None
-    if not settle(folder, temporary, found, digest, name):
-        raise Refused(f"digest mismatch: expected {digest}, got {found}")
+            def open_url(address):
+                return opener.open(address, timeout=TIMEOUT_SECONDS)
+        try:
+            with open_url(url) as body:
+                temporary, found = to_temporary(folder, name, body.read, max_bytes, pending)
+        except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
+            raise Refused(f"the fetch failed: {error}") from None
+        if not settle(folder, temporary, found, digest, name):
+            raise Refused(f"digest mismatch: expected {digest}, got {found}")
+    finally:
+        for temporary in pending:  # a renamed file is gone from this name, so only leftovers are removed
+            remove(folder, temporary)
 
 
 def main(argv):
