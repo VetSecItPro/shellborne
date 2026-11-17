@@ -23,7 +23,9 @@ Reads the tracked files of <repo> and refuses:
     backslashes and quotes removed and case ignored, so a comment, a quoted or printed word, a split word or an
     upper-case name (the Mac file system runs it) cannot hide one; options may stand between the words of a
     multi-word entry. A fetch or pull whose first word after its options is origin, with no git option before the
-    subcommand, is the repository's own and passes. A Dockerfile ADD of a URL needs --checksum=sha256:<64 hex>.
+    subcommand, is the repository's own and passes, unless anything in the file can relocate the repository (a GIT_
+    variable, a change of folder, a submodule, git init, a .git/ path, --git-dir or --work-tree), which voids that
+    for the whole file. A Dockerfile ADD of a URL needs --checksum=sha256:<64 hex>.
     Files a build runs: workflows and local actions (action.yml anywhere), a tracked file with a shebang or the executable bit, shell,
     make, PowerShell, Python, Ruby and Perl suffixes, Makefiles, justfiles, Dockerfiles and Containerfiles,
     build.rs, Package.swift and build.zig. Stated limit: a word built at run time is not seen;
@@ -260,16 +262,25 @@ def raw_forms(text):
 
 
 ORIGIN_SUBCOMMAND = re.compile(r"git\s+(?:fetch|pull)", re.IGNORECASE)
+# Anything that can make git use another repository than the one checked out: a repository-locating or config
+# variable, a change of folder (cd, pushd, chdir, cwd, --chdir, env -C, working-directory), a submodule, a new
+# repository (git init), a write into a .git/ folder, or a git-dir or work-tree option. One anywhere in a file voids the
+# origin exception for that whole file, since the word origin then proves nothing.
+RELOCATES = re.compile(r"(?<![\w-])(?:GIT_\w+|cd|pushd|chdir|cwd|--chdir|working-directory|submodule|--git-dir"
+                       r"|--work-tree|env(?:\s+-\S+)*\s+-\w*C)(?![\w-])|(?<![\w-])git\s+init(?![\w-])|\.git/",
+                       re.IGNORECASE)
 COMMAND_END = re.compile(r"[\n;&|)]")
 
 
 def fetch_findings(text, rules):
     """Line numbers where a download word stands in text, read in every raw form."""
     lines = set()
-    for form, where in raw_forms(text):
+    forms = raw_forms(text)
+    relocatable = any(RELOCATES.search(form) for form, _ in forms)
+    for form, where in forms:
         for _word, pattern in rules["downloads"]:
             for match in pattern.finditer(form):
-                if ORIGIN_SUBCOMMAND.fullmatch(match.group()):
+                if not relocatable and ORIGIN_SUBCOMMAND.fullmatch(match.group()):
                     end = COMMAND_END.search(form, match.end())
                     if from_origin(form[match.end():end.start() if end else len(form)]):
                         continue
@@ -379,6 +390,8 @@ def prove_controls(rules):
                 raise Broken("a download word does not refuse its own seeded line or a hidden form of it")
         if ORIGIN_SUBCOMMAND.fullmatch(word) and fetch_findings(f"{word} --no-tags origin main\n", rules):
             raise Broken("a fetch or pull of the repository's own origin is refused")
+        if ORIGIN_SUBCOMMAND.fullmatch(word) and fetch_findings(f"cd vendor\n{word} origin main\n", rules) != [2]:
+            raise Broken("a fetch or pull of origin passes in a file that can relocate the repository")
     if fetch_findings(f"tools/fetch-pinned {CONTROL_URL} {'0' * 64} control.tgz\n", rules):
         raise Broken("a call of the helper is refused")
     if docker_add_findings(f"ADD {CONTROL_URL} /x\n") != [1] or docker_add_findings(
