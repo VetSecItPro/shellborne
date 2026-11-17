@@ -13,7 +13,7 @@ kept only when it already matches, with no fetch; any other file there is remove
 
 Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
 digest is 64 hex digits; the destination is inside the folder the helper runs in, its folder exists and resolves
-inside that folder, and it is not a link or a folder. Exit 0 placed, 1 refused (fetch failed, too large, or digest
+inside that folder, and it is absent or a regular file (not a link, folder or special file). Exit 0 placed, 1 refused (fetch failed, too large, or digest
 mismatch), 2 malformed arguments. Nothing is written for exit 1 or 2.
 """
 import hashlib
@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -76,8 +77,14 @@ def check_destination(dest, root):
     if real_parent != root and root not in real_parent.parents:
         raise Malformed("the destination is outside the folder the helper runs in")
     target = real_parent / path.name
-    if path.name in ("", ".", "..") or target.is_symlink() or target.is_dir():
-        raise Malformed("the destination must be a plain file name, not a link or a folder")
+    if path.name in ("", ".", ".."):
+        raise Malformed("the destination must be a plain file name")
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return target
+    if not stat.S_ISREG(info.st_mode):
+        raise Malformed("the destination must be absent or a regular file, not a link, folder or special file")
     return target
 
 
@@ -100,15 +107,26 @@ def expired(signum, frame):
 def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS):
     """Place url's body at dest only when its SHA-256 is digest; raise Refused otherwise. A file already at dest
     is kept only when it already matches, with no fetch; any other file there is removed first, so whatever is at
-    dest when this returns or raises has been verified. One deadline covers the whole request."""
+    dest when this returns or raises has been verified. One deadline covers everything after the arguments are
+    checked: reading a file already there, the connection, redirects and the body."""
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
         raise Malformed("the digest must be 64 hex digits")
     target = check_destination(dest, root if root is not None else os.getcwd())
     if threading.current_thread() is not threading.main_thread():
         raise Malformed("the helper runs its deadline on the main thread only")
-    if target.exists():
-        if file_digest(target, max_bytes) == digest.lower():
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
+    try:
+        return place(url, digest.lower(), target, open_url, max_bytes)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def place(url, digest, target, open_url, max_bytes):
+    if os.path.lexists(target):
+        if file_digest(target, max_bytes) == digest:
             return target
         os.unlink(target)  # an unverified file never stays at the destination
     if open_url is None:
@@ -118,8 +136,6 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
             return opener.open(address, timeout=TIMEOUT_SECONDS)
     handle, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".part", dir=target.parent)
     placed = False
-    previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
     try:
         hasher, size = hashlib.sha256(), 0
         with os.fdopen(handle, "wb") as out:
@@ -137,14 +153,12 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
             os.fsync(out.fileno())
         signal.setitimer(signal.ITIMER_REAL, 0)  # nothing after this point waits on the network
         found = hasher.hexdigest()
-        if found != digest.lower():
-            raise Refused(f"digest mismatch: expected {digest.lower()}, got {found}")
+        if found != digest:
+            raise Refused(f"digest mismatch: expected {digest}, got {found}")
         os.chmod(temporary, 0o644)
         os.replace(temporary, target)
         placed = True
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
         if not placed:
             try:
                 os.unlink(temporary)
