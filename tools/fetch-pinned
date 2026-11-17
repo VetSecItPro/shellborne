@@ -18,7 +18,8 @@ flags or extended attributes, so a caller that needs those sets them after place
 Threat model: the helper defends against an untrusted network and against stale, partial or wrong files at the
 destination. It does not defend against another process writing in the destination folder during the run; such a
 process already holds the build's trust. The cleanup removes a temporary name, or the file it found at the
-destination and could not verify, only while that name still holds that same file.
+destination and could not verify, only while that name still holds that same file. Every cleanup step runs
+whatever an earlier one raised, and a name it could not remove is named in the refusal.
 
 Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
 digest is 64 hex digits; the destination is inside the folder the helper runs in, its folder exists and resolves
@@ -105,7 +106,7 @@ def open_destination(dest, root):
                 inner = os.open(part, FOLDER, dir_fd=folder)
             except OSError:
                 raise Malformed("every folder in the destination path must exist and be a real folder, not a link")
-            os.close(folder)
+            close_quietly(folder)
             folder = inner
         try:
             info = os.stat(parts[-1], dir_fd=folder, follow_symlinks=False)
@@ -115,7 +116,7 @@ def open_destination(dest, root):
             raise Malformed("the destination must be absent or a regular file, not a link, folder or special file")
         return folder, parts[-1]
     except BaseException:
-        os.close(folder)
+        close_quietly(folder)
         raise
 
 
@@ -143,8 +144,18 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
-        os.close(folder)
+        close_quietly(folder)
     return dest
+
+
+def close_quietly(handle):
+    """The one way the helper closes a handle. A close never changes the outcome: what a handle held was synced and
+    checked before it is closed, or the run is refused already, so a failed close neither turns a refusal into
+    another error nor a verified placement into a refusal."""
+    try:
+        os.close(handle)
+    except OSError:
+        pass
 
 
 def remove(folder, name):
@@ -240,7 +251,7 @@ def place(url, digest, folder, name, open_url, max_bytes):
     destination is copied through a temporary file and hashed as that copy, so success never rests on an inode
     read from the name; the deadline stays armed until this returns; one cleanup owns every temporary file and the
     unverified file found at the destination, and removes each only while it still holds that same file."""
-    pending, handles, unverified = [], [], None
+    pending, handles, unverified, failure = [], [], None, None
     try:
         try:
             info = os.stat(name, dir_fd=folder, follow_symlinks=False)
@@ -272,7 +283,7 @@ def place(url, digest, folder, name, open_url, max_bytes):
                 except TooLarge:
                     temporary = None  # over the cap, so it is not the pinned file
             finally:
-                os.close(handle)
+                close_quietly(handle)
             if temporary is not None and settle(folder, temporary, copy, found, digest, name):
                 placed(pending, temporary)
                 unverified = None
@@ -292,14 +303,28 @@ def place(url, digest, folder, name, open_url, max_bytes):
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
         placed(pending, temporary)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)  # the cleanup is never cut short; a refusal in flight still rises
+        # Every step runs whatever an earlier one raised, so one failing step never keeps the others from running.
         for handle in handles:
-            os.close(handle)
+            close_quietly(handle)
+        left = []
         for temporary, own in pending:  # only leftovers this run made, each while it still holds that file
-            remove_own(folder, temporary, own)
+            try:
+                remove_own(folder, temporary, own)
+            except OSError:
+                left.append(temporary)
         if unverified is not None:  # a file found at the destination that a failure kept from being verified
-            remove_own(folder, name, unverified)
+            try:
+                remove_own(folder, name, unverified)
+            except OSError:
+                left.append(name)
+        if left:  # exit 1 never hides a leftover: the refusal names it, after the reason the run failed, if any
+            reason = f" after: {failure}" if failure is not None else ""
+            raise Refused(f"could not remove {', '.join(left)}{reason}") from failure
 
 
 def main(argv):
