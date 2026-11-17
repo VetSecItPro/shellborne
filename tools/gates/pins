@@ -15,29 +15,27 @@ Reads the tracked files of <repo> and refuses:
     tracked Package.resolved beside it;
   - unlocked-build: a cargo command that resolves dependencies, in a workflow, a local action or a build script,
     without a locked flag;
-  - (a download or cargo word inside a quoted argument of echo or printf is printed, not run, and is skipped; one in
-    a quoted string a shell runs, sh -c or eval, is judged)
-  - unverified-download: a download in a workflow, a local action or a build script that no checksum
-    verification follows later in the same file. A checksum counts only when its pipeline holds a literal
-    64-hex SHA-256 digest written in the file, so a digest file made from the download does not count. It counts only as a command: one inside a comment, a
-    quoted string or an argument to another command (echo, printf, an assignment) does not. For a curl or wget,
-    or any download word that is not git, the checksum's pipeline must also name the downloaded file: the -o,
-    --output, -O or > target, else the URL's last path part, so a checksum of another file does not count. A
-    git clone or fetch has no single file, so any later checksum command counts for it. A git fetch from the
-    repository's own origin is not a download, whatever it fetches;
-  - download-used-before-check: a downloaded file that any command names between its download and its first
-    verifying checksum (it was extracted, run or copied unverified), or a download piped straight into another
-    command (curl ... | sh) or run in the background (curl ... &), which no checksum can be sure to come after;
-    reported on the download's line. A name inside a
-    comment, the download's own command or a verifying checksum's pipeline is not a use. A git clone or fetch names
-    no single file, so this rule does not judge what reads its tree (a stated limit);
+  - (a cargo word inside a quoted argument of echo or printf is printed, not run, and is skipped; one in a quoted
+    string a shell runs, sh -c or eval, is judged)
+  - fetch-outside-helper: a download word from the table in any file a build runs, other than the one helper file
+    the table names (tools/fetch-pinned, which places a file only when its SHA-256 matches). The words are matched
+    on the raw text, with backslash line joins (the shell's, and YAML's escaped line break with its indentation),
+    backslashes and quotes removed and case ignored, so a comment, a quoted or printed word, a split word or an
+    upper-case name (the Mac file system runs it) cannot hide one; options may stand between the words of a
+    multi-word entry. A fetch or pull whose first word after its options is origin, with no git option before the
+    subcommand, is the repository's own and passes, unless anything in the file can relocate the repository (a GIT_
+    variable, a change of folder, a submodule, git init, a .git/ path, --git-dir or --work-tree), which voids that
+    for the whole file. A Dockerfile ADD of a URL needs --checksum=sha256:<64 hex>.
+    Files a build runs: workflows and local actions (action.yml anywhere), a tracked file with a shebang or the executable bit, shell,
+    make, PowerShell, Python, Ruby and Perl suffixes, Makefiles, justfiles, Dockerfiles and Containerfiles,
+    build.rs, Package.swift and build.zig. Stated limit: a word built at run time is not seen;
   - ghostty-pin: a Ghostty pin (a PIN.toml under a ghostty folder) whose commit is not 40 lowercase hex;
   - zig-hash: a build.zig.zon dependency that is not a path inside the tree and has no hash;
   - docker-digest: a Dockerfile FROM, or a workflow container or service image, not pinned by sha256 digest.
-The download, checksum and build words live in pins.toml beside this file; --tables-from <ref> reads it from
+The download and build words and the helper's path live in pins.toml beside this file; --tables-from <ref> reads it from
 tools/gates/ at that commit of the repository instead, so in CI a pull request cannot drop a word. Each run first
-proves every word refuses its own seeded line and passes its own verified or locked line; a word that cannot go red
-breaks the run.
+proves every word refuses its own seeded line and its hidden forms, and every build word passes its own locked line;
+a word that cannot go red breaks the run.
 
 A build script is a tracked .sh, .bash, .zsh or .mk file, a Makefile or justfile, or a file with a shell shebang.
 Workflow commands are read from run: values only: a literal block line by line, a folded block or a plain scalar
@@ -54,6 +52,7 @@ manifest that does not parse, or an unreadable file is broken, never a pass.
 """
 import importlib.machinery
 import importlib.util
+import os
 import pathlib
 import posixpath
 import re
@@ -63,22 +62,19 @@ import tomllib
 HERE = pathlib.Path(__file__).resolve().parent
 TABLE = "pins.toml"
 MAX_FINDINGS = 1000
-HEX_DIGEST = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".mk")
 SCRIPT_NAMES = ("Makefile", "makefile", "GNUmakefile", "justfile")
+RUN_SUFFIXES = SCRIPT_SUFFIXES + (".ksh", ".fish", ".ps1", ".psm1", ".py", ".rb", ".pl")
+RUN_NAMES = SCRIPT_NAMES + ("Justfile", "build.rs", "Package.swift", "build.zig", "action.yml", "action.yaml")
 SHELL_SHEBANG = re.compile(r"^#!\s*\S*(?:/|\benv\s+)(?:ba|z|da|k)?sh\b")
 DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
 SEPARATOR = re.compile(r"&&|\|\||;|\|")
-PIPELINE_END = re.compile(r"&&|\|\||;|(?<![<>&|])&(?![&>])")  # a bare & runs the command before it in the background
-SINGLE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # Words that may stand before a command and still leave it in command position.
 COMMAND_PREFIXES = {"if", "then", "do", "else", "elif", "while", "until", "!", "{", "(", "time", "sudo", "command",
                     "exec"}
-CURL_OUTPUT = {"-o", "--output"}
-WGET_OUTPUT = {"-O", "--output-document"}
-# git fetch and pull options that take their value as the next word, so it is not read as the remote.
+# Options of a fetch or pull that take their value as the next word, so it is not read as the remote.
 FETCH_VALUE_OPTIONS = {"-s", "--strategy", "-X", "--strategy-option", "--depth", "--deepen", "--shallow-since",
                        "--shallow-exclude", "--negotiation-tip", "--refmap", "-o", "--server-option", "-j", "--jobs", "--upload-pack", "--recurse-submodules-default"}
 # A path that may lead a command word: absolute, home or relative with a dot, never a bare URL part.
@@ -86,8 +82,6 @@ PATH_PREFIX = r"(?:(?:\.{1,2}|~)?/[^\s;&|()\"'`]*)?"
 # A +toolchain or an option, with an optional value, between a command and its subcommand.
 OPTIONS = r"(?:\s+(?:\+\S+|--?[A-Za-z][\w-]*(?:=[^\s;&|]+)?(?:\s+(?!-)[^\s;&|]+)?))*"
 CONTROL_URL = "https://example.invalid/control.tgz"
-CONTROL_FILE = "control.tgz"
-CONTROL_HASH = "0" * 64
 
 
 def load(name, path):
@@ -106,12 +100,23 @@ class Broken(Exception):
 
 def word_pattern(command):
     """A command phrase as whole words, any run of white space between them. A path may lead the first word
-    (/usr/bin/curl), and a toolchain or any number of options with an optional value may stand between the first
-    word and the rest (git -C dir fetch is git fetch; cargo -v build is cargo build)."""
+    (/usr/bin/cargo), and a toolchain or any number of options with an optional value may stand between the first
+    word and the rest (cargo -v build is cargo build)."""
     words = command.split()
     between = OPTIONS if len(words) > 1 else ""
     body = re.escape(words[0]) + between + "".join(r"\s+" + re.escape(word) for word in words[1:])
     return re.compile(r"(?<![\w./:-])" + PATH_PREFIX + body + r"(?![\w.-])")
+
+
+def fetch_pattern(command):
+    """A download entry as whole words in raw text, case ignored: no word character or hyphen may touch it, so a
+    path (/usr/bin/x), a dotted config key (a.b.word) or a one-letter option (-Mword) before it and a suffix (.exe)
+    after it still match, and any
+    number of options with an optional value may stand between the words of a multi-word entry."""
+    words = command.split()
+    body = re.escape(words[0]) + "".join(OPTIONS + r"\s+" + re.escape(word) for word in words[1:])
+    # A word may also stand glued to a one-letter option, as a module name follows ruby -r, perl -M or python3 -m.
+    return re.compile(r"(?:(?<![\w-])|(?<=[^\w-]-[A-Za-z]))" + body + r"(?![\w-])", re.IGNORECASE)
 
 
 def load_rules(text):
@@ -119,11 +124,18 @@ def load_rules(text):
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise Broken(f"{TABLE} is malformed: {error}")
-    shape = {"downloads": {"commands"}, "checksums": {"commands"}, "builds": {"commands", "locked"}}
-    if set(data) != set(shape) or any(not isinstance(data[key], dict) or set(data[key]) != fields
-                                      for key, fields in shape.items()):
-        raise Broken(f"{TABLE} must hold exactly [downloads], [checksums] and [builds] with their word lists, "
-                     "so no rule is left without words")
+    shape = {"downloads": {"commands"}, "builds": {"commands", "locked"}}
+    optional = {"downloads": {"helper"}, "builds": set()}
+    keys = set(data) - {"checksums"}  # a base table from before the helper still holds its checksum words
+    if "checksums" in data:  # only in its exact historical shape: a table with one non-empty list of words
+        legacy = data["checksums"]
+        if (not isinstance(legacy, dict) or set(legacy) != {"commands"} or not isinstance(legacy["commands"], list)
+                or not legacy["commands"] or not all(isinstance(v, str) and v.strip() for v in legacy["commands"])):
+            raise Broken(f"{TABLE}: a [checksums] section is read only in its historical shape, commands = [words]")
+    if keys != set(shape) or any(not isinstance(data[key], dict) or not fields <= set(data[key]) <= fields | optional[key]
+                                 for key, fields in shape.items()):
+        raise Broken(f"{TABLE} must hold [downloads] and [builds] with their word lists, so no rule is left without "
+                     "words")
     rules = {}
     for key, fields in shape.items():
         for field in fields:
@@ -132,9 +144,13 @@ def load_rules(text):
                     or not all(isinstance(v, str) and v.strip() and len(v) <= 100 for v in values)):
                 raise Broken(f"{TABLE}: [{key}] {field} must be a list of words, and an empty list cannot fail")
             rules[(key, field)] = [" ".join(v.split()) for v in values]
+    helper = data["downloads"].get("helper")
+    if helper is not None and (not isinstance(helper, str) or not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)*", helper)
+                               or ".." in helper.split("/")):
+        raise Broken(f"{TABLE}: [downloads] helper must be one tracked path")
     return {
-        "downloads": [(word, word_pattern(word)) for word in rules[("downloads", "commands")]],
-        "checksums": [word_pattern(word) for word in rules[("checksums", "commands")]],
+        "downloads": [(word, fetch_pattern(word)) for word in rules[("downloads", "commands")]],
+        "helper": helper,
         "builds": [word_pattern(word) for word in rules[("builds", "commands")]],
         "locked": rules[("builds", "locked")],
         "words": rules,
@@ -212,54 +228,11 @@ def in_command_position(masked, start):
     return all(word in COMMAND_PREFIXES for word in head[last:].split())
 
 
-def download_name(word, arguments):
-    """The file a download writes, or None when it names no single file (a git clone or fetch)."""
-    tool = word.split()[0]
-    if tool == "git":
-        return None
-    words = [part.strip("\"'") for part in arguments.split()]
-    outputs = CURL_OUTPUT if tool == "curl" else WGET_OUTPUT if tool == "wget" else set()
-    url = None
-    index = 0
-    while index < len(words):
-        part = words[index]
-        if part == ">" and index + 1 < len(words):
-            return words[index + 1]
-        if part.startswith(">") and len(part) > 1:
-            return part.lstrip(">")
-        if part in outputs and index + 1 < len(words):
-            if words[index + 1] != "-":
-                return words[index + 1]
-            index += 2
-            continue
-        option = next((flag for flag in outputs if flag.startswith("--") and part.startswith(flag + "=")), None)
-        if option:
-            return part.split("=", 1)[1]
-        short = next((flag for flag in outputs if not flag.startswith("--")), None)
-        if short and part.startswith("-") and not part.startswith("--") and short[1] in part[1:]:
-            rest = part[part.index(short[1], 1) + 1:]
-            if rest:
-                return rest
-            if index + 1 < len(words) and words[index + 1] != "-":
-                return words[index + 1]
-            index += 2
-            continue
-        if url is None and not part.startswith("-"):
-            url = part
-        index += 1
-    if url is None:
-        return None
-    last = url.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
-    return last or None
-
-
-def names_file(text, name):
-    return bool(re.search(r"(?<![\w./-])" + re.escape(name) + r"(?![\w-])", text))
-
-
-def fetch_from_origin(arguments):
-    """True when a git fetch names no remote, or the repository's own origin."""
-    words = [word.strip("\"'") for word in arguments.split()]
+def from_origin(rest):
+    """True when the words after a fetch or pull name the repository's own origin as the remote: options are
+    skipped (a value-taking option with its value), and the first other word must be origin. No remote, --all or
+    --multiple is not the origin alone, so it is refused."""
+    words = rest.split()
     index = 0
     while index < len(words):
         word = words[index]
@@ -269,72 +242,80 @@ def fetch_from_origin(arguments):
             index += 2 if word in FETCH_VALUE_OPTIONS else 1
             continue
         return word == "origin"
-    return True
+    return False
 
 
-def background(masked, at):
-    """True when the pipeline that ends at at is run in the background by a bare &."""
-    found = PIPELINE_END.match(masked, at)
-    return bool(found) and found.group() == "&"
+def raw_forms(text):
+    """The text as the words a shell or YAML may read from it: (form, index of each form character in text), once
+    with no line join (an escaped backslash before a newline joins nothing), once with the shell's backslash line
+    join and once with YAML's escaped line break, which also drops the next line's indentation, each with every
+    other backslash and every quote removed. A word in any form is refused, which fails closed."""
+    forms = []
+    for join, eat_indent in ((False, False), (True, False), (True, True)):
+        out, where, index = [], [], 0
+        while index < len(text):
+            char = text[index]
+            if join and char == "\\" and text[index + 1:index + 2] == "\n":
+                index += 2
+                while eat_indent and index < len(text) and text[index] in " \t":
+                    index += 1
+                continue
+            if char not in "\\'\"":
+                out.append(char)
+                where.append(index)
+            index += 1
+        forms.append(("".join(out), where))
+    return forms
 
 
-def pipeline_span(masked, start):
-    """(begin, end) of the pipeline holding start, bounded by ;, &&, || and a bare &, never a single | or a
-    redirection such as 2>&1 or &>."""
-    begin = 0
-    for found in PIPELINE_END.finditer(masked[:start]):
-        begin = found.end()
-    end = PIPELINE_END.search(masked, start)
-    return begin, end.start() if end else len(masked)
+ORIGIN_SUBCOMMAND = re.compile(r"git\s+(?:fetch|pull)", re.IGNORECASE)
+# Anything that can make git use another repository than the one checked out: a repository-locating or config
+# variable, a change of folder (cd, pushd, chdir, cwd, --chdir, env -C, working-directory), a submodule, a new
+# repository (git init), a write into a .git/ folder, or a git-dir or work-tree option. One anywhere in a file voids the
+# origin exception for that whole file, since the word origin then proves nothing.
+RELOCATES = re.compile(r"(?<![\w-])(?:GIT_\w+|cd|pushd|chdir|cwd|--chdir|working-directory|submodule|--git-dir"
+                       r"|--work-tree|env(?:\s+-\S+)*\s+-\w*C)(?![\w-])|(?<![\w-])git\s+init(?![\w-])|\.git/",
+                       re.IGNORECASE)
+COMMAND_END = re.compile(r"[\n;&|)]")
+
+
+def fetch_findings(text, rules):
+    """Line numbers where a download word stands in text, read in every raw form."""
+    lines = set()
+    forms = raw_forms(text)
+    relocatable = any(RELOCATES.search(form) for form, _ in forms)
+    for form, where in forms:
+        for _word, pattern in rules["downloads"]:
+            for match in pattern.finditer(form):
+                if not relocatable and ORIGIN_SUBCOMMAND.fullmatch(match.group()):
+                    end = COMMAND_END.search(form, match.end())
+                    if from_origin(form[match.end():end.start() if end else len(form)]):
+                        continue
+                lines.add(text.count("\n", 0, where[match.start()]) + 1)
+    return sorted(lines)
+
+
+ADD = re.compile(r"^\s*ADD\s+(.*)$", re.IGNORECASE)
+ADD_CHECKSUM = re.compile(r"(?<!\S)--checksum=sha256:[0-9a-f]{64}(?!\S)")
+
+
+def docker_add_findings(text):
+    """Line numbers of a Dockerfile ADD that fetches a URL (or a git remote) without a sha256 checksum."""
+    found = []
+    for number, line in logical_lines(enumerate(text.splitlines(), 1)):
+        match = ADD.match(line)
+        if match and re.search(r"://|(?<![\w.-])git@", match.group(1)) and not ADD_CHECKSUM.search(match.group(1)):
+            found.append(number)
+    return found
 
 
 PRINTERS = ("echo", "printf")  # print their arguments and run nothing
-SAFE_EXPANSION = re.compile(r"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})")  # $NAME or ${NAME}: no operator, no command
-SAFE_REDIRECT = re.compile(r"(?<![\w<>&])(?:[0-9]?>>?|&>>?)\s*/dev/(?:null|stdout|stderr)(?![\w/.-])"
-                           r"|(?<![\w<>&])[0-9]?>&[0-9-](?!\w)")  # to /dev/null or between descriptors
-HERE_STRING = re.compile(r"<<<")
-PROCESS = re.compile(r"<\(([^()]*)\)")  # a process substitution with no parenthesis inside
-NOT_PLAIN = re.compile(r"[`$<>(){};&|]")  # what remains can run, group, redirect or expand: not plain
-
-
-def plain(text):
-    """True when text holds nothing that runs, groups, redirects or expands beyond $NAME, ${NAME} and a
-    redirection to /dev/null or between descriptors, counting quoted text too, which fails closed."""
-    return not NOT_PLAIN.search(SAFE_EXPANSION.sub(" ", SAFE_REDIRECT.sub(" ", text)))
-
-
-def plain_print(text, printers):
-    """True when text is one echo or printf the file has not redefined, with plain arguments."""
-    words = text.split()
-    return bool(words) and words[0] in printers and plain(text)
-
-
-def plain_check(text, printers):
-    """True when the checksum's own stage adds nothing but plain words, a here-string and <( ) process substitutions
-    that are each a plain print."""
-    text = PROCESS.sub(lambda found: " " if plain_print(found.group(1), printers) else found.group(), text)
-    return plain(HERE_STRING.sub(" ", text))
-
-
-def names_without_use(masked, code, index, at, begin, stop, printers):
-    """True when the mention at index, inside the checksum pipeline begin..stop whose checksum command starts at at,
-    names the file without using it. The stages of a pipeline run at once, so a stage that names the file is excused
-    only in a shape that cannot use it: the checksum's own stage, plain (plain_check), or a plain print (plain_print).
-    Anything else, however it would use the file, is not excused, which fails closed."""
-    first = begin
-    for found in SINGLE_PIPE.finditer(masked, begin, index):
-        first = found.end()
-    after = SINGLE_PIPE.search(masked, index, stop)
-    last = after.start() if after else stop
-    stage = code[first:last]
-    return plain_check(stage, printers) if first <= at < last else plain_print(stage, printers)
 
 
 CHANGED_SHELL = re.compile(r"(?<![\w${-])(?:BASH_ENV|ENV|PATH)\s*\+?[=:]|(?<![\w-])hash\s+-p(?![\w-])")
 SHELL_KEY = re.compile(r"(?<![\w-])shell\s*:(.*)")
 STANDARD_SHELL = re.compile(r"(?:bash|sh)(?:\s+(?:--noprofile|--norc|-[eux]+|-[eux]*o\s+pipefail))*(?:\s+\{0\})?")
 SOURCED = re.compile(r"(?<![\w./-])(?:source|\.)(?=\s)")
-PATH_FILE = re.compile(r"GITHUB_PATH")
 
 
 def shell_changed(text):
@@ -380,25 +361,16 @@ def printed(text, masked, start, printers):
     return bool(words) and words[0].rsplit("/", 1)[-1] in printers
 
 
-def mentions(code, name):
-    """Each start index where a command line names the file, also through a path (./tool.tgz, "$DIR/tool.tgz"): a use
-    is matched by the file's own name after a slash too, which fails closed."""
-    base = posixpath.basename(name.rstrip("/")) or name
-    return [found.start() for found in re.finditer(r"(?<![\w.-])" + re.escape(base) + r"(?![\w-])", code)]
-
-
 def command_findings(lines, rules, changed=False):
-    """(rule, line number) for each unlocked build and unverified download in a file's command lines. changed says
-    the file can change which command a word runs (shell_changed), so no printing or checksum word is trusted."""
-    found, downloads, checks = [], [], []
+    """(rule, line number) for each unlocked build in a file's command lines. changed says the file can change which
+    command a word runs (shell_changed), so no printing word is trusted to only print."""
+    found = []
     masks, codes = map(list, zip(*(shell_mask(text) for _, text in lines))) if lines else ([], [])
-    checkers = {word.split()[0] for word in rules["words"][("checksums", "commands")]}
-    untrusted = shadowed(masks, codes, set(PRINTERS) | checkers)
+    untrusted = shadowed(masks, codes, set(PRINTERS))
     if changed or any(in_command_position(masked, found.start()) for masked in masks for found in SOURCED.finditer(masked)):
-        untrusted = set(PRINTERS) | checkers  # a sourced script or a changed shell or PATH can redefine any of them
-    path_from = next((seq for seq, code in enumerate(codes) if PATH_FILE.search(code)), None)  # later steps only
+        untrusted = set(PRINTERS)  # a sourced script or a changed shell or PATH can redefine either
     printers = tuple(word for word in PRINTERS if word not in untrusted)
-    for seq, (number, text) in enumerate(lines):  # seq orders commands, since one line can hold several runs
+    for seq, (number, text) in enumerate(lines):
         masked, code = masks[seq], codes[seq]
         for pattern in rules["builds"]:
             for match in pattern.finditer(text):
@@ -410,97 +382,28 @@ def command_findings(lines, rules, changed=False):
                 rest = [word.strip("\"'") for word in rest]
                 if not any(word == flag or word.startswith(flag + "=") for word in rest for flag in rules["locked"]):
                     found.append(("unlocked-build", number))
-        for word, pattern in rules["downloads"]:
-            for match in pattern.finditer(text):
-                if printed(text, masked, match.start(), printers):
-                    continue
-                if word in ("git fetch", "git pull") and fetch_from_origin(segment_after(text, match.end())):
-                    continue
-                _, until = pipeline_span(masked, match.end())
-                piped = bool(SINGLE_PIPE.search(masked, match.end(), until))  # curl ... | sh
-                piped = piped or background(masked, until)  # curl ... &: a later checksum may read an older file
-                downloads.append((seq, number, match.start(), match.end(), until,
-                                  download_name(word, segment_after(code, match.end())), piped))
-        for pattern in rules["checksums"]:
-            for match in pattern.finditer(masked):
-                if (in_command_position(masked, match.start()) and masked[match.start():].split()[0] not in untrusted
-                        and (path_from is None or seq <= path_from)):
-                    begin, end = pipeline_span(masked, match.start())
-                    pipeline = code[begin:end]
-                    if HEX_DIGEST.search(pipeline):  # a digest file made from the download proves nothing
-                        checks.append((seq, match.start(), pipeline, begin, end))
-    for seq, number, start, end, until, name, piped in downloads:
-        verifying = [(check_seq, at, begin, stop) for check_seq, at, pipeline, begin, stop in checks
-                     if (check_seq, at) > (seq, end) and (name is None or names_file(pipeline, name))]
-        if not verifying:
-            found.append(("unverified-download", number))
-            continue
-        if piped:
-            found.append(("download-used-before-check", number))
-            continue
-        if name is None:
-            continue
-        first_seq, _, _, first_stop = min(verifying)  # a use inside the first check's own pipeline counts too
-
-        def excused(command, index):
-            """The download's own command, or a verifying checksum's pipeline in a stage that only prints text or is
-            the checksum itself, names the file without using it."""
-            if command == seq and start <= index < until:
-                return True
-            return any(command == check_seq and begin <= index < stop
-                       and names_without_use(masks[command], codes[command], index, at, begin, stop, printers)
-                       for check_seq, at, begin, stop in verifying)
-        used = any((seq, end) < (command, index) < (first_seq, first_stop) and not excused(command, index)
-                   for command, code in enumerate(codes) for index in mentions(code, name))
-        if used:
-            found.append(("download-used-before-check", number))
     return found
 
 
 def prove_controls(rules):
-    """Every word must refuse its own seeded line and pass its own verified or locked line."""
-    first_check = rules["words"][("checksums", "commands")][0]
-    for check in rules["words"][("checksums", "commands")]:
-        made = [(1, f"{rules['downloads'][0][0]} {CONTROL_URL}"), (2, f"{check} {CONTROL_FILE}.sha256")]
-        if ("unverified-download", 1) not in command_findings(made, rules):
-            raise Broken("a checksum of a digest file made from the download counts as a check")
-    verified = f'echo "{CONTROL_HASH}  {CONTROL_FILE}" | {{check}} -'
+    """Every download word must refuse its own seeded line and its hidden forms; a fetch or pull of origin and a
+    helper call must pass; every build word must refuse its own line and pass its own locked line."""
     for word, _ in rules["downloads"]:
-        bad = command_findings([(1, f"{word} {CONTROL_URL}")], rules)
-        good = command_findings([(1, f"{word} {CONTROL_URL}"), (2, verified.format(check=first_check))], rules)
-        if ("unverified-download", 1) not in bad or good:
-            raise Broken("a download word does not refuse its own seeded download")
-    first_download = rules["downloads"][0][0]
-    unchecked = [f"true # {{check}} {CONTROL_FILE}.sha256", f'echo "{{check}} {CONTROL_FILE}.sha256"',
-                 f"echo '{{check}} {CONTROL_FILE}.sha256'"]
-    for check in rules["words"][("checksums", "commands")]:
-        if command_findings([(1, f"{first_download} {CONTROL_URL}"), (2, verified.format(check=check))], rules):
-            raise Broken("a checksum word does not pass its own verified download")
-        for line in unchecked:
-            if ("unverified-download", 1) not in command_findings(
-                    [(1, f"{first_download} {CONTROL_URL}"), (2, line.format(check=check))], rules):
-                raise Broken("a checksum named in a comment or a quoted string counts as a check")
-    for word, _ in rules["downloads"]:
-        if word.split()[0] == "git":
-            continue
-        other = f'echo "{CONTROL_HASH}  other-{CONTROL_FILE}" | {first_check} -'
-        if ("unverified-download", 1) not in command_findings([(1, f"{word} {CONTROL_URL}"), (2, other)], rules):
-            raise Broken("a checksum of another file counts for a download")
-    for word, _ in rules["downloads"]:  # verification comes before the first use
-        if word.split()[0] == "git":
-            continue
-        used = [(1, f"{word} {CONTROL_URL}"), (2, f"tar -xzf {CONTROL_FILE}"), (3, verified.format(check=first_check))]
-        if ("download-used-before-check", 1) not in command_findings(used, rules):
-            raise Broken("a download used before its checksum passes")
-        if ("download-used-before-check", 1) not in command_findings(
-                [(1, f"{word} {CONTROL_URL} | sh"), (2, verified.format(check=first_check))], rules):
-            raise Broken("a download piped into a command passes")
-        if ("download-used-before-check", 1) not in command_findings(
-                [(1, f"{word} {CONTROL_URL} &"), (2, verified.format(check=first_check))], rules):
-            raise Broken("a download run in the background passes")
-        if command_findings([(1, f"{word} {CONTROL_URL}"), (2, verified.format(check=first_check)),
-                             (3, f"tar -xzf {CONTROL_FILE}")], rules):
-            raise Broken("a download verified before its first use is refused")
+        head, *tail = word.split()
+        split = head[0] + '""' + head[1:] if len(head) > 1 else head
+        for line in (f"{word} {CONTROL_URL}", f"# {word} {CONTROL_URL}", f'echo "{word} {CONTROL_URL}"',
+                     " ".join([split, *tail]) + f" {CONTROL_URL}", f"{word.upper()} {CONTROL_URL}"):
+            if fetch_findings(f"{line}\n", rules) != [1]:
+                raise Broken("a download word does not refuse its own seeded line or a hidden form of it")
+        if ORIGIN_SUBCOMMAND.fullmatch(word) and fetch_findings(f"{word} --no-tags origin main\n", rules):
+            raise Broken("a fetch or pull of the repository's own origin is refused")
+        if ORIGIN_SUBCOMMAND.fullmatch(word) and fetch_findings(f"cd vendor\n{word} origin main\n", rules) != [2]:
+            raise Broken("a fetch or pull of origin passes in a file that can relocate the repository")
+    if fetch_findings(f"tools/fetch-pinned {CONTROL_URL} {'0' * 64} control.tgz\n", rules):
+        raise Broken("a call of the helper is refused")
+    if docker_add_findings(f"ADD {CONTROL_URL} /x\n") != [1] or docker_add_findings(
+            f"ADD --checksum=sha256:{'0' * 64} {CONTROL_URL} /x\n"):
+        raise Broken("the Dockerfile ADD rule does not refuse an unchecked URL or pass a checked one")
     for word in rules["words"][("builds", "commands")]:
         if ("unlocked-build", 1) not in command_findings([(1, word)], rules):
             raise Broken("a build word does not refuse its own seeded build")
@@ -668,6 +571,20 @@ def is_script(rr, repo, name):
 def is_dockerfile(name):
     base = pathlib.PurePosixPath(name).name
     return base in ("Dockerfile", "Containerfile") or base.startswith("Dockerfile.") or base.lower().endswith(".dockerfile")
+
+
+def build_runs(rr, repo, name):
+    """True for a file a build runs: a workflow, a local action (action.yml anywhere, since uses: ./path reaches any
+    folder), a run suffix or name, a Dockerfile, or a file with a shebang or the executable bit."""
+    path = pathlib.PurePosixPath(name)
+    if name.startswith((".github/workflows/", ".github/actions/")) and path.suffix in (".yml", ".yaml"):
+        return True
+    if path.suffix.lower() in RUN_SUFFIXES or path.name in RUN_NAMES or is_dockerfile(name):
+        return True
+    rr.kind_check(repo, name)
+    if os.lstat(pathlib.Path(repo) / name).st_mode & 0o111:
+        return True
+    return rr.starts_with_shebang(repo, name)
 
 
 def toml_keys(text):
@@ -963,20 +880,30 @@ def main(argv):
         check_ghostty(rr, deps, repo, names, findings)
         check_zig(rr, deps, repo, names, findings)
         for name in names:
+            if build_runs(rr, repo, name):
+                raw = rr.read_source(repo, name, raw=True)
+                if name != rules["helper"]:
+                    where = f"(a download outside {rules['helper'] or 'the helper'})"
+                    for number in fetch_findings(raw, rules):
+                        findings.append(("fetch-outside-helper", f"{rr.shown(name)}:{number} {where}"))
+                if is_dockerfile(name):
+                    for number in docker_add_findings(raw):
+                        findings.append(("fetch-outside-helper", f"{rr.shown(name)}:{number} (an ADD of a URL "
+                                         "with no sha256 checksum)"))
             workflow = name.startswith(".github/workflows/") and name.endswith((".yml", ".yaml"))
             action = name.startswith(".github/actions/") and pathlib.PurePosixPath(name).name in ("action.yml", "action.yaml")
             if workflow or action:
-                lines = rr.read_source(repo, name).splitlines()
+                lines = rr.read_source(repo, name, raw=True).splitlines()
                 commands = list(logical_lines(run_lines(lines)))
                 images = workflow_image_findings(lines, action)
             elif is_dockerfile(name):
-                commands, images = [], docker_findings(rr.read_source(repo, name))
+                commands, images = [], docker_findings(rr.read_source(repo, name, raw=True))
             elif is_script(rr, repo, name):
-                commands = list(logical_lines(enumerate(rr.read_source(repo, name).splitlines(), 1)))
+                commands = list(logical_lines(enumerate(rr.read_source(repo, name, raw=True).splitlines(), 1)))
                 images = []
             else:
                 continue
-            for rule, number in command_findings(commands, rules, shell_changed(rr.read_source(repo, name))):
+            for rule, number in command_findings(commands, rules, shell_changed(rr.read_source(repo, name, raw=True))):
                 findings.append((rule, f"{rr.shown(name)}:{number}"))
             for number in images:
                 findings.append(("docker-digest", f"{rr.shown(name)}:{number} (an image with no sha256 digest)"))

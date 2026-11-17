@@ -10,3 +10,4 @@
 /tools/gates/ @VetSecItPro
 /.githooks/ @VetSecItPro
 /tools/install-hooks @VetSecItPro
+/tools/fetch-pinned @VetSecItPro

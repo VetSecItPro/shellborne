@@ -344,8 +344,9 @@ def allowed_at(name, allowed):
     return any(name.startswith(entry) if entry.endswith("/") else name == entry for entry in allowed)
 
 
-def read_source(repo, name):
-    """One tracked source as text: a regular file only, opened without following a symlink, at most MAX_BYTES."""
+def read_source(repo, name, raw=False):
+    """One tracked source as text: a regular file only, opened without following a symlink, at most MAX_BYTES.
+    raw reads any bytes one character each (Latin-1), for a reader that looks only for ASCII words."""
     path = pathlib.Path(repo) / name
     try:
         info = os.lstat(path)
@@ -371,6 +372,8 @@ def read_source(repo, name):
         raise Broken(f"cannot read {shown(name)}: {error.strerror}")
     if len(data) > MAX_BYTES:
         raise Broken(f"{shown(name)} is over the {MAX_BYTES}-byte cap for a source file")
+    if raw:
+        return data.decode("latin-1")
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
