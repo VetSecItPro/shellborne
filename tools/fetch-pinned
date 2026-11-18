@@ -411,33 +411,40 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         # Each restoration is tried twice, and one that still fails is named after the others have run. The order keeps
         # every alarm with its own handler: the helper's timer is cancelled, then the caller's handler goes back, and
         # only then is a timer the helper's swap displaced re-armed, and only if that handler is back.
+        # If caller code running during the fetch installed its own alarm handler, the caller owns the alarm now: its
+        # handler and its timer stay as they are, since putting back what the run started with would undo its choice.
         try:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            taken = signal.getsignal(signal.SIGALRM) != deadline.expired
         except Exception:
+            taken = False
+        if not taken:
             try:
                 signal.setitimer(signal.ITIMER_REAL, 0)
-            except Exception as error:
-                unrestored.append(f"the real-time timer ({described(error)})")
-        handler_back = True
-        try:
-            signal.signal(signal.SIGALRM, alarm)
-        except Exception:
+            except Exception:
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                except Exception as error:
+                    unrestored.append(f"the real-time timer ({described(error)})")
+            handler_back = True
             try:
                 signal.signal(signal.SIGALRM, alarm)
-            except Exception as error:
-                handler_back = False
-                unrestored.append(f"the alarm handler ({described(error)})")
-        if timer is not None and timer[0] > 0:  # a timer the swap displaced
-            if not handler_back:
-                unrestored.append("the caller's real-time timer (not re-armed: its handler could not be put back)")
-            else:
+            except Exception:
                 try:
-                    signal.setitimer(signal.ITIMER_REAL, *timer)
-                except Exception:
+                    signal.signal(signal.SIGALRM, alarm)
+                except Exception as error:
+                    handler_back = False
+                    unrestored.append(f"the alarm handler ({described(error)})")
+            if timer is not None and timer[0] > 0:  # a timer the swap displaced
+                if not handler_back:
+                    unrestored.append("the caller's real-time timer (not re-armed: its handler could not be put back)")
+                else:
                     try:
                         signal.setitimer(signal.ITIMER_REAL, *timer)
-                    except Exception as error:
-                        unrestored.append(f"the caller's real-time timer ({described(error)})")
+                    except Exception:
+                        try:
+                            signal.setitimer(signal.ITIMER_REAL, *timer)
+                        except Exception as error:
+                            unrestored.append(f"the caller's real-time timer ({described(error)})")
         if folder is not None:
             try:
                 close_quietly(folder)
@@ -699,9 +706,11 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
             pass
         except BaseException as error:  # not the cleanup's to drop: raised once every step has run
             deferred = deferred or error
-        # Each step below is attempted regardless of how the previous ones went.
+        # Each step below is attempted regardless of how the previous ones went. The timer is stopped only while the
+        # alarm is still the run's own; a caller that took it over keeps its timer.
         try:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            if signal.getsignal(signal.SIGALRM) == deadline.expired:
+                signal.setitimer(signal.ITIMER_REAL, 0)
         except Exception:
             pass
         for handle in handles:
