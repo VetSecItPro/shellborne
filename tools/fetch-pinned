@@ -303,7 +303,7 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         raise Malformed("a real-time timer is already running, and the helper's deadline needs it")
     state = outcome if outcome is not None else Outcome()
     holder = interrupts if interrupts is not None else Interrupts()
-    deadline, folder, unrestored = Deadline(), None, []
+    deadline, folder, unrestored, deferred = Deadline(), None, [], None
     try:
         if interrupts is None:
             holder.install()
@@ -311,24 +311,35 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         signal.signal(signal.SIGALRM, deadline.expired)
         signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
         place(url, digest.lower(), folder, name, open_url, max_bytes, deadline, state, holder)
+    except (Exception, KeyboardInterrupt):
+        raise
+    except BaseException as error:  # an exit request in flight: nothing below may replace it
+        deferred = error
+        raise
     finally:
         # Each step below runs whatever an earlier one raised. A signal handler runs between bytecodes, so the one
         # interrupt and the one deadline signal still armed are absorbed by these repeated attempts.
         try:
             holder.hold()
             deadline.disarm()
-        except BaseException:
+        except (Exception, KeyboardInterrupt):
             pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
         try:
             holder.hold()
             deadline.disarm()
-        except BaseException:
+        except (Exception, KeyboardInterrupt):
             pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
         try:
             holder.hold()
             deadline.disarm()
-        except BaseException:
+        except (Exception, KeyboardInterrupt):
             pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
         # Each restoration is tried twice, and one that still fails is named after the others have run.
         try:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -357,6 +368,8 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
                     holder.release()
                 except Exception as error:
                     unrestored.append(f"the interrupt handler ({described(error)})")
+        if deferred is not None:
+            raise deferred  # an exit request outranks a report the caller can no longer act on
         if unrestored:
             raise StateNotRestored(f"could not restore {', '.join(unrestored)}")
         if interrupts is None and state.placed and holder.held:  # the caller's handler is back: raise it now
@@ -530,7 +543,7 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
     deadline = deadline or Deadline()
     state = state if state is not None else Outcome()
     interrupts = interrupts if interrupts is not None else Interrupts()
-    pending, handles, failure, cleared = [], [], None, False
+    pending, handles, failure, cleared, deferred = [], [], None, False, None
     try:
         deadline.arm()
         aside = set_aside(folder, name, pending)
@@ -585,18 +598,24 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
         try:
             interrupts.hold()
             deadline.disarm()
-        except BaseException:
+        except (Exception, KeyboardInterrupt):
             pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
         try:
             interrupts.hold()
             deadline.disarm()
-        except BaseException:
+        except (Exception, KeyboardInterrupt):
             pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
         try:
             interrupts.hold()
             deadline.disarm()
-        except BaseException:
+        except (Exception, KeyboardInterrupt):
             pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
         # Every step runs whatever an earlier one raised, so one failing step never keeps the others from running.
         try:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -620,6 +639,8 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
                 left.append(name)
         # Exit 1 never hides a leftover: the refusal names it, after the reason the run failed, if any. A placed run has
         # renamed every pending name away, so a failure while checking one leaves nothing and refuses nothing.
+        if deferred is not None:
+            raise deferred
         if left and not state.placed:
             reason = f" after: {failure}" if failure is not None else ""
             raise Refused(f"could not remove {', '.join(left)}{reason}") from failure
