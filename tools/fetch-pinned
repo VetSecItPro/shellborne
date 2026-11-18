@@ -438,22 +438,32 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         # Each restoration is tried twice, and one that still fails is named after the others have run. The order keeps
         # every alarm with its own handler: the helper's timer is cancelled, then the caller's handler goes back, and
         # only then is a timer the helper's swap displaced re-armed, and only if that handler is back.
+        stopped = True
         try:
             signal.setitimer(signal.ITIMER_REAL, 0)
         except Exception:
             try:
                 signal.setitimer(signal.ITIMER_REAL, 0)
             except Exception as error:
+                stopped = False
                 unrestored.append(f"the real-time timer ({described(error)})")
-        handler_back = True
-        try:
-            signal.signal(signal.SIGALRM, alarm)
-        except Exception:
+        handler_back = stopped
+        if not stopped:  # a live timer of the helper's must not reach the caller's handler: leave a disarmed one there
+            try:
+                deadline.disarm()
+                signal.signal(signal.SIGALRM, deadline.expired)
+            except Exception:
+                pass
+            unrestored.append("the alarm handler (the helper's disarmed one stays while its timer runs)")
+        else:
             try:
                 signal.signal(signal.SIGALRM, alarm)
-            except Exception as error:
-                handler_back = False
-                unrestored.append(f"the alarm handler ({described(error)})")
+            except Exception:
+                try:
+                    signal.signal(signal.SIGALRM, alarm)
+                except Exception as error:
+                    handler_back = False
+                    unrestored.append(f"the alarm handler ({described(error)})")
         if timer is not None and timer[0] > 0:  # a timer the swap displaced
             if not handler_back:
                 unrestored.append("the caller's real-time timer (not re-armed: its handler could not be put back)")
@@ -690,23 +700,31 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
 
             def open_url(address):
                 return opener.open(address, timeout=TIMEOUT_SECONDS)
-        # The callback, its reply and the reply's methods are caller code that may install a SIGINT handler. The
-        # holder is put back in front each time control returns from them, so no such handler is still exposed when
-        # the commit or the cleanup takes hold.
+        # The callback, its reply, entering and leaving that reply, and each read on it are caller code that may
+        # install a SIGINT handler. The holder is put back in front each time control returns from them, so no such
+        # handler is still exposed when the commit or the cleanup takes hold.
         def from_caller(call, *arguments):
             try:
                 return call(*arguments)
             finally:
                 interrupts.adopt_guarded()
 
+        class Entered:  # entering and leaving the reply are caller code as well
+            def __init__(inner, reply):
+                inner.reply = reply
+
+            def __enter__(inner):
+                return from_caller(type(inner.reply).__enter__, inner.reply)
+
+            def __exit__(inner, *raised):
+                return from_caller(type(inner.reply).__exit__, inner.reply, *raised)
+
         try:
-            with from_caller(open_url, url) as body:
+            with Entered(from_caller(open_url, url)) as body:
                 temporary, found, written = to_temporary(folder, name, lambda size: from_caller(body.read, size),
                                                          max_bytes, pending, handles)
         except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
             raise Refused(f"the fetch failed: {error}") from None
-        finally:
-            interrupts.adopt_guarded()  # the reply's own exit is caller code too
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
         commit(deadline, interrupts, state)
