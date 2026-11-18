@@ -32,7 +32,10 @@ there.
 Only the executable changes process-wide state: it sets the last-resort report and holds interrupts until it exits,
 so nothing between the commit point and the exit can change the exit status. A library call, or main called in
 process, puts the interrupt and alarm handlers back and sets no report, and the helper takes over interrupts only
-while they are Python's default: a caller that ignores them or handles them itself keeps that.
+while they are Python's default: a caller that ignores them or handles them itself keeps that. The deadline borrows
+the real-time timer and the alarm handler, so a caller whose real-time timer is running, or whose alarm handler was
+set outside Python and so is one Python cannot put back, is refused before anything changes; a timer or handler the
+helper cannot put back afterward is reported as StateNotRestored, never swallowed, and the run's outcome stands.
 
 Every line the helper prints is printable ASCII: any other character in a name, an operating-system message or text
 a server sent is shown as an escape, so no input can break or forge a log line. Every exception, an interrupt
@@ -93,6 +96,11 @@ class Malformed(Refused):
 
 class TooLarge(Refused):
     """The bytes passed the cap."""
+
+
+class StateNotRestored(Exception):
+    """The run ended, placed or refused as its outcome records, but a timer or handler the helper changed could not
+    be put back, so the caller learns of it instead of inheriting it silently."""
 
 
 class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
@@ -263,14 +271,11 @@ class Interrupts:
     def hold(self):
         self.armed = False
 
-    def release(self, replay=False):
-        """Put Python's default handler back, then raise a held interrupt when replay asks for it."""
+    def release(self):
+        """Put Python's default handler back, if this holder took it over."""
         if self.installed:
             signal.signal(signal.SIGINT, signal.default_int_handler)
             self.installed = False
-        if replay and self.held:
-            self.held = False
-            raise KeyboardInterrupt
 
 
 def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
@@ -282,16 +287,23 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
     redirects, the body and the placement; only the final cleanup runs with it cancelled, so it is never cut
     short. outcome records the commit point for a caller that reads it; interrupts is a caller's own holder (main
     passes one), and without one the call takes over interrupts for the run and puts the handler back at the end,
-    raising an interrupt it held only when the file was placed. Every handler it changes is put back, however the
-    run ends."""
+    raising an interrupt it held only when the file was placed. Every timer and handler it changes is put back,
+    however the run ends, or the call raises StateNotRestored naming what could not be; a running real-time timer,
+    or an alarm handler Python cannot put back, is refused before anything changes."""
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
         raise Malformed("the digest must be 64 hex digits")
     if threading.current_thread() is not threading.main_thread():
         raise Malformed("the helper runs its deadline on the main thread only")
+    alarm = signal.getsignal(signal.SIGALRM)
+    if alarm is None:
+        raise Malformed("the alarm handler was set outside Python, which cannot put it back, so the deadline cannot "
+                        "borrow it")
+    if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+        raise Malformed("a real-time timer is already running, and the helper's deadline needs it")
     state = outcome if outcome is not None else Outcome()
     holder = interrupts if interrupts is not None else Interrupts()
-    deadline, folder, alarm = Deadline(), None, signal.getsignal(signal.SIGALRM)
+    deadline, folder, unrestored = Deadline(), None, []
     try:
         if interrupts is None:
             holder.install()
@@ -317,15 +329,21 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
             deadline.disarm()
         except BaseException:
             pass
+        # Each restoration is tried twice, and one that still fails is named after the others have run.
         try:
             signal.setitimer(signal.ITIMER_REAL, 0)
         except Exception:
-            pass
-        if alarm is not None:  # None: a handler set outside Python, which Python cannot put back
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except Exception as error:
+                unrestored.append(f"the real-time timer ({described(error)})")
+        try:
+            signal.signal(signal.SIGALRM, alarm)
+        except Exception:
             try:
                 signal.signal(signal.SIGALRM, alarm)
-            except Exception:
-                pass
+            except Exception as error:
+                unrestored.append(f"the alarm handler ({described(error)})")
         if folder is not None:
             try:
                 close_quietly(folder)
@@ -333,9 +351,17 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
                 pass
         if interrupts is None:
             try:
-                holder.release(state.placed)
+                holder.release()
             except Exception:
-                holder.release(state.placed)
+                try:
+                    holder.release()
+                except Exception as error:
+                    unrestored.append(f"the interrupt handler ({described(error)})")
+        if unrestored:
+            raise StateNotRestored(f"could not restore {', '.join(unrestored)}")
+        if interrupts is None and state.placed and holder.held:  # the caller's handler is back: raise it now
+            holder.held = False
+            raise KeyboardInterrupt
     return dest
 
 
