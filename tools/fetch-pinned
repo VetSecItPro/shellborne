@@ -28,9 +28,10 @@ just as it starts.
 
 Process-wide state. Only the command-line entry point changes it for good: it installs the last-resort report, and
 from the commit point to exit an interrupt is merely noted, so the status reported is the status on disk. A library
-call, or main used in process, returns the interrupt and alarm handlers and installs no report. The program takes
-over interrupts only from Python's default handler; with a caller's own handler, an interrupt during the commit or
-cleanup waits in the signal mask and reaches that handler afterward, and an ignored interrupt stays ignored. The
+call, or main used in process, returns the interrupt and alarm handlers and installs no report. For the run, the
+program sits in front of whatever Python-level SIGINT handler the caller has: while the download can still be stopped,
+each interrupt goes through to that handler, which can raise only once; during the commit and the cleanup it is noted
+instead, and a caller's own handler receives it once the cleanup is over. An ignored interrupt stays ignored. The
 deadline needs the alarm handler and the real-time timer, so a caller already running that timer, or whose alarm
 handler was installed outside Python (one Python cannot put back), is turned away before anything changes; a timer
 that starts during that check shows up in the program's own swap, which puts it back and fails the run. A timer or
@@ -254,41 +255,47 @@ class Outcome:
 
 
 class Interrupts:
-    """The run's interrupt handling. Until held, an interrupt raises as usual, and at most once; once held, it is
-    recorded instead, so the commit and the cleanup run to their end. Only Python's default handler is taken over: a
-    caller that ignores interrupts or handles them itself keeps that, and holding then changes nothing."""
+    """How the run treats SIGINT. While armed, an interrupt behaves as the caller set it up: Python's default handler
+    raises KeyboardInterrupt, and a caller's own handler is called. Either way it can raise only once, because the
+    holder disarms itself before handing the signal on. Once held, an interrupt is only noted, so the commit and the
+    cleanup always run to their end. The holder sits in front of any Python-level handler for the run; an ignored
+    interrupt, or one left to the operating system, is not touched."""
 
     def __init__(self):
-        self.armed, self.held, self.installed, self.blocked = True, False, False, None
+        self.armed, self.held, self.installed, self.previous = True, False, False, None
 
     def fired(self, signum, frame):
-        if self.armed:
-            self.armed = False
+        if not self.armed:
+            self.held = True
+            return
+        self.armed = False  # before handing it on, so a handler that raises can do so only this once
+        previous = self.previous
+        if previous is None or previous is signal.default_int_handler:
             raise KeyboardInterrupt
-        self.held = True
+        previous(signum, frame)
+        self.armed = True  # the caller's handler returned instead of raising: keep passing interrupts to it
 
     def install(self):
-        if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        current = signal.getsignal(signal.SIGINT)
+        if callable(current):
+            self.previous = current
             self.installed = True  # first, so a release after an interrupt inside the next call still restores
             signal.signal(signal.SIGINT, self.fired)
 
     def hold(self):
-        """Stop an interrupt from raising. With Python's default handler taken over, it is recorded; with a caller's own
-        handler left in place, it is blocked in the signal mask, so it waits for release instead of cutting the cleanup
-        short, and reaches that handler then. An ignored interrupt needs neither."""
         self.armed = False
-        if not self.installed and self.blocked is None and signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
-            self.blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
 
     def release(self):
-        """Put Python's default handler back, if this holder took it over, and the signal mask as it was, if this holder
-        blocked the interrupt; a blocked interrupt then reaches the caller's handler. The holder's owner releases it."""
-        if self.installed:
-            signal.signal(signal.SIGINT, signal.default_int_handler)
-            self.installed = False
-        if self.blocked is not None:
-            before, self.blocked = self.blocked, None
-            signal.pthread_sigmask(signal.SIG_SETMASK, before)
+        """Give the caller back its SIGINT handler. An interrupt noted while held is sent again to a caller's own
+        handler, which then decides what it means; for Python's default handler the run decides (fetch_pinned)."""
+        if not self.installed:
+            return
+        previous = self.previous
+        signal.signal(signal.SIGINT, previous)
+        self.installed = False
+        if self.held and previous is not signal.default_int_handler:
+            self.held = False
+            signal.raise_signal(signal.SIGINT)
 
 
 def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
