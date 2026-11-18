@@ -6,23 +6,54 @@ Usage: fetch-pinned <https-url> <sha256> <destination>
 This is the one way a build brings a file in from the network; the pin gate refuses every other fetch in a file a
 build runs. The file streams into a new temporary file beside the destination, hashed in this program as it is
 written and capped in size, and is renamed onto the destination only when the digest matches. On any failure the
-temporary file is removed and the destination is left as it was, so the destination name never holds an unverified
-file and no later command can use one, whatever order a script runs in. A file already at the destination is
-kept only when it already matches, with no fetch; any other file there is removed before the fetch. One deadline
-(15 minutes) covers the whole request, connection, redirects and body.
+temporary file is removed and the destination keeps nothing this run did not verify: a file already there is kept
+only when a copy of it, hashed as that copy, matches, with no fetch; any other file there, and a copy of it that
+did not verify, is removed before the fetch; a file the helper could not finish copying is removed whatever went
+wrong; and a file this run renamed into place is removed if a refusal comes before the run returns. So no later
+command can use an unverified file, whatever order a script runs in. One deadline (15 minutes) covers the whole
+request, connection, redirects and body.
+
+The helper's first change to the destination takes whatever is there off the name: it renames it aside, or, when
+that rename fails or the run is refused before it, removes it. From then on the name is empty or holds a verified
+file at every instant, and even a run killed outright leaves nothing unverified there. Before that change the helper
+only reads, so a run killed before that change leaves the destination as it found it. The cost: a file that matches
+is briefly absent from the name while it is checked.
+
+The command-line run has one commit point, where the verified file is in place: an interrupt before it is rolled
+back, and from it on interrupts are ignored and the run reports the placement, so exit 1 never comes with a file
+written, and exit 0 always does.
+
+Every line the helper prints is printable ASCII: any other character in a name, an operating-system message or text
+a server sent is shown as an escape, so no input can break or forge a log line. Every exception, an interrupt
+included, ends as one such line, and the helper's own last-resort report prints one line without any chained text.
+
+Kept permissions are the mode bits only: a verified copy of a file already there keeps its mode, but not its ACLs,
+flags or extended attributes, so a caller that needs those sets them after placement.
+
+Threat model: the helper defends against an untrusted network and against stale, partial or wrong files at the
+destination. It does not defend against another process writing in the destination folder during the run; such a
+process already holds the build's trust. The cleanup removes a temporary name, or a file this run renamed onto the
+destination, only while that name still holds that same file. Every cleanup step runs
+whatever an earlier one raised, and any name the helper could not remove is named in the refusal.
 
 Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
-digest is 64 hex digits; the destination is inside the folder the helper runs in, its folder exists and resolves
-inside that folder through real folders only (no link anywhere in the path, checked folder by folder and held
-open through the write), and it is absent or a regular file (not a link, folder or special file). Exit 0 placed, 1 refused (fetch failed, too large, or digest
-mismatch), 2 malformed arguments. Nothing is written for exit 1 or 2.
+digest is 64 hex digits; the destination is inside the folder the helper runs in (an absolute path may spell that
+folder as the shell's $PWD when it resolves there), its folder exists and resolves inside that folder through real
+folders only (no link anywhere in the path, checked folder by folder and held open through the write), it is absent
+or a regular file (not a link, folder or special file), it is valid UTF-8 with no control character and plainly
+names a file (no trailing slash, no empty, . or .. part; a leading ./ is allowed), and its name leaves room for the
+temporary name beside it. Exit 0 placed; 1 refused (the fetch failed or passed its deadline, the bytes passed the
+cap or did not match the digest, the run was interrupted, or the helper could not clear the destination or its
+temporary files); 2 malformed arguments. Nothing is written for exit 1 or 2.
 """
 import hashlib
 import http.client
+import ipaddress
 import os
 import re
 import secrets
 import signal
+import socket
 import stat
 import sys
 import threading
@@ -35,6 +66,9 @@ TIMEOUT_SECONDS = 120
 DEADLINE_SECONDS = 900
 CHUNK = 1024 * 1024
 HEX64 = re.compile(r"[0-9A-Fa-f]{64}")
+PRINTABLE = re.compile(r"[\x21-\x7e]+")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+LABEL = re.compile(r"(?!-)[A-Za-z0-9_-]{1,63}(?<!-)")
 
 
 class Refused(Exception):
@@ -63,11 +97,44 @@ def https_only_opener():
 
 
 def check_url(url):
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme.lower() != "https" or not parts.hostname:
+    """Every URL urllib cannot send or resolve as written is malformed here, before any fetch: anything but
+    printable ASCII (a space, a control character, a letter outside ASCII), a bracket host that does not close, a
+    port that is not a number in range, and a host that is neither an IP address nor a name of valid labels."""
+    if not isinstance(url, str) or not PRINTABLE.fullmatch(url):
+        raise Malformed("the URL must be printable ASCII, with no space or control character")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError as error:
+        raise Malformed(f"the URL cannot be read: {error}") from None
+    if port == 0:
+        raise Malformed("the URL's port must be 1 to 65535")
+    if parts.scheme.lower() != "https" or not host:
         raise Malformed("the URL must be https with a host")
+    if not valid_host(host):
+        raise Malformed("the URL's host must be an IP address or a name of valid labels")
     if parts.username is not None or parts.password is not None:
         raise Malformed("the URL must not carry a user name or password")
+
+
+def valid_host(host):
+    """An IP address, or a name of labels of 1 to 63 letters, digits, underscores or inner hyphens, 253 characters
+    in all; one trailing dot is allowed. A host the system's own address parser reads as an address (hex, octal or
+    short forms such as 0x7f000001, 017.0.0.1 or 127.1) must be written as one, and a name's last label is not all
+    digits, since the resolver would read it as an address too. inet_aton parses locally and looks nothing up."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    labels = (host[:-1] if host.endswith(".") else host).split(".")
+    try:
+        socket.inet_aton(".".join(labels))
+        return False
+    except OSError:
+        pass
+    return (0 < len(".".join(labels)) <= 253 and all(LABEL.fullmatch(label) for label in labels)
+            and not labels[-1].isdigit())
 
 
 FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -80,10 +147,24 @@ def open_destination(dest, root):
     root = os.path.realpath(root)
     if not dest:
         raise Malformed("the destination must name a file")
+    if CONTROL.search(dest):
+        raise Malformed("the destination must not hold a control character")
+    try:
+        dest.encode("utf-8")
+    except UnicodeEncodeError:
+        raise Malformed("the destination must be valid UTF-8 text") from None
+    pieces = (dest[2:] if dest.startswith("./") else dest).split("/")
+    if any(piece in ("", ".", "..") for piece in (pieces[1:] if os.path.isabs(dest) else pieces)):
+        raise Malformed("the destination must plainly name a file: no trailing slash and no empty, . or .. part")
     path = os.path.normpath(dest if os.path.isabs(dest) else os.path.join(root, dest))
-    if not path.startswith(root + os.sep):
+    prefixes = [root]
+    shell = os.path.normpath(os.environ.get("PWD") or ".")  # the shell's spelling of the same folder, if it is one
+    if os.path.isabs(shell) and os.path.realpath(shell) == root:
+        prefixes.append(shell)
+    inside = [prefix for prefix in prefixes if path != prefix and os.path.commonpath([prefix, path]) == prefix]
+    if not inside:  # compared part by part, so / as the folder holds its paths and /a/work never holds /a/workshop
         raise Malformed("the destination is outside the folder the helper runs in")
-    parts = path[len(root) + 1:].split(os.sep)
+    parts = os.path.relpath(path, inside[0]).split(os.sep)
     if any(part in ("", ".", "..") for part in parts):
         raise Malformed("the destination must be a plain path to a file")
     try:
@@ -96,8 +177,14 @@ def open_destination(dest, root):
                 inner = os.open(part, FOLDER, dir_fd=folder)
             except OSError:
                 raise Malformed("every folder in the destination path must exist and be a real folder, not a link")
-            os.close(folder)
+            close_quietly(folder)
             folder = inner
+        try:
+            longest = os.fpathconf(folder, "PC_NAME_MAX")
+        except (OSError, ValueError):
+            longest = 255
+        if len(temporary_name(parts[-1]).encode()) > longest:  # its temporary name must fit beside it
+            raise Malformed("the destination's name is too long for the temporary name the helper puts beside it")
         try:
             info = os.stat(parts[-1], dir_fd=folder, follow_symlinks=False)
         except FileNotFoundError:
@@ -106,20 +193,54 @@ def open_destination(dest, root):
             raise Malformed("the destination must be absent or a regular file, not a link, folder or special file")
         return folder, parts[-1]
     except BaseException:
-        os.close(folder)
+        close_quietly(folder)
         raise
 
 
-def expired(signum, frame):
-    raise Refused("the fetch passed its deadline")
+class Deadline:
+    """The one deadline. It raises at most once and only while armed: an expiry before the work is armed is held and
+    raised when it is, and once disarmed an expiry does nothing, so a signal already on its way cannot cut the
+    cleanup short or turn a verified placement into a refusal."""
+
+    def __init__(self):
+        self.armed, self.passed = False, False
+
+    def expired(self, signum, frame):
+        self.passed = True
+        if self.armed:
+            self.armed = False
+            raise Refused("the fetch passed its deadline")
+
+    def arm(self):
+        self.armed = True
+        if self.passed:
+            self.armed = False
+            raise Refused("the fetch passed its deadline")
+
+    def disarm(self):
+        self.armed = False
 
 
-def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS):
+class Outcome:
+    """The command-line run's record of its one commit point. commit() is called once the verified file is in place
+    and the deadline is disarmed: it ignores interrupts from then on, then records the run as placed, so no interrupt
+    can land after the record and before the report. An interrupt before it rolls the placement back."""
+
+    def __init__(self):
+        self.placed = False
+
+    def commit(self):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        self.placed = True
+
+
+def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
+                 outcome=None):
     """Place url's body at dest only when its SHA-256 is digest; raise Refused otherwise. A file already at dest
     is kept only when a copy of it, hashed as that copy, matches, with no fetch; any other file there is removed
-    first, so whatever is at dest when this returns or raises has been verified. One deadline covers everything
-    after the arguments are checked: reading a file already there, the connection, redirects, the body and the
-    placement; only the final removal of leftover temporary files runs with it cancelled, so it is never cut
+    first, so whatever is at dest when this returns, or refuses once the arguments are checked, has been verified.
+    One deadline covers everything after the arguments are checked: reading a file already there, the connection,
+    redirects, the body and the placement; only the final cleanup runs with it cancelled, so it is never cut
     short."""
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
@@ -127,33 +248,75 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
     if threading.current_thread() is not threading.main_thread():
         raise Malformed("the helper runs its deadline on the main thread only")
     folder, name = open_destination(dest, root if root is not None else os.getcwd())
-    previous = signal.signal(signal.SIGALRM, expired)
+    deadline = Deadline()
+    previous = signal.signal(signal.SIGALRM, deadline.expired)
     signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
     try:
-        place(url, digest.lower(), folder, name, open_url, max_bytes)
+        place(url, digest.lower(), folder, name, open_url, max_bytes, deadline, outcome)
     finally:
+        deadline.disarm()
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
-        os.close(folder)
+        close_quietly(folder)
     return dest
 
 
+def close_quietly(handle):
+    """The one way the helper closes a handle. A close never changes the outcome: what a handle held was synced and
+    checked before it is closed, or the run is refused already, so a failed close neither turns a refusal into
+    another error nor a verified placement into a refusal."""
+    try:
+        os.close(handle)
+    except OSError:
+        pass
+
+
 def remove(folder, name):
+    """The one way the helper removes a name. A name already gone is fine; any other failure is a refusal that names
+    what was left, so exit 1 never hides a leftover."""
     try:
         os.unlink(name, dir_fd=folder)
     except FileNotFoundError:
         pass
+    except OSError as error:
+        raise Refused(f"could not remove {name}: {error.strerror or error}") from None
+
+
+def temporary_name(name):
+    """The one shape of every temporary name: hidden, beside the destination, random, and marked as partial."""
+    return f".{name}.{secrets.token_hex(8)}.part"
+
+
+def identity(info):
+    return info.st_dev, info.st_ino
+
+
+def remove_own(folder, name, own):
+    """Remove name only while it still holds the file this run made or read (own is its device and inode). A name
+    whose file is not known yet (own is None: the run was cut off between creating it and recording it) is removed
+    as it stands: in that instant it holds this run's new file unless another process raced it, which the threat
+    model leaves out."""
+    if own is not None:
+        try:
+            if identity(os.stat(name, dir_fd=folder, follow_symlinks=False)) != own:
+                return
+        except FileNotFoundError:
+            return
+    remove(folder, name)
 
 
 def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644):
     """Write what read() yields into a new temporary file beside the destination, hashing as it goes, under the
-    cap; return (temporary name, SHA-256, open handle). The name joins pending before the file exists and the
-    handle joins handles, so the caller's one cleanup removes and closes them on any failure, however late, and
-    the handle stays open so placement can prove it installs this very file."""
-    temporary = f".{name}.{secrets.token_hex(8)}.part"
-    pending.append(temporary)
+    cap; return (temporary name, SHA-256, open handle). The name joins pending before the file exists, with the
+    file's identity recorded as soon as it does, and the handle joins handles, so the caller's one cleanup removes
+    and closes them on any failure, however late, and the handle stays open so placement can prove it installs
+    this very file."""
+    temporary = temporary_name(name)
+    entry = [temporary, None]
+    pending.append(entry)
     handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
     handles.append(handle)
+    entry[1] = identity(os.fstat(handle))
     hasher, size = hashlib.sha256(), 0
     while chunk := read(CHUNK):
         size += len(chunk)
@@ -169,7 +332,48 @@ def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644):
 
 
 def same_file(info, other):
-    return (info.st_dev, info.st_ino) == (other.st_dev, other.st_ino)
+    return identity(info) == identity(other)
+
+
+def commit(deadline, outcome, pending, temporary):
+    """The one commit point: the verified file is in place. The deadline is disarmed first, then the command-line
+    run's outcome ignores interrupts and records the placement, and only then does the cleanup give up the file, so
+    an interrupt before this point is rolled back and none can come after it."""
+    deadline.disarm()
+    if outcome is not None:
+        outcome.commit()
+    placed(pending, temporary)
+
+
+def placed(pending, temporary):
+    """A renamed temporary file is the destination now, so its old name is no longer this run's to clean up."""
+    pending[:] = [entry for entry in pending if entry[0] != temporary]
+
+
+def discard(folder, pending):
+    """Remove every pending temporary file now (a copy that did not verify), not at the end; an entry leaves the
+    list only once its removal succeeded, so a failure here is retried and named by the final cleanup."""
+    while pending:
+        temporary, own = pending[0]
+        remove_own(folder, temporary, own)
+        del pending[0]
+
+
+def clear_destination(folder, name, owns, cleared):
+    """After a refusal, remove from the destination a file this run renamed there (owns, the identities of every
+    file still pending), only while the name still holds it, so exit 1 never leaves a file written. If the refusal
+    came before the destination was cleared (set aside, or removed where it stood), whatever file is there was
+    never verified, so it is removed as it stands; a folder is never removed."""
+    if cleared and not owns:
+        return
+    try:
+        info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode):
+        return
+    if not cleared or identity(info) in owns:
+        remove(folder, name)
 
 
 def settle(folder, temporary, handle, found, digest, name):
@@ -187,50 +391,74 @@ def settle(folder, temporary, handle, found, digest, name):
     return True
 
 
-def changed(folder, name):
-    """The destination stopped being a regular file during the run: a link or special file there is removed
-    through the held folder, so nothing unverified stays at the name; a folder is left, since it holds no
-    fetched bytes and removing a tree is not this helper's to do."""
+def set_aside(folder, name, pending):
+    """The helper's first change to the destination: rename whatever is there aside to a temporary name, in one atomic
+    rename, before anything reads it, so from here the name is empty or holds a verified file at every instant, even
+    if the run is killed. When the rename fails, the file is removed where it stands, or the refusal names it; a
+    refusal before this step has the cleanup remove it the same way. Return the pending entry for it, or None when
+    the name is empty. A folder is renamed back and refused, since it holds no fetched bytes and removing a tree is
+    not this helper's to do; a link or special file is refused, and the cleanup removes it."""
+    entry = [temporary_name(name), None]
+    pending.append(entry)
     try:
-        info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        os.rename(name, entry[0], src_dir_fd=folder, dst_dir_fd=folder)
     except FileNotFoundError:
-        return Refused("the destination changed during the run")
-    if not stat.S_ISDIR(info.st_mode):
+        pending.remove(entry)
+        return None
+    except OSError:  # it cannot be set aside, so it is removed where it stands, or the refusal names it
+        pending.remove(entry)
         remove(folder, name)
-    return Refused("the destination changed during the run into something other than a regular file")
+        return None
+    info = os.stat(entry[0], dir_fd=folder, follow_symlinks=False)
+    entry[1] = identity(info)
+    if stat.S_ISDIR(info.st_mode):
+        os.rename(entry[0], name, src_dir_fd=folder, dst_dir_fd=folder)
+        pending.remove(entry)
+        raise Refused("the destination changed during the run into a folder")
+    if not stat.S_ISREG(info.st_mode):
+        raise Refused("the destination changed during the run into something other than a regular file")
+    return entry
 
 
-def place(url, digest, folder, name, open_url, max_bytes):
+def place(url, digest, folder, name, open_url, max_bytes, deadline=None, outcome=None):
     """Everything here works through the folder handle, never through the path again. A file already at the
-    destination is copied through a temporary file and hashed as that copy, so success never rests on an inode
-    read from the name; the deadline stays armed until this returns; one cleanup owns every temporary file."""
-    pending, handles = [], []
+    destination is first set aside, then copied through a temporary file and hashed as that copy, so success never
+    rests on an inode read from a name; the deadline stays armed until placement is verified; one cleanup owns
+    every temporary file and any file this run renamed onto the destination, and removes each only while it still
+    holds that same file."""
+    deadline = deadline or Deadline()
+    pending, handles, failure, cleared = [], [], None, False
     try:
-        try:
-            info = os.stat(name, dir_fd=folder, follow_symlinks=False)
-        except FileNotFoundError:
-            info = None
-        if info is not None:
-            if not stat.S_ISREG(info.st_mode):
-                raise changed(folder, name)
+        deadline.arm()
+        aside = set_aside(folder, name, pending)
+        cleared = True  # the name is empty now, or its file is set aside under a temporary name
+        if aside is not None:
+            found = None
             try:
-                handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+                handle = os.open(aside[0], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
             except OSError:
-                raise changed(folder, name) from None
+                handle = None  # it cannot be read, so it cannot be verified: it goes like any other wrong file
+        if aside is not None and handle is not None:
             try:
-                if not stat.S_ISREG(os.fstat(handle).st_mode):
-                    raise changed(folder, name)
-                mode = stat.S_IMODE(os.fstat(handle).st_mode)  # the copy keeps the existing file's permissions
+                found_info = os.fstat(handle)
+                if identity(found_info) != aside[1] or not stat.S_ISREG(found_info.st_mode):
+                    raise Refused("the destination changed during the run")
+                mode = stat.S_IMODE(found_info.st_mode)  # the copy keeps the existing file's mode bits
                 try:
                     temporary, found, copy = to_temporary(folder, name, lambda size: os.read(handle, size),
                                                           max_bytes, pending, handles, mode)
                 except TooLarge:
-                    temporary = None  # over the cap, so it is not the pinned file
+                    found = None  # over the cap, so it is not the pinned file
             finally:
-                os.close(handle)
-            if temporary is not None and settle(folder, temporary, copy, found, digest, name):
-                return
-            remove(folder, name)  # an unverified file never stays at the destination
+                close_quietly(handle)
+        if aside is not None:
+            if found == digest:
+                remove_own(folder, aside[0], aside[1])  # the verified copy replaces it, so the original goes first
+                pending.remove(aside)
+                if settle(folder, temporary, copy, found, digest, name):
+                    commit(deadline, outcome, pending, temporary)
+                    return
+            discard(folder, pending)  # the file set aside and its copy did not verify: both go before the fetch
         if open_url is None:
             opener = https_only_opener()
 
@@ -243,30 +471,93 @@ def place(url, digest, folder, name, open_url, max_bytes):
             raise Refused(f"the fetch failed: {error}") from None
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
+        commit(deadline, outcome, pending, temporary)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)  # the cleanup is never cut short; a refusal in flight still rises
+        try:
+            deadline.disarm()  # the cleanup is never cut short; a refusal in flight still rises
+        except Refused:  # the one deadline signal landed as the cleanup began: it is spent now
+            deadline.disarm()
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        # Every step runs whatever an earlier one raised, so one failing step never keeps the others from running.
         for handle in handles:
-            os.close(handle)
-        for temporary in pending:  # a renamed file is gone from this name, so only leftovers are removed
-            remove(folder, temporary)
+            close_quietly(handle)
+        owns = [own for _, own in pending if own is not None]  # a pending file may already be at the destination
+        left = []
+        for temporary, own in pending:  # only leftovers this run made, each while it still holds that file
+            try:
+                remove_own(folder, temporary, own)
+            except (OSError, Refused):
+                left.append(temporary)
+        try:  # a file this run renamed onto the destination before a refusal, or one never set aside
+            clear_destination(folder, name, owns, cleared)
+        except (OSError, Refused):
+            left.append(name)
+        if left:  # exit 1 never hides a leftover: the refusal names it, after the reason the run failed, if any
+            reason = f" after: {failure}" if failure is not None else ""
+            raise Refused(f"could not remove {', '.join(left)}{reason}") from failure
+
+
+def shown(text):
+    """One line of printable ASCII: a backslash, a control character or any non-ASCII character becomes an escape."""
+    return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape").decode("ascii")
+                   for c in str(text))
+
+
+def say(text, stream):
+    """The one place the helper prints, so no message can skip the escaping."""
+    print(shown(text), file=stream)
+
+
+def described(error):
+    """An exception's text, or its type's name when even making the text fails, so a report never raises."""
+    try:
+        return str(error)
+    except Exception:
+        return type(error).__name__
+
+
+def last_resort(kind, value, trace):
+    """Python's report for an exception that escapes main (an interrupt during a report, say) would print chained text
+    unescaped; this prints one escaped line with the exception's type only. It never raises, since Python answers a
+    report that raises with its own full report. The run still never exits 0: Python exits 1, or 130 for an
+    interrupt."""
+    try:
+        say(f"fetch-pinned: refused: {getattr(kind, '__name__', 'error')}", sys.stderr)
+    except BaseException:
+        pass
+
+
+def refusal(error):
+    """(exit status, the one line) for an exception that ended a run before its commit point."""
+    if isinstance(error, Malformed):
+        return 2, f"fetch-pinned: malformed: {described(error)}"
+    if isinstance(error, Refused):
+        return 1, f"fetch-pinned: refused: {described(error)}"
+    if isinstance(error, OSError):  # any operating-system failure is a refusal; nothing unverified is left in place
+        return 1, f"fetch-pinned: refused: {error.strerror or described(error)}"
+    return 1, f"fetch-pinned: refused: {type(error).__name__}: {described(error)}"  # an interrupt included
 
 
 def main(argv):
+    sys.excepthook = last_resort
     if len(argv) != 4:
-        print("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", file=sys.stderr)
+        say("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", sys.stderr)
         return 2
+    outcome = Outcome()
     try:
-        fetch_pinned(argv[1], argv[2], argv[3])
-    except Malformed as error:
-        print(f"fetch-pinned: malformed: {error}", file=sys.stderr)
-        return 2
-    except Refused as error:
-        print(f"fetch-pinned: refused: {error}", file=sys.stderr)
-        return 1
-    except OSError as error:  # any operating-system failure is a refusal; nothing unverified is left in place
-        print(f"fetch-pinned: refused: {error.strerror or error}", file=sys.stderr)
-        return 1
-    print(f"fetch-pinned: placed {argv[3]}")
+        fetch_pinned(argv[1], argv[2], argv[3], outcome=outcome)
+    except BaseException as error:
+        if not outcome.placed:  # before the commit point: rolled back, so the run is refused
+            status, line = refusal(error)
+            say(line, sys.stderr)
+            return status
+    try:  # past the commit point the file is verified and in place, so even a report that fails is exit 0
+        say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
+    except BaseException:
+        pass
     return 0
 
 
