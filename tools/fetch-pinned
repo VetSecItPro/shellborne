@@ -66,6 +66,7 @@ not remove.
 import hashlib
 import http.client
 import ipaddress
+import math
 import os
 import re
 import secrets
@@ -289,9 +290,11 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
     redirects, the body and the placement; only the final cleanup runs with it cancelled, so it is never cut
     short. outcome records the commit point for a caller that reads it; interrupts is a caller's own holder (main
     passes one), and without one the call takes over interrupts for the run and puts the handler back at the end,
-    raising an interrupt it held only when the file was placed. Every timer and handler it changes is put back,
-    however the run ends, or the call raises StateNotRestored naming what could not be; a running real-time timer,
-    or an alarm handler Python cannot put back, is refused before anything changes."""
+    raising an interrupt it held only when the file was placed. A deadline that is not a positive finite number, a
+    byte cap that is not a whole number of 0 or more, and a holder or record from an earlier run are malformed.
+    Every timer and handler it changes is put back, however the run ends, or the call raises StateNotRestored naming
+    what could not be; a running real-time timer, or an alarm handler Python cannot put back, is refused before
+    anything changes."""
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
         raise Malformed("the digest must be 64 hex digits")
@@ -299,6 +302,13 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         raise Malformed("the helper runs its deadline on the main thread only")
     if outcome is not None and outcome.placed:
         raise Malformed("the outcome record is from an earlier run; each run needs a fresh one")
+    if interrupts is not None and (not interrupts.armed or interrupts.held):
+        raise Malformed("the interrupt holder is from an earlier run; each run needs a fresh one")
+    if (isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, (int, float))
+            or not math.isfinite(deadline_seconds) or deadline_seconds <= 0):
+        raise Malformed("the deadline must be a positive, finite number of seconds")  # 0 would cancel the timer
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise Malformed("the byte cap must be a whole number, 0 or more")
     alarm = signal.getsignal(signal.SIGALRM)
     if alarm is None:
         raise Malformed("the alarm handler was set outside Python, which cannot put it back, so the deadline cannot "
