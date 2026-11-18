@@ -1,67 +1,67 @@
 #!/usr/bin/env python3
-"""Fetch one file over https and place it only when its SHA-256 matches (plan step P0.11.5).
+"""Download one file over https and keep it only if its SHA-256 equals the pinned value (plan step P0.11.5).
 
 Usage: fetch-pinned <https-url> <sha256> <destination>
 
-This is the one way a build brings a file in from the network; the pin gate refuses every other fetch in a file a
-build runs. The file streams into a new temporary file beside the destination, hashed in this program as it is
-written and capped in size, and is renamed onto the destination only when the digest matches. On any failure the
-temporary file is removed and the destination keeps nothing this run did not verify: a file already there is kept
-only when a copy of it, hashed as that copy, matches, with no fetch; any other file there, and a copy of it that
-did not verify, is removed before the fetch; a file the helper could not finish copying is removed whatever went
-wrong; and a file this run renamed into place is removed if a refusal comes before the run returns. So no later
-command can use an unverified file, whatever order a script runs in. One deadline (15 minutes) covers the whole
-request, connection, redirects and body.
+Builds bring files in from the network through this program and nothing else; the pin gate refuses any other
+download in a file a build executes.
 
-The helper's first change to the destination takes whatever is there off the name: it renames it aside, or, when
-that rename fails or the run is refused before it, removes it. From then on the name is empty or holds a verified
-file at every instant, and even a run killed outright leaves nothing unverified there. Before that change the helper
-only reads, so a run killed before that change leaves the destination as it found it. The cost: a file that matches
-is briefly absent from the name while it is checked.
+How a run goes. The body lands in a hidden scratch file next to the destination, hashed and size-limited as it
+arrives, and is renamed over the destination only once the hash checks out. Whatever already sits at the
+destination is dealt with before anything else is written. That first change to the destination moves whatever sits
+at that name to a scratch name, or deletes it when the move is impossible or the run fails before reaching it. That old
+file is reused, with no download, only if a fresh copy of it hashes to the pin; otherwise it and its copy are gone
+before the download starts. Until that first change the program only reads, so a run stopped by any means at that
+stage finds the destination untouched. Afterward the destination name is, at every moment, either vacant or holding
+a checked file, even if the process is killed. The price is a short gap in which a good existing file is away from
+its name while it is checked. One deadline of 15 minutes bounds the request, any redirects and the body.
 
-The run has one commit point, where the verified file is in place: interrupts are held and the deadline disarmed,
-then one store records the run as placed. The cleanup reads that record: before the store it rolls the placement
-back, and after it nothing can undo it. From the commit point, and from the first line of the cleanup on any path,
-interrupts are held: one is recorded rather than raised, so a second interrupt cannot cut a rollback short, and every
-cleanup step runs whatever an earlier one raised. So exit 1 never comes with a file written, and exit 0 always does.
-A held interrupt is dropped when the run is refused anyway, since the run has stopped; on a placed run the command
-line reports the placement, and a library call raises it once the caller's handler is back. A signal handler runs
-between bytecodes, so the one interrupt and the one deadline signal that may land as the cleanup begins are absorbed
-there.
+Outcome and exit status. A run turns final at its commit point: the checked file is in place, interrupts are held,
+the deadline is switched off, and one store marks the run as placed. Before that store the cleanup undoes the
+placement; after it, nothing can. Interrupts arriving during the commit or anywhere in the cleanup wait instead of
+raising, so a second Ctrl-C cannot stop a rollback half way, and each cleanup step runs even when an earlier step
+failed. Hence a status of 1 always means no file was written, and a status of 0 always means one was. A waiting
+interrupt is discarded when the run failed anyway; after a placement the command line still reports success, while
+a library call raises the interrupt once the caller's handlers are back. Python runs signal handlers between
+bytecodes, so the cleanup's first lines soak up the one interrupt and the one deadline signal that could arrive
+just as it starts.
 
-Only the executable changes process-wide state: it sets the last-resort report and holds interrupts until it exits,
-so nothing between the commit point and the exit can change the exit status. A library call, or main called in
-process, puts the interrupt and alarm handlers back and sets no report, and the helper takes over interrupts only
-while they are Python's default: a caller that ignores them or handles them itself keeps that. The deadline borrows
-the real-time timer and the alarm handler, so a caller whose real-time timer is running, or whose alarm handler was
-set outside Python and so is one Python cannot put back, is refused before anything changes (a timer that starts
-during that check is read from the helper's own swap and put back at once); a timer or handler the helper cannot put
-back afterward is reported as StateNotRestored, never swallowed, and the run's outcome stands. After placement the
-command line keeps exit 0 and prints such a failure as one warning line.
+Process-wide state. Only the command-line entry point changes it for good: it installs the last-resort report, and
+from the commit point to exit an interrupt is merely noted, so the status reported is the status on disk. A library
+call, or main used in process, returns the interrupt and alarm handlers and installs no report. The program takes
+over interrupts only from Python's default handler; with a caller's own handler, an interrupt during the commit or
+cleanup waits in the signal mask and reaches that handler afterward, and an ignored interrupt stays ignored. The
+deadline needs the alarm handler and the real-time timer, so a caller already running that timer, or whose alarm
+handler was installed outside Python (one Python cannot put back), is turned away before anything changes; a timer
+that starts during that check shows up in the program's own swap, which puts it back and fails the run. A timer or
+handler that cannot be returned afterward raises StateNotRestored rather than passing silently, and the outcome of
+the run stands; after a placement the command line keeps status 0 and prints the problem as one warning line.
 
-Every line the helper prints is printable ASCII: any other character in a name, an operating-system message or text
-a server sent is shown as an escape, so no input can break or forge a log line. Every exception, an interrupt
-included, ends as one such line, and the helper's own last-resort report prints one line without any chained text.
+Output. Every line printed is printable ASCII. Any other character, whether from a file name, a system error
+message or anything a server sent back, appears as an escape, so no input can split or fake a log line. Every exception,
+an interrupt included, ends as a single such line; the last-resort report prints one line and no chained text.
 
-Kept permissions are the mode bits only: a verified copy of a file already there keeps its mode, but not its ACLs,
-flags or extended attributes, so a caller that needs those sets them after placement.
+Permissions. Only the mode bits carry over: a checked copy of an existing file keeps its mode, but not its ACLs,
+flags or extended attributes; a caller that needs those applies them after placement.
 
-Threat model: the helper defends against an untrusted network and against stale, partial or wrong files at the
-destination. It does not defend against another process writing in the destination folder during the run; such a
-process already holds the build's trust. The cleanup removes a temporary name, or a file this run renamed onto the
-destination, only while that name still holds that same file. Every cleanup step runs
-whatever an earlier one raised, and any name the helper could not remove is named in the refusal.
+Threat model. Covered: an untrusted network, and a destination holding an old, truncated or wrong file. Not covered:
+another process writing into the destination folder during the run, since such a process already has the build's
+trust. The cleanup deletes a scratch name, or a file this run put at the destination, only while that name still
+holds that exact file; each cleanup step runs regardless of earlier failures, and any name left behind is listed
+in the refusal.
 
-Rules: the URL is https with a host and no user name or password, and a redirect is followed only to https; the
-digest is 64 hex digits; the destination is inside the folder the helper runs in (an absolute path may spell that
-folder as the shell's $PWD when it resolves there), its folder exists and resolves inside that folder through real
-folders only (no link anywhere in the path, checked folder by folder and held open through the write), it is absent
-or a regular file (not a link, folder or special file), it is valid UTF-8 with no control character and plainly
-names a file (no trailing slash, no empty, . or .. part; a leading ./ is allowed), and its name leaves room for the
-temporary name beside it. Exit 0 placed; 1 refused (the fetch failed or passed its deadline, the bytes passed the
-cap or did not match the digest, the run was interrupted, or the helper could not clear the destination or its
-temporary files); 2 malformed arguments. Nothing is written for exit 1 or 2, except a name the refusal says it could
-not remove.
+Inputs. The URL must be https, name a host, and carry no user name or password; redirects are followed only to
+https. The digest is 64 hex digits. The destination must lie inside the working folder (an absolute path may reach
+it through the shell's $PWD spelling when that resolves to the same place); every folder on its path must exist and
+be a real folder, not a link, checked one level at a time and kept open for the write; the destination itself is
+either missing or a regular file; it is valid UTF-8 without control characters, it plainly names a file (no trailing
+slash, no empty, . or .. segment, though a leading ./ is fine), and its name is short enough for the scratch name
+placed next to it.
+
+Exit status. 0: placed. 1: refused, because the download failed or ran past its deadline, the bytes went over the
+cap or hashed to something else, the run was interrupted, or the program could not clear the destination or its
+scratch files. 2: malformed arguments. A status of 1 or 2 leaves nothing written, apart from any name the refusal
+reports as not removed.
 """
 import hashlib
 import http.client
@@ -120,9 +120,9 @@ def https_only_opener():
 
 
 def check_url(url):
-    """Every URL urllib cannot send or resolve as written is malformed here, before any fetch: anything but
-    printable ASCII (a space, a control character, a letter outside ASCII), a bracket host that does not close, a
-    port that is not a number in range, and a host that is neither an IP address nor a name of valid labels."""
+    """Reject, before anything is downloaded, any URL that urllib could not send or resolve exactly as written: text
+    outside printable ASCII (spaces, control characters, letters beyond ASCII), an opening bracket with no closing
+    one, a port outside 1 to 65535 or not numeric, and a host that is neither an address nor a well-formed name."""
     if not isinstance(url, str) or not PRINTABLE.fullmatch(url):
         raise Malformed("the URL must be printable ASCII, with no space or control character")
     try:
@@ -135,16 +135,17 @@ def check_url(url):
     if parts.scheme.lower() != "https" or not host:
         raise Malformed("the URL must be https with a host")
     if not valid_host(host):
-        raise Malformed("the URL's host must be an IP address or a name of valid labels")
+        raise Malformed("the URL's host must be an address or a well-formed host name")
     if parts.username is not None or parts.password is not None:
         raise Malformed("the URL must not carry a user name or password")
 
 
 def valid_host(host):
-    """An IP address, or a name of labels of 1 to 63 letters, digits, underscores or inner hyphens, 253 characters
-    in all; one trailing dot is allowed. A host the system's own address parser reads as an address (hex, octal or
-    short forms such as 0x7f000001, 017.0.0.1 or 127.1) must be written as one, and a name's last label is not all
-    digits, since the resolver would read it as an address too. inet_aton parses locally and looks nothing up."""
+    """True for an address, or for a name made of dot-separated labels (each 1 to 63 letters, digits, underscores or
+    hyphens not at either end, 253 characters at most overall, with one optional trailing dot). A host the system's
+    own address parser reads as an address (hex, octal or short forms such as 0x7f000001, 017.0.0.1 or 127.1) must
+    be written as one, and a name's last label is not all digits, since the resolver would read it as an address
+    too. inet_aton parses locally and looks nothing up."""
     try:
         ipaddress.ip_address(host)
         return True
@@ -164,9 +165,9 @@ FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 def open_destination(dest, root):
-    """(folder handle, file name) for dest. The folder is reached from root one part at a time with links refused,
-    and every later step works through that handle, so no link or swapped folder can move the file outside root
-    between the check and the write. The destination itself must be absent or a regular file."""
+    """Return (folder handle, file name) for dest. Each folder below root is opened in turn, refusing links, and all
+    later work goes through the last handle; a link, or a folder replaced once the check is done, therefore cannot
+    redirect the write outside root. The destination has to be missing or a regular file."""
     root = os.path.realpath(root)
     if not dest:
         raise Malformed("the destination must name a file")
@@ -178,14 +179,14 @@ def open_destination(dest, root):
         raise Malformed("the destination must be valid UTF-8 text") from None
     pieces = (dest[2:] if dest.startswith("./") else dest).split("/")
     if any(piece in ("", ".", "..") for piece in (pieces[1:] if os.path.isabs(dest) else pieces)):
-        raise Malformed("the destination must plainly name a file: no trailing slash and no empty, . or .. part")
+        raise Malformed("the destination must be a plain file path: no trailing slash, and no empty, . or .. segment")
     path = os.path.normpath(dest if os.path.isabs(dest) else os.path.join(root, dest))
     prefixes = [root]
     shell = os.path.normpath(os.environ.get("PWD") or ".")  # the shell's spelling of the same folder, if it is one
     if os.path.isabs(shell) and os.path.realpath(shell) == root:
         prefixes.append(shell)
     inside = [prefix for prefix in prefixes if path != prefix and os.path.commonpath([prefix, path]) == prefix]
-    if not inside:  # compared part by part, so / as the folder holds its paths and /a/work never holds /a/workshop
+    if not inside:  # whole segments compared: / as the folder holds any path; /a/work does not contain /a/workshop
         raise Malformed("the destination is outside the folder the helper runs in")
     parts = os.path.relpath(path, inside[0]).split(os.sep)
     if any(part in ("", ".", "..") for part in parts):
@@ -213,7 +214,7 @@ def open_destination(dest, root):
         except FileNotFoundError:
             return folder, parts[-1]
         if not stat.S_ISREG(info.st_mode):
-            raise Malformed("the destination must be absent or a regular file, not a link, folder or special file")
+            raise Malformed("the destination must be missing or a regular file; a link, folder or device is refused")
         return folder, parts[-1]
     except BaseException:
         close_quietly(folder)
@@ -221,9 +222,9 @@ def open_destination(dest, root):
 
 
 class Deadline:
-    """The one deadline. It raises at most once and only while armed: an expiry before the work is armed is held and
-    raised when it is, and once disarmed an expiry does nothing, so a signal already on its way cannot cut the
-    cleanup short or turn a verified placement into a refusal."""
+    """The run's single deadline. It raises once at most, and only while armed. If the time runs out before arming,
+    arming raises it; after disarming, running out has no effect, so a late alarm can neither interrupt the cleanup
+    nor turn a checked placement into a failure."""
 
     def __init__(self):
         self.armed, self.passed = False, False
@@ -258,7 +259,7 @@ class Interrupts:
     caller that ignores interrupts or handles them itself keeps that, and holding then changes nothing."""
 
     def __init__(self):
-        self.armed, self.held, self.installed = True, False, False
+        self.armed, self.held, self.installed, self.blocked = True, False, False, None
 
     def fired(self, signum, frame):
         if self.armed:
@@ -272,29 +273,37 @@ class Interrupts:
             signal.signal(signal.SIGINT, self.fired)
 
     def hold(self):
+        """Stop an interrupt from raising. With Python's default handler taken over, it is recorded; with a caller's own
+        handler left in place, it is blocked in the signal mask, so it waits for release instead of cutting the cleanup
+        short, and reaches that handler then. An ignored interrupt needs neither."""
         self.armed = False
+        if not self.installed and self.blocked is None and signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+            self.blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
 
     def release(self):
-        """Put Python's default handler back, if this holder took it over."""
+        """Put Python's default handler back, if this holder took it over, and the signal mask as it was, if this holder
+        blocked the interrupt; a blocked interrupt then reaches the caller's handler. The holder's owner releases it."""
         if self.installed:
             signal.signal(signal.SIGINT, signal.default_int_handler)
             self.installed = False
+        if self.blocked is not None:
+            before, self.blocked = self.blocked, None
+            signal.pthread_sigmask(signal.SIG_SETMASK, before)
 
 
 def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
                  outcome=None, interrupts=None):
-    """Place url's body at dest only when its SHA-256 is digest; raise Refused otherwise. A file already at dest
-    is kept only when a copy of it, hashed as that copy, matches, with no fetch; any other file there is removed
-    first, so whatever is at dest when this returns, or refuses once the arguments are checked, has been verified.
-    One deadline covers everything after the arguments are checked: reading a file already there, the connection,
-    redirects, the body and the placement; only the final cleanup runs with it cancelled, so it is never cut
-    short. outcome records the commit point for a caller that reads it; interrupts is a caller's own holder (main
-    passes one), and without one the call takes over interrupts for the run and puts the handler back at the end,
-    raising an interrupt it held only when the file was placed. A deadline that is not a positive finite number, a
-    byte cap that is not a whole number of 0 or more, and a holder or record from an earlier run are malformed.
-    Every timer and handler it changes is put back, however the run ends, or the call raises StateNotRestored naming
-    what could not be; a running real-time timer, or an alarm handler Python cannot put back, is refused before
-    anything changes."""
+    """Put url's body at dest if its SHA-256 equals digest, and raise Refused if not. An existing file at dest is
+    reused without a download only when a fresh copy of it hashes correctly; anything else there is cleared first,
+    so after argument checking, dest holds only checked content whether the call returns or raises. The deadline
+    starts once the arguments pass and covers hashing an existing file, connecting, redirects, the body and the
+    rename; only the closing cleanup runs without it, so the cleanup is never cut off. outcome is a record the
+    caller can read for the commit point. interrupts is a holder the caller supplies (main does); without one, the
+    call manages interrupts itself for the duration, returns the handler at the end, and re-raises a held interrupt
+    only if the file was placed. Malformed: a deadline other than a positive finite number, a byte cap that is
+    negative or not an integer, and a holder or record reused from another run. Every timer and handler this call
+    changes is returned on every path, or StateNotRestored names the one that could not be; the call turns away a
+    caller whose real-time timer is running or whose alarm handler Python cannot put back, before changing anything."""
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
         raise Malformed("the digest must be 64 hex digits")
@@ -333,8 +342,8 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         deferred = error
         raise
     finally:
-        # Each step below runs whatever an earlier one raised. A signal handler runs between bytecodes, so the one
-        # interrupt and the one deadline signal still armed are absorbed by these repeated attempts.
+        # The steps below each run even if an earlier one failed. Python delivers signals between bytecodes, so these
+        # repeated attempts soak up the single interrupt and the single deadline alarm that might still arrive.
         try:
             holder.hold()
             deadline.disarm()
@@ -356,23 +365,36 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
             pass
         except BaseException as error:  # not the cleanup's to drop: raised once every step has run
             deferred = deferred or error
-        # Each restoration is tried twice, and one that still fails is named after the others have run. The timer goes
-        # back to what the helper's own setitimer replaced: a running one is restored, otherwise it is cancelled.
-        before = timer if timer is not None and timer[0] > 0 else (0.0, 0.0)
+        # Each restoration is tried twice, and one that still fails is named after the others have run. The order keeps
+        # every alarm with its own handler: the helper's timer is cancelled, then the caller's handler goes back, and
+        # only then is a timer the helper's swap displaced re-armed, and only if that handler is back.
         try:
-            signal.setitimer(signal.ITIMER_REAL, *before)
+            signal.setitimer(signal.ITIMER_REAL, 0)
         except Exception:
             try:
-                signal.setitimer(signal.ITIMER_REAL, *before)
+                signal.setitimer(signal.ITIMER_REAL, 0)
             except Exception as error:
                 unrestored.append(f"the real-time timer ({described(error)})")
+        handler_back = True
         try:
             signal.signal(signal.SIGALRM, alarm)
         except Exception:
             try:
                 signal.signal(signal.SIGALRM, alarm)
             except Exception as error:
+                handler_back = False
                 unrestored.append(f"the alarm handler ({described(error)})")
+        if timer is not None and timer[0] > 0:  # a timer the swap displaced
+            if not handler_back:
+                unrestored.append("the caller's real-time timer (not re-armed: its handler could not be put back)")
+            else:
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, *timer)
+                except Exception:
+                    try:
+                        signal.setitimer(signal.ITIMER_REAL, *timer)
+                    except Exception as error:
+                        unrestored.append(f"the caller's real-time timer ({described(error)})")
         if folder is not None:
             try:
                 close_quietly(folder)
@@ -397,9 +419,9 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
 
 
 def close_quietly(handle):
-    """The one way the helper closes a handle. A close never changes the outcome: what a handle held was synced and
-    checked before it is closed, or the run is refused already, so a failed close neither turns a refusal into
-    another error nor a verified placement into a refusal."""
+    """Close a handle, ignoring errors; every close in the program goes through here. Closing cannot change the
+    result: by then the data was flushed and checked, or the run has already failed, so a close error never swaps
+    one failure for another and never turns a success into a failure."""
     try:
         os.close(handle)
     except OSError:
@@ -441,11 +463,11 @@ def remove_own(folder, name, own):
 
 
 def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644):
-    """Write what read() yields into a new temporary file beside the destination, hashing as it goes, under the
-    cap; return (temporary name, SHA-256, open handle). The name joins pending before the file exists, with the
-    file's identity recorded as soon as it does, and the handle joins handles, so the caller's one cleanup removes
-    and closes them on any failure, however late, and the handle stays open so placement can prove it installs
-    this very file."""
+    """Copy everything read() returns into a fresh scratch file next to the destination, hashing along the way and
+    stopping at the cap; return (scratch name, SHA-256, open handle). The name is added to pending before the file
+    is created and its identity noted right after; the handle goes into handles. That lets the caller's cleanup
+    delete and close both after a failure at any point, and keeping the handle open lets the rename step confirm
+    that the file it installs is this one."""
     temporary = temporary_name(name)
     entry = [temporary, None]
     pending.append(entry)
@@ -471,9 +493,9 @@ def same_file(info, other):
 
 
 def commit(deadline, interrupts, state):
-    """The one commit point: the verified file is in place. Interrupts are held and the deadline is disarmed first,
-    then one store records the run as placed. The cleanup reads that record and keeps the destination from then on,
-    so a failure or an interrupt before the store rolls the placement back, and nothing after it can undo it."""
+    """Make the placement final. The checked file is already at the destination; hold interrupts, switch the
+    deadline off, then mark the run placed with a single assignment. The cleanup consults that mark: without it the
+    placement is undone, with it the destination is kept, so only events before the assignment can reverse it."""
     interrupts.hold()
     deadline.disarm()
     state.placed = True
@@ -523,12 +545,12 @@ def settle(folder, temporary, handle, found, digest, name):
 
 
 def set_aside(folder, name, pending):
-    """The helper's first change to the destination: rename whatever is there aside to a temporary name, in one atomic
-    rename, before anything reads it, so from here the name is empty or holds a verified file at every instant, even
-    if the run is killed. When the rename fails, the file is removed where it stands, or the refusal names it; a
-    refusal before this step has the cleanup remove it the same way. Return the pending entry for it, or None when
-    the name is empty. A folder is renamed back and refused, since it holds no fetched bytes and removing a tree is
-    not this helper's to do; a link or special file is refused, and the cleanup removes it."""
+    """Move whatever occupies the destination to a scratch name with a single atomic rename, before reading any of it.
+    This is the program's first change there; afterward the name is vacant or holds a checked file at all times,
+    process death included. If the rename fails, the file is removed where it stands, or the refusal lists it; a
+    failure earlier in the run has the cleanup delete it in the same way. Returns the pending entry, or None if
+    nothing was there. A folder is moved back and the run refused, because it cannot contain downloaded bytes and
+    deleting a directory tree is out of scope; a link or device is refused and left for the cleanup to delete."""
     entry = [temporary_name(name), None]
     pending.append(entry)
     try:
@@ -552,12 +574,12 @@ def set_aside(folder, name, pending):
 
 
 def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=None, interrupts=None):
-    """Everything here works through the folder handle, never through the path again. A file already at the
-    destination is first set aside, then copied through a temporary file and hashed as that copy, so success never
-    rests on an inode read from a name; the deadline stays armed until placement is verified; one cleanup owns
-    every temporary file and any file this run renamed onto the destination, and removes each only while it still
-    holds that same file. The cleanup runs with interrupts held and reads the commit record: a placed run keeps its
-    destination whatever a later step raises."""
+    """All file work here uses the folder handle; the path is not consulted again. An existing destination is moved
+    away first, then copied to a scratch file and hashed as that copy, so a good result never depends on reading a
+    name twice. The deadline remains armed until the placement is confirmed. A single cleanup is responsible for
+    every scratch file and for anything this run put at the destination, deleting each only while its name still
+    refers to that file. It runs with interrupts held and reads the placed mark, so once a run is marked placed, no
+    later error removes the destination."""
     deadline = deadline or Deadline()
     state = state if state is not None else Outcome()
     interrupts = interrupts if interrupts is not None else Interrupts()
@@ -610,9 +632,9 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
         failure = error
         raise
     finally:
-        # The cleanup is never cut short: interrupts are held and the deadline disarmed first. A signal handler runs
-        # between bytecodes, so the one interrupt and the one deadline signal still armed are absorbed by these
-        # repeated attempts; a refusal in flight still rises.
+        # Nothing may stop this cleanup early, so interrupts are held and the deadline switched off before anything
+        # else. Signals arrive between bytecodes; these repeated attempts catch the one interrupt and the one alarm
+        # that might still land here, while an exception already propagating keeps propagating.
         try:
             interrupts.hold()
             deadline.disarm()
@@ -634,7 +656,7 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
             pass
         except BaseException as error:  # not the cleanup's to drop: raised once every step has run
             deferred = deferred or error
-        # Every step runs whatever an earlier one raised, so one failing step never keeps the others from running.
+        # Each step below is attempted regardless of how the previous ones went.
         try:
             signal.setitimer(signal.ITIMER_REAL, 0)
         except Exception:
@@ -650,7 +672,7 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
                 remove_own(folder, temporary, own)
             except Exception:
                 left.append(temporary)
-        if not state.placed:  # a file this run renamed onto the destination before a refusal, or one never set aside
+        if not state.placed:  # undo an unfinished placement, or remove a file the run never got to move away
             try:
                 clear_destination(folder, name, pending, cleared)
             except Exception:
@@ -665,7 +687,7 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
 
 
 def shown(text):
-    """One line of printable ASCII: a backslash, a control character or any non-ASCII character becomes an escape."""
+    """Render text as one printable ASCII line, writing backslashes, control characters and non-ASCII as escapes."""
     return "".join(c if " " <= c <= "~" and c != "\\" else c.encode("unicode_escape").decode("ascii")
                    for c in str(text))
 
@@ -684,10 +706,10 @@ def described(error):
 
 
 def last_resort(kind, value, trace):
-    """Python's report for an exception that escapes main (an interrupt during a report, say) would print chained text
-    unescaped; this prints one escaped line with the exception's type only. It never raises, since Python answers a
-    report that raises with its own full report. The run still never exits 0: Python exits 1, or 130 for an
-    interrupt."""
+    """Handle an exception that gets past main, such as an interrupt during a report. Python's default output would
+    include chained text without escaping, so this prints a single escaped line naming only the exception type. It
+    never raises, because if it did Python would fall back to its full default output. The status is still nonzero:
+    1 in general, 130 for an interrupt."""
     try:
         say(f"fetch-pinned: refused: {getattr(kind, '__name__', 'error')}", sys.stderr)
     except BaseException:
