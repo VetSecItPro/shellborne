@@ -269,6 +269,7 @@ class Interrupts:
     def __init__(self):
         self.armed, self.held, self.installed, self.previous = True, False, False, None
         self.busy, self.again = False, False
+        self.callback = self.fired  # one object, known by identity: a bound method is a new object on each read
 
     def fired(self, signum, frame):
         if not self.armed:
@@ -312,25 +313,25 @@ class Interrupts:
         caller's latest choice and put the holder back in front of it. A handler set outside Python reads as None
         and could never be handed back once replaced, so the holder steps aside and leaves that one in place."""
         current = signal.getsignal(signal.SIGINT)
-        if not self.installed or current == self.fired:
+        if not self.installed or current is self.callback:
             return
         if current is None:
             self.installed, self.previous = False, None
             return
         self.previous = current
-        signal.signal(signal.SIGINT, self.fired)
+        signal.signal(signal.SIGINT, self.callback)
 
     def install(self):
         current = signal.getsignal(signal.SIGINT)
         if callable(current):
             self.previous = current
             self.installed = True  # first, so a release after an interrupt inside the next call still restores
-            signal.signal(signal.SIGINT, self.fired)
+            signal.signal(signal.SIGINT, self.callback)
 
     def adopt_guarded(self):
         """Adopt with SIGINT blocked, so an interrupt cannot reach a new handler in the moment between reading it
         and fronting it. No caller code runs inside that block, so lifting it undoes only the holder's own."""
-        if not self.installed or signal.getsignal(signal.SIGINT) == self.fired:
+        if not self.installed or signal.getsignal(signal.SIGINT) is self.callback:
             return
         blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
         try:
@@ -349,7 +350,7 @@ class Interrupts:
         if not self.installed:
             return
         current = signal.getsignal(signal.SIGINT)
-        if current == self.fired:
+        if current is self.callback:
             signal.signal(signal.SIGINT, self.previous)
         elif current is not None:  # the caller's latest choice is already in place: leave it there
             self.previous = current
@@ -689,11 +690,23 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
 
             def open_url(address):
                 return opener.open(address, timeout=TIMEOUT_SECONDS)
+        # The callback, its reply and the reply's methods are caller code that may install a SIGINT handler. The
+        # holder is put back in front each time control returns from them, so no such handler is still exposed when
+        # the commit or the cleanup takes hold.
+        def from_caller(call, *arguments):
+            try:
+                return call(*arguments)
+            finally:
+                interrupts.adopt_guarded()
+
         try:
-            with open_url(url) as body:
-                temporary, found, written = to_temporary(folder, name, body.read, max_bytes, pending, handles)
+            with from_caller(open_url, url) as body:
+                temporary, found, written = to_temporary(folder, name, lambda size: from_caller(body.read, size),
+                                                         max_bytes, pending, handles)
         except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
             raise Refused(f"the fetch failed: {error}") from None
+        finally:
+            interrupts.adopt_guarded()  # the reply's own exit is caller code too
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
         commit(deadline, interrupts, state)
