@@ -34,8 +34,10 @@ so nothing between the commit point and the exit can change the exit status. A l
 process, puts the interrupt and alarm handlers back and sets no report, and the helper takes over interrupts only
 while they are Python's default: a caller that ignores them or handles them itself keeps that. The deadline borrows
 the real-time timer and the alarm handler, so a caller whose real-time timer is running, or whose alarm handler was
-set outside Python and so is one Python cannot put back, is refused before anything changes; a timer or handler the
-helper cannot put back afterward is reported as StateNotRestored, never swallowed, and the run's outcome stands.
+set outside Python and so is one Python cannot put back, is refused before anything changes (a timer that starts
+during that check is read from the helper's own swap and put back at once); a timer or handler the helper cannot put
+back afterward is reported as StateNotRestored, never swallowed, and the run's outcome stands. After placement the
+command line keeps exit 0 and prints such a failure as one warning line.
 
 Every line the helper prints is printable ASCII: any other character in a name, an operating-system message or text
 a server sent is shown as an escape, so no input can break or forge a log line. Every exception, an interrupt
@@ -243,7 +245,7 @@ class Deadline:
 
 class Outcome:
     """The run's record of its one commit point: placed is set by a single store once the verified file is in place,
-    and the cleanup and main read it."""
+    and the cleanup and main read it. A record belongs to one run: one already marked placed is refused."""
 
     def __init__(self):
         self.placed = False
@@ -295,6 +297,8 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         raise Malformed("the digest must be 64 hex digits")
     if threading.current_thread() is not threading.main_thread():
         raise Malformed("the helper runs its deadline on the main thread only")
+    if outcome is not None and outcome.placed:
+        raise Malformed("the outcome record is from an earlier run; each run needs a fresh one")
     alarm = signal.getsignal(signal.SIGALRM)
     if alarm is None:
         raise Malformed("the alarm handler was set outside Python, which cannot put it back, so the deadline cannot "
@@ -303,13 +307,15 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
         raise Malformed("a real-time timer is already running, and the helper's deadline needs it")
     state = outcome if outcome is not None else Outcome()
     holder = interrupts if interrupts is not None else Interrupts()
-    deadline, folder, unrestored, deferred = Deadline(), None, [], None
+    deadline, folder, unrestored, deferred, timer = Deadline(), None, [], None, None
     try:
         if interrupts is None:
             holder.install()
         folder, name = open_destination(dest, root if root is not None else os.getcwd())
         signal.signal(signal.SIGALRM, deadline.expired)
-        signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
+        timer = signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
+        if timer[0] > 0:  # a timer started after the check: the final block puts it back as it was
+            raise Refused("a real-time timer started while the helper was taking it, so it was put back")
         place(url, digest.lower(), folder, name, open_url, max_bytes, deadline, state, holder)
     except (Exception, KeyboardInterrupt):
         raise
@@ -340,12 +346,14 @@ def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTE
             pass
         except BaseException as error:  # not the cleanup's to drop: raised once every step has run
             deferred = deferred or error
-        # Each restoration is tried twice, and one that still fails is named after the others have run.
+        # Each restoration is tried twice, and one that still fails is named after the others have run. The timer goes
+        # back to what the helper's own setitimer replaced: a running one is restored, otherwise it is cancelled.
+        before = timer if timer is not None and timer[0] > 0 else (0.0, 0.0)
         try:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.setitimer(signal.ITIMER_REAL, *before)
         except Exception:
             try:
-                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.setitimer(signal.ITIMER_REAL, *before)
             except Exception as error:
                 unrestored.append(f"the real-time timer ({described(error)})")
         try:
@@ -688,7 +696,8 @@ def refusal(error):
 
 
 def main(argv, interrupts=None):
-    """Run once and return the exit status; a report that cannot be printed never changes it. interrupts is the
+    """Run once and return the exit status; a report that cannot be printed never changes it, and a failure after
+    placement keeps exit 0 and is printed as one warning line. interrupts is the
     executable's holder, kept held until the process exits. Called in process without one, main takes over
     interrupts for the run only and puts the handler back before it returns, dropping one it held, and it sets no
     last-resort report."""
@@ -703,9 +712,11 @@ def main(argv, interrupts=None):
     try:
         if interrupts is None:
             holder.install()
+        late = None
         try:
             fetch_pinned(argv[1], argv[2], argv[3], outcome=outcome, interrupts=holder)
         except BaseException as error:
+            late = error
             if not outcome.placed:  # before the commit point: rolled back, so the run is refused
                 status = 1
                 try:
@@ -718,6 +729,11 @@ def main(argv, interrupts=None):
             say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
         except BaseException:
             pass
+        if late is not None and not isinstance(late, KeyboardInterrupt):  # after placement: reported, not swallowed
+            try:
+                say(f"fetch-pinned: warning: {type(late).__name__}: {described(late)}", sys.stderr)
+            except BaseException:
+                pass
         return 0
     finally:
         if interrupts is None:
