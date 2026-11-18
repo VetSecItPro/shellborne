@@ -19,9 +19,25 @@ file at every instant, and even a run killed outright leaves nothing unverified 
 only reads, so a run killed before that change leaves the destination as it found it. The cost: a file that matches
 is briefly absent from the name while it is checked.
 
-The command-line run has one commit point, where the verified file is in place: an interrupt before it is rolled
-back, and from it on interrupts are ignored and the run reports the placement, so exit 1 never comes with a file
-written, and exit 0 always does.
+The run has one commit point, where the verified file is in place: interrupts are held and the deadline disarmed,
+then one store records the run as placed. The cleanup reads that record: before the store it rolls the placement
+back, and after it nothing can undo it. From the commit point, and from the first line of the cleanup on any path,
+interrupts are held: one is recorded rather than raised, so a second interrupt cannot cut a rollback short, and every
+cleanup step runs whatever an earlier one raised. So exit 1 never comes with a file written, and exit 0 always does.
+A held interrupt is dropped when the run is refused anyway, since the run has stopped; on a placed run the command
+line reports the placement, and a library call raises it once the caller's handler is back. A signal handler runs
+between bytecodes, so the one interrupt and the one deadline signal that may land as the cleanup begins are absorbed
+there.
+
+Only the executable changes process-wide state: it sets the last-resort report and holds interrupts until it exits,
+so nothing between the commit point and the exit can change the exit status. A library call, or main called in
+process, puts the interrupt and alarm handlers back and sets no report, and the helper takes over interrupts only
+while they are Python's default: a caller that ignores them or handles them itself keeps that. The deadline borrows
+the real-time timer and the alarm handler, so a caller whose real-time timer is running, or whose alarm handler was
+set outside Python and so is one Python cannot put back, is refused before anything changes (a timer that starts
+during that check is read from the helper's own swap and put back at once); a timer or handler the helper cannot put
+back afterward is reported as StateNotRestored, never swallowed, and the run's outcome stands. After placement the
+command line keeps exit 0 and prints such a failure as one warning line.
 
 Every line the helper prints is printable ASCII: any other character in a name, an operating-system message or text
 a server sent is shown as an escape, so no input can break or forge a log line. Every exception, an interrupt
@@ -44,11 +60,13 @@ or a regular file (not a link, folder or special file), it is valid UTF-8 with n
 names a file (no trailing slash, no empty, . or .. part; a leading ./ is allowed), and its name leaves room for the
 temporary name beside it. Exit 0 placed; 1 refused (the fetch failed or passed its deadline, the bytes passed the
 cap or did not match the digest, the run was interrupted, or the helper could not clear the destination or its
-temporary files); 2 malformed arguments. Nothing is written for exit 1 or 2.
+temporary files); 2 malformed arguments. Nothing is written for exit 1 or 2, except a name the refusal says it could
+not remove.
 """
 import hashlib
 import http.client
 import ipaddress
+import math
 import os
 import re
 import secrets
@@ -81,6 +99,11 @@ class Malformed(Refused):
 
 class TooLarge(Refused):
     """The bytes passed the cap."""
+
+
+class StateNotRestored(Exception):
+    """The run ended, placed or refused as its outcome records, but a timer or handler the helper changed could not
+    be put back, so the caller learns of it instead of inheriting it silently."""
 
 
 class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
@@ -222,42 +245,154 @@ class Deadline:
 
 
 class Outcome:
-    """The command-line run's record of its one commit point. commit() is called once the verified file is in place
-    and the deadline is disarmed: it ignores interrupts from then on, then records the run as placed, so no interrupt
-    can land after the record and before the report. An interrupt before it rolls the placement back."""
+    """The run's record of its one commit point: placed is set by a single store once the verified file is in place,
+    and the cleanup and main read it. A record belongs to one run: one already marked placed is refused."""
 
     def __init__(self):
         self.placed = False
 
-    def commit(self):
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        self.placed = True
+
+class Interrupts:
+    """The run's interrupt handling. Until held, an interrupt raises as usual, and at most once; once held, it is
+    recorded instead, so the commit and the cleanup run to their end. Only Python's default handler is taken over: a
+    caller that ignores interrupts or handles them itself keeps that, and holding then changes nothing."""
+
+    def __init__(self):
+        self.armed, self.held, self.installed = True, False, False
+
+    def fired(self, signum, frame):
+        if self.armed:
+            self.armed = False
+            raise KeyboardInterrupt
+        self.held = True
+
+    def install(self):
+        if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+            self.installed = True  # first, so a release after an interrupt inside the next call still restores
+            signal.signal(signal.SIGINT, self.fired)
+
+    def hold(self):
+        self.armed = False
+
+    def release(self):
+        """Put Python's default handler back, if this holder took it over."""
+        if self.installed:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            self.installed = False
 
 
 def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
-                 outcome=None):
+                 outcome=None, interrupts=None):
     """Place url's body at dest only when its SHA-256 is digest; raise Refused otherwise. A file already at dest
     is kept only when a copy of it, hashed as that copy, matches, with no fetch; any other file there is removed
     first, so whatever is at dest when this returns, or refuses once the arguments are checked, has been verified.
     One deadline covers everything after the arguments are checked: reading a file already there, the connection,
     redirects, the body and the placement; only the final cleanup runs with it cancelled, so it is never cut
-    short."""
+    short. outcome records the commit point for a caller that reads it; interrupts is a caller's own holder (main
+    passes one), and without one the call takes over interrupts for the run and puts the handler back at the end,
+    raising an interrupt it held only when the file was placed. A deadline that is not a positive finite number, a
+    byte cap that is not a whole number of 0 or more, and a holder or record from an earlier run are malformed.
+    Every timer and handler it changes is put back, however the run ends, or the call raises StateNotRestored naming
+    what could not be; a running real-time timer, or an alarm handler Python cannot put back, is refused before
+    anything changes."""
     check_url(url)
     if not HEX64.fullmatch(digest or ""):
         raise Malformed("the digest must be 64 hex digits")
     if threading.current_thread() is not threading.main_thread():
         raise Malformed("the helper runs its deadline on the main thread only")
-    folder, name = open_destination(dest, root if root is not None else os.getcwd())
-    deadline = Deadline()
-    previous = signal.signal(signal.SIGALRM, deadline.expired)
-    signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
+    if outcome is not None and outcome.placed:
+        raise Malformed("the outcome record is from an earlier run; each run needs a fresh one")
+    if interrupts is not None and (not interrupts.armed or interrupts.held):
+        raise Malformed("the interrupt holder is from an earlier run; each run needs a fresh one")
+    if (isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, (int, float))
+            or not math.isfinite(deadline_seconds) or deadline_seconds <= 0):
+        raise Malformed("the deadline must be a positive, finite number of seconds")  # 0 would cancel the timer
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise Malformed("the byte cap must be a whole number, 0 or more")
+    alarm = signal.getsignal(signal.SIGALRM)
+    if alarm is None:
+        raise Malformed("the alarm handler was set outside Python, which cannot put it back, so the deadline cannot "
+                        "borrow it")
+    if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+        raise Malformed("a real-time timer is already running, and the helper's deadline needs it")
+    state = outcome if outcome is not None else Outcome()
+    holder = interrupts if interrupts is not None else Interrupts()
+    deadline, folder, unrestored, deferred, timer = Deadline(), None, [], None, None
     try:
-        place(url, digest.lower(), folder, name, open_url, max_bytes, deadline, outcome)
+        if interrupts is None:
+            holder.install()
+        folder, name = open_destination(dest, root if root is not None else os.getcwd())
+        signal.signal(signal.SIGALRM, deadline.expired)
+        timer = signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
+        if timer[0] > 0:  # a timer started after the check: the final block puts it back as it was
+            raise Refused("a real-time timer started while the helper was taking it, so it was put back")
+        place(url, digest.lower(), folder, name, open_url, max_bytes, deadline, state, holder)
+    except (Exception, KeyboardInterrupt):
+        raise
+    except BaseException as error:  # an exit request in flight: nothing below may replace it
+        deferred = error
+        raise
     finally:
-        deadline.disarm()
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        close_quietly(folder)
+        # Each step below runs whatever an earlier one raised. A signal handler runs between bytecodes, so the one
+        # interrupt and the one deadline signal still armed are absorbed by these repeated attempts.
+        try:
+            holder.hold()
+            deadline.disarm()
+        except (Exception, KeyboardInterrupt):
+            pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
+        try:
+            holder.hold()
+            deadline.disarm()
+        except (Exception, KeyboardInterrupt):
+            pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
+        try:
+            holder.hold()
+            deadline.disarm()
+        except (Exception, KeyboardInterrupt):
+            pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
+        # Each restoration is tried twice, and one that still fails is named after the others have run. The timer goes
+        # back to what the helper's own setitimer replaced: a running one is restored, otherwise it is cancelled.
+        before = timer if timer is not None and timer[0] > 0 else (0.0, 0.0)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, *before)
+        except Exception:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, *before)
+            except Exception as error:
+                unrestored.append(f"the real-time timer ({described(error)})")
+        try:
+            signal.signal(signal.SIGALRM, alarm)
+        except Exception:
+            try:
+                signal.signal(signal.SIGALRM, alarm)
+            except Exception as error:
+                unrestored.append(f"the alarm handler ({described(error)})")
+        if folder is not None:
+            try:
+                close_quietly(folder)
+            except Exception:
+                pass
+        if interrupts is None:
+            try:
+                holder.release()
+            except Exception:
+                try:
+                    holder.release()
+                except Exception as error:
+                    unrestored.append(f"the interrupt handler ({described(error)})")
+        if deferred is not None:
+            raise deferred  # an exit request outranks a report the caller can no longer act on
+        if unrestored:
+            raise StateNotRestored(f"could not restore {', '.join(unrestored)}")
+        if interrupts is None and state.placed and holder.held:  # the caller's handler is back: raise it now
+            holder.held = False
+            raise KeyboardInterrupt
     return dest
 
 
@@ -335,19 +470,13 @@ def same_file(info, other):
     return identity(info) == identity(other)
 
 
-def commit(deadline, outcome, pending, temporary):
-    """The one commit point: the verified file is in place. The deadline is disarmed first, then the command-line
-    run's outcome ignores interrupts and records the placement, and only then does the cleanup give up the file, so
-    an interrupt before this point is rolled back and none can come after it."""
+def commit(deadline, interrupts, state):
+    """The one commit point: the verified file is in place. Interrupts are held and the deadline is disarmed first,
+    then one store records the run as placed. The cleanup reads that record and keeps the destination from then on,
+    so a failure or an interrupt before the store rolls the placement back, and nothing after it can undo it."""
+    interrupts.hold()
     deadline.disarm()
-    if outcome is not None:
-        outcome.commit()
-    placed(pending, temporary)
-
-
-def placed(pending, temporary):
-    """A renamed temporary file is the destination now, so its old name is no longer this run's to clean up."""
-    pending[:] = [entry for entry in pending if entry[0] != temporary]
+    state.placed = True
 
 
 def discard(folder, pending):
@@ -359,11 +488,13 @@ def discard(folder, pending):
         del pending[0]
 
 
-def clear_destination(folder, name, owns, cleared):
-    """After a refusal, remove from the destination a file this run renamed there (owns, the identities of every
-    file still pending), only while the name still holds it, so exit 1 never leaves a file written. If the refusal
-    came before the destination was cleared (set aside, or removed where it stood), whatever file is there was
-    never verified, so it is removed as it stands; a folder is never removed."""
+def clear_destination(folder, name, pending, cleared):
+    """After a refusal, remove from the destination a file this run renamed there (one whose identity a pending
+    entry holds), only while the name still holds it, so exit 1 never leaves a file written. If the refusal came
+    before the destination was cleared (set aside, or removed where it stood), whatever file is there was never
+    verified, so it is removed as it stands; a folder is never removed. It is called only for a run that was not
+    placed."""
+    owns = [own for _, own in pending if own is not None]
     if cleared and not owns:
         return
     try:
@@ -420,14 +551,17 @@ def set_aside(folder, name, pending):
     return entry
 
 
-def place(url, digest, folder, name, open_url, max_bytes, deadline=None, outcome=None):
+def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=None, interrupts=None):
     """Everything here works through the folder handle, never through the path again. A file already at the
     destination is first set aside, then copied through a temporary file and hashed as that copy, so success never
     rests on an inode read from a name; the deadline stays armed until placement is verified; one cleanup owns
     every temporary file and any file this run renamed onto the destination, and removes each only while it still
-    holds that same file."""
+    holds that same file. The cleanup runs with interrupts held and reads the commit record: a placed run keeps its
+    destination whatever a later step raises."""
     deadline = deadline or Deadline()
-    pending, handles, failure, cleared = [], [], None, False
+    state = state if state is not None else Outcome()
+    interrupts = interrupts if interrupts is not None else Interrupts()
+    pending, handles, failure, cleared, deferred = [], [], None, False, None
     try:
         deadline.arm()
         aside = set_aside(folder, name, pending)
@@ -456,7 +590,7 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, outcome
                 remove_own(folder, aside[0], aside[1])  # the verified copy replaces it, so the original goes first
                 pending.remove(aside)
                 if settle(folder, temporary, copy, found, digest, name):
-                    commit(deadline, outcome, pending, temporary)
+                    commit(deadline, interrupts, state)
                     return
             discard(folder, pending)  # the file set aside and its copy did not verify: both go before the fetch
         if open_url is None:
@@ -471,31 +605,61 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, outcome
             raise Refused(f"the fetch failed: {error}") from None
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
-        commit(deadline, outcome, pending, temporary)
+        commit(deadline, interrupts, state)
     except BaseException as error:
         failure = error
         raise
     finally:
+        # The cleanup is never cut short: interrupts are held and the deadline disarmed first. A signal handler runs
+        # between bytecodes, so the one interrupt and the one deadline signal still armed are absorbed by these
+        # repeated attempts; a refusal in flight still rises.
         try:
-            deadline.disarm()  # the cleanup is never cut short; a refusal in flight still rises
-        except Refused:  # the one deadline signal landed as the cleanup began: it is spent now
+            interrupts.hold()
             deadline.disarm()
-        signal.setitimer(signal.ITIMER_REAL, 0)
+        except (Exception, KeyboardInterrupt):
+            pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
+        try:
+            interrupts.hold()
+            deadline.disarm()
+        except (Exception, KeyboardInterrupt):
+            pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
+        try:
+            interrupts.hold()
+            deadline.disarm()
+        except (Exception, KeyboardInterrupt):
+            pass
+        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
+            deferred = deferred or error
         # Every step runs whatever an earlier one raised, so one failing step never keeps the others from running.
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        except Exception:
+            pass
         for handle in handles:
-            close_quietly(handle)
-        owns = [own for _, own in pending if own is not None]  # a pending file may already be at the destination
+            try:
+                close_quietly(handle)
+            except Exception:
+                pass
         left = []
         for temporary, own in pending:  # only leftovers this run made, each while it still holds that file
             try:
                 remove_own(folder, temporary, own)
-            except (OSError, Refused):
+            except Exception:
                 left.append(temporary)
-        try:  # a file this run renamed onto the destination before a refusal, or one never set aside
-            clear_destination(folder, name, owns, cleared)
-        except (OSError, Refused):
-            left.append(name)
-        if left:  # exit 1 never hides a leftover: the refusal names it, after the reason the run failed, if any
+        if not state.placed:  # a file this run renamed onto the destination before a refusal, or one never set aside
+            try:
+                clear_destination(folder, name, pending, cleared)
+            except Exception:
+                left.append(name)
+        # Exit 1 never hides a leftover: the refusal names it, after the reason the run failed, if any. A placed run has
+        # renamed every pending name away, so a failure while checking one leaves nothing and refuses nothing.
+        if deferred is not None:
+            raise deferred
+        if left and not state.placed:
             reason = f" after: {failure}" if failure is not None else ""
             raise Refused(f"could not remove {', '.join(left)}{reason}") from failure
 
@@ -541,25 +705,62 @@ def refusal(error):
     return 1, f"fetch-pinned: refused: {type(error).__name__}: {described(error)}"  # an interrupt included
 
 
-def main(argv):
-    sys.excepthook = last_resort
+def main(argv, interrupts=None):
+    """Run once and return the exit status; a report that cannot be printed never changes it, and a failure after
+    placement keeps exit 0 and is printed as one warning line. interrupts is the
+    executable's holder, kept held until the process exits. Called in process without one, main takes over
+    interrupts for the run only and puts the handler back before it returns, dropping one it held, and it sets no
+    last-resort report."""
     if len(argv) != 4:
-        say("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", sys.stderr)
+        try:
+            say("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", sys.stderr)
+        except BaseException:
+            pass
         return 2
+    holder = interrupts if interrupts is not None else Interrupts()
     outcome = Outcome()
     try:
-        fetch_pinned(argv[1], argv[2], argv[3], outcome=outcome)
-    except BaseException as error:
-        if not outcome.placed:  # before the commit point: rolled back, so the run is refused
-            status, line = refusal(error)
-            say(line, sys.stderr)
-            return status
-    try:  # past the commit point the file is verified and in place, so even a report that fails is exit 0
-        say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
-    except BaseException:
-        pass
-    return 0
+        if interrupts is None:
+            holder.install()
+        late = None
+        try:
+            fetch_pinned(argv[1], argv[2], argv[3], outcome=outcome, interrupts=holder)
+        except BaseException as error:
+            late = error
+            if not outcome.placed:  # before the commit point: rolled back, so the run is refused
+                status = 1
+                try:
+                    status, line = refusal(error)
+                    say(line, sys.stderr)
+                except BaseException:
+                    pass
+                return status
+        try:  # past the commit point the file is verified and in place, so even a report that fails is exit 0
+            say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
+        except BaseException:
+            pass
+        if late is not None and not isinstance(late, KeyboardInterrupt):  # after placement: reported, not swallowed
+            try:
+                say(f"fetch-pinned: warning: {type(late).__name__}: {described(late)}", sys.stderr)
+            except BaseException:
+                pass
+        return 0
+    finally:
+        if interrupts is None:
+            try:
+                holder.release()
+            except Exception:
+                holder.release()
+
+
+def command(argv):
+    """The executable's entry, and the one place that changes process-wide state, since the process ends with the
+    run: it sets the last-resort report and holds interrupts from the commit point until the process exits."""
+    sys.excepthook = last_resort
+    interrupts = Interrupts()
+    interrupts.install()
+    return main(argv, interrupts)
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(command(sys.argv))
