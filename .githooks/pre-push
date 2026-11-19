@@ -22,7 +22,12 @@ case $(git -C "$top" rev-parse --show-object-format 2>/dev/null) in
 esac
 shape="[^[:space:]][^[:space:]]* $hex [^[:space:]][^[:space:]]* $hex\$"
 # Every buffer has a cap: the whole ref list is read through 1 MiB, and one ref line may hold at most 4 KiB.
-refs=$(head -c 1048577; printf x)
+# The x keeps trailing newlines through the capture, and it is printed only after head succeeds, so a read that
+# fails partway stops the push rather than passing a shortened list.
+if ! refs=$(head -c 1048577 && printf x); then
+    echo "leak-guard: refused: the ref list from git could not be read; nothing in this push was checked" >&2
+    exit 1
+fi
 refs=${refs%x}
 if [ "$(printf '%s' "$refs" | wc -c)" -gt 1048576 ]; then
     echo "leak-guard: refused: the ref list from git is over 1 MiB; nothing in this push was checked" >&2
