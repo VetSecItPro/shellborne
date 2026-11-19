@@ -21,12 +21,19 @@ case $(git -C "$top" rev-parse --show-object-format 2>/dev/null) in
     *) echo "leak-guard: broken: cannot read this repository's object format" >&2; exit 1 ;;
 esac
 shape="[^[:space:]][^[:space:]]* $hex [^[:space:]][^[:space:]]* $hex\$"
+# Every buffer has a cap: the whole ref list is read through 1 MiB, and one ref line may hold at most 4 KiB.
+refs=$(head -c 1048577; printf x)
+refs=${refs%x}
+if [ "$(printf '%s' "$refs" | wc -c)" -gt 1048576 ]; then
+    echo "leak-guard: refused: the ref list from git is over 1 MiB; nothing in this push was checked" >&2
+    exit 1
+fi
 status=0
 while IFS= read -r line || [ -n "$line" ]; do
     if [ -z "$line" ]; then
         continue  # names no ref: a chainer that re-emits git's input adds one newline to an empty list
     fi
-    if ! expr "$line" : "$shape" >/dev/null; then
+    if [ "${#line}" -gt 4096 ] || ! expr "$line" : "$shape" >/dev/null; then
         echo "leak-guard: refused: malformed ref line from git (want four fields with two full object names); nothing in this push was checked" >&2
         exit 1
     fi
@@ -69,5 +76,7 @@ while IFS= read -r line || [ -n "$line" ]; do
             "$private/tools/sb-plan" check --root "$private" --clone "$top" --range "$plan_range" --branch "$local_ref" || status=1
         fi
     fi
-done
+done <<EOF
+$refs
+EOF
 exit $status
