@@ -7,33 +7,39 @@ Builds bring files in from the network through this program and nothing else; th
 download in a file a build executes. The program is used only as a command: each run is its own process, and the
 functions below exist for its tests, not as a library promise.
 
-Two processes. The program's own process does every step on disk. The network is reached by a separate process that
-it starts with Python's isolated mode and the URL and byte cap as arguments: that one opens the URL, follows
-redirects only to https, stops at the cap, and sends every byte it receives into a scratch file that this program
-made and noted first, handed to it as its standard output. The command line has no option that runs that part alone,
-so the tool offers no way to fetch without the check. Before it opens anything, the program blocks every signal
-except the few that report a fault in its own code (and SIGKILL and SIGSTOP, which nothing can block), so no handler
-ever runs in it again and no step can be cut off half way. A request to stop (an interrupt, a terminate, a hangup
-and the like) waits as a pending signal; the program looks for one while the download runs, between chunks of a
-local copy, and once more just before the commit point. Found before that point, it ends the download process and
-refuses the run, after the whole cleanup; found later, it changes nothing. The other process unblocks everything
-first, so a Ctrl-C to the terminal ends it at once. One deadline of 15 minutes bounds the request, any redirects and
-the body: when it passes, the download process is killed, which also covers looking up the host. The program
-measures and hashes the scratch file itself and never relies on the other process for either.
+Two processes. However it is started, the program first replaces itself with Python in isolated mode, without
+bytecode, running this same file, so no module beside it and no PYTHONPATH entry can take the place of a standard
+module; then, before it opens anything, it blocks every signal except the few that report a fault in its own code
+(and SIGKILL and SIGSTOP, which nothing can block), so no handler ever runs in it again and no step can be cut off
+half way. Its own process does every step on disk. The network is reached by a separate process, started in its own
+process group with the same isolation and with the URL and byte cap as arguments; it compiles this file from its
+source text, opens the URL, follows redirects only to https, stops at the cap, and sends every byte it receives into
+a scratch file that this program made and noted first, handed to it as its standard output. The command line has no
+option that runs that part alone, so the tool offers no way to fetch without the check. Once that process has ended,
+its whole group is killed and the program copies the bytes into a second scratch file that nothing else ever had
+open, measuring and hashing the copy itself; that copy is what gets placed. A request to stop (any pending signal
+whose default would end the process) is looked for while the download runs, between chunks of a copy, as the
+download process ends and once more just before the commit point. Found before that point, it ends the download and
+refuses the run, after the whole cleanup; found later, it changes nothing. One deadline of 15 minutes bounds the
+request, any redirects and the body: when it passes, the download process is killed, which also covers looking up
+the host. Its error output is read while it runs, a bounded amount and never to its end, so nothing it or a server
+sends can stall the run.
 
 How a run goes. The body lands in a hidden scratch file next to the destination and is renamed over the destination
 only once its hash checks out. Whatever already sits at the destination is dealt with before anything else is
 written. That first change to the destination moves whatever sits at that name to a scratch name, or deletes it when
 the move is impossible or the run fails before reaching it. That old file is reused, with no download, only if a
 fresh copy of it hashes to the pin; otherwise it and its copy are gone before the download starts. Until that first
-change the program only reads, so a run stopped by any means at that stage finds the destination untouched.
+change the program only reads, so a run killed at that stage finds the destination untouched; one that refuses
+there removes the file, as every refusal removes a file it never checked.
 Afterward the destination name is, at every moment, either vacant or holding a checked file, even if the process is
 killed. The price is a short gap in which a good existing file is away from its name while it is checked.
 
 Outcome and exit status. A run turns final at its commit point: the checked file is in place and one store marks the
 run as placed. Before that store the cleanup undoes the placement; after it, nothing can. Each cleanup step runs even
 when an earlier one failed. Hence a status of 1 always means no file was written, and a status of 0 always means one
-was. A failure after a placement keeps status 0 and is printed as one warning line.
+was. A failure after a placement keeps status 0 and is printed as one warning line. The program flushes its own
+output and leaves directly, so an output stream that is closed or out of space leaves the status alone.
 
 Output. Every line printed is printable ASCII. Any other character, whether from a file name, a system error message,
 the download process or anything a server sent back, appears as an escape, so no input can split or fake a log line.
@@ -60,22 +66,36 @@ or hashed to something else, the run was interrupted, or the program could not c
 files. 2: malformed arguments. A status of 1 or 2 leaves nothing written, apart from any name the refusal reports as
 not removed.
 """
-import hashlib
-import http.client
-import ipaddress
-import math
-import os
-import re
-import secrets
-import signal
-import socket
-import stat
-import subprocess
+import os  # already loaded while Python started, so nothing beside this file can stand in for it
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+
+# Signals that report a fault in this program's own code stay deliverable; SIGKILL and SIGSTOP cannot be blocked.
+FAULT_NAMES = ("SIGKILL", "SIGSTOP", "SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGTRAP", "SIGSYS", "SIGABRT")
+
+if __name__ == "__main__" and not (sys.flags.isolated and sys.flags.dont_write_bytecode):
+    # Started any other way (by path, through the interpreter, with PYTHONPATH set), the program first becomes
+    # itself again in isolated mode, before importing anything a folder or the environment could supply.
+    os.execv(sys.executable, [sys.executable, "-I", "-B", os.path.abspath(__file__), *sys.argv[1:]])
+
+import signal  # noqa: E402  (after the re-exec on purpose)
+
+if __name__ == "__main__":
+    signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals() - {getattr(signal, name) for name in FAULT_NAMES
+                                                                      if hasattr(signal, name)})
+
+import hashlib  # noqa: E402
+import http.client  # noqa: E402
+import ipaddress  # noqa: E402
+import math  # noqa: E402
+import re  # noqa: E402
+import secrets  # noqa: E402
+import socket  # noqa: E402
+import stat  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.parse  # noqa: E402
+import urllib.request  # noqa: E402
 
 MAX_BYTES = 512 * 1024 * 1024
 TIMEOUT_SECONDS = 120
@@ -88,23 +108,22 @@ PRINTABLE = re.compile(r"[\x21-\x7e]+")
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 LABEL = re.compile(r"(?!-)[A-Za-z0-9_-]{1,63}(?<!-)")
 
-# Signals that ask a process to end. Blocked in this process, each one waits as pending and is read as a stop request.
-STOPS = frozenset(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGPIPE", "SIGALRM",
-                                                     "SIGUSR1", "SIGUSR2", "SIGXCPU", "SIGXFSZ", "SIGVTALRM",
-                                                     "SIGPROF") if hasattr(signal, name))
-# Signals that report a fault in this program's own code stay deliverable; SIGKILL and SIGSTOP cannot be blocked.
-UNBLOCKED = frozenset(getattr(signal, name) for name in ("SIGKILL", "SIGSTOP", "SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL",
-                                                         "SIGTRAP", "SIGSYS", "SIGABRT") if hasattr(signal, name))
+UNBLOCKED = frozenset(getattr(signal, name) for name in FAULT_NAMES if hasattr(signal, name))
+# Blocked signals that by default do nothing, or only pause or continue the process; any other pending one is a stop
+# request, the real-time signals included.
+QUIET = frozenset(getattr(signal, name) for name in ("SIGCHLD", "SIGWINCH", "SIGURG", "SIGCONT", "SIGTSTP", "SIGTTIN",
+                                                     "SIGTTOU", "SIGINFO") if hasattr(signal, name))
+STOPS = frozenset(signal.valid_signals() - UNBLOCKED - QUIET)
 
-# What the download process runs: unblock every signal it inherited blocked, load this file, and fetch.
+# What the download process runs: unblock every signal it inherited blocked, compile this file's source text (never a
+# cached or planted bytecode file), and fetch.
 CHILD_CODE = """import signal, sys
 signal.pthread_sigmask(signal.SIG_SETMASK, set())
-import importlib.machinery, importlib.util
-loader = importlib.machinery.SourceFileLoader("fetch_pinned_download", sys.argv[1])
-spec = importlib.util.spec_from_loader(loader.name, loader)
-module = importlib.util.module_from_spec(spec)
-loader.exec_module(module)
-sys.exit(module.download_child(sys.argv[2], int(sys.argv[3])))
+with open(sys.argv[1], "rb") as source:
+    code = compile(source.read(), sys.argv[1], "exec")
+namespace = {"__name__": "fetch_pinned_download", "__file__": sys.argv[1]}
+exec(code, namespace)
+sys.exit(namespace["download_child"](sys.argv[2], int(sys.argv[3])))
 """
 REPORTED = 3  # the download process's status when it printed its own reason
 
@@ -399,7 +418,7 @@ def download_child(url, max_bytes):
     except BaseException as error:
         try:
             reason = described(error) if isinstance(error, Refused) else f"the fetch failed: {type(error).__name__}"
-            say(reason, sys.stderr)
+            say(reason[:(MESSAGE_BYTES - 1) // 10], sys.stderr)  # an escape is at most 10 characters long
         except BaseException:
             pass
         return REPORTED
@@ -408,33 +427,53 @@ def download_child(url, max_bytes):
 def child_argv(url, max_bytes, prefix=None):
     """The download process's command: this file run in Python's isolated mode, given the URL and the cap. prefix
     replaces everything before the URL; the tests use it to stand in for the network."""
-    head = list(prefix) if prefix is not None else [sys.executable, "-I", "-c", CHILD_CODE, os.path.abspath(__file__)]
+    head = list(prefix) if prefix is not None else [sys.executable, "-I", "-B", "-c", CHILD_CODE,
+                                                    os.path.abspath(__file__)]
     return head + [url, str(max_bytes)]
 
 
 def spawned(prefix=None):
-    """The program's download: start the download process with the scratch file as its standard output, wait for it
-    while looking for a stop request and the deadline, and end it with SIGKILL if either comes first. Its own reason
-    is read back only when it reported one, at most MESSAGE_BYTES of it."""
+    """The program's download: start the download process in a process group of its own, with the scratch file as
+    its standard output, and wait for it while looking for a stop request, the deadline and the cap. Its error pipe is
+    emptied as it waits without ever blocking, keeping at most MESSAGE_BYTES, and is not read to its end. When it is
+    done, or when a stop, the deadline or the cap comes first, the whole group is killed."""
     def download(url, handle, max_bytes, end, stop):
         process = subprocess.Popen(child_argv(url, max_bytes, prefix), stdin=subprocess.DEVNULL, stdout=handle,
-                                   stderr=subprocess.PIPE, close_fds=True)
-        message = b""
+                                   stderr=subprocess.PIPE, close_fds=True, start_new_session=True)
+        pipe = process.stderr.fileno()
+        os.set_blocking(pipe, False)
+        message = bytearray()
+
+        def drain():
+            while True:
+                try:
+                    chunk = os.read(pipe, 65536)
+                except BlockingIOError:
+                    return
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                message.extend(chunk[:max(0, MESSAGE_BYTES - len(message))])
+
         try:
             while True:
+                drain()
                 try:
                     process.wait(timeout=POLL_SECONDS)
                     break
                 except subprocess.TimeoutExpired:
                     halt(end, stop)
+                    if os.fstat(handle).st_size > max_bytes:
+                        raise TooLarge(f"the bytes pass the cap of {max_bytes}")
         finally:
-            if process.returncode is None:
-                process.kill()
-                process.wait()
             try:
-                message = process.stderr.read(MESSAGE_BYTES)
-            except Exception:
+                os.killpg(process.pid, signal.SIGKILL)  # the download process and anything it started
+            except OSError:
                 pass
+            if process.returncode is None:
+                process.wait()
+            drain()
             try:
                 process.stderr.close()
             except Exception:
@@ -443,8 +482,8 @@ def spawned(prefix=None):
         status = process.returncode
         if status == 0:
             return
-        if status == REPORTED and message.strip():
-            raise Refused(message.decode("utf-8", "replace").strip())
+        if status == REPORTED and bytes(message).strip():
+            raise Refused(bytes(message).decode("utf-8", "replace").strip())
         if status < 0:
             raise Refused(f"the download process was ended by {signal_name(-status)}")
         raise Refused(f"the download process failed with status {status}")
@@ -572,9 +611,19 @@ def place(url, digest, folder, name, download, max_bytes, end=None, stop=None, s
                     commit(state)
                     return
             discard(folder, pending)  # the file set aside and its copy did not verify: both go before the fetch
-        temporary, written = scratch(folder, name, pending, handles)
-        download(url, written, max_bytes, end, stop)
-        found = finish(written, max_bytes)
+        _, received = scratch(folder, name, pending, handles)
+        download(url, received, max_bytes, end, stop)
+        offset = [0]
+
+        def read_received(size):
+            chunk = os.pread(received, size, offset[0])
+            offset[0] += len(chunk)
+            return chunk
+
+        # The download process's file may still be open somewhere; the bytes are copied into one only this process
+        # ever had open, hashed there, and that copy is what goes into place.
+        temporary, found, written = to_temporary(folder, name, read_received, max_bytes, pending, handles, 0o644, end,
+                                                 stop)
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
         halt(end, stop)  # the last check before the commit point
@@ -718,10 +767,21 @@ def main(argv, child=None, deadline_seconds=DEADLINE_SECONDS):
 def command(argv, child=None, deadline_seconds=DEADLINE_SECONDS):
     """The executable's entry. Its first act blocks every signal that can be blocked, apart from those reporting a
     fault in this program, so that from here to exit no handler runs; then it sets the last-resort report and runs."""
-    signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals() - UNBLOCKED)
+    signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals() - UNBLOCKED)  # already so when run as a file
     sys.excepthook = last_resort
     return main(argv, child, deadline_seconds)
 
 
+def leave(status):
+    """Flush both streams here, where a failure can be ignored, and end the process with status, so Python's own flush
+    at shutdown can neither change the status nor print a line of its own."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except BaseException:
+            pass
+    os._exit(status)
+
+
 if __name__ == "__main__":
-    sys.exit(command(sys.argv))
+    leave(command(sys.argv))
