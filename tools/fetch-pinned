@@ -267,7 +267,7 @@ class Interrupts:
     an ignored interrupt, or one left to the operating system, is not touched."""
 
     def __init__(self):
-        self.armed, self.held, self.installed, self.previous = True, False, False, None
+        self.armed, self.held, self.live, self.previous = True, False, False, None
         self.busy, self.again = False, False
         self.callback = self.fired  # one object, known by identity: a bound method is a new object on each read
 
@@ -280,15 +280,12 @@ class Interrupts:
             return
         while True:
             previous = self.previous
-            if previous is None or previous is signal.default_int_handler:
+            if previous is signal.default_int_handler:
                 self.armed = False
                 raise KeyboardInterrupt
-            if previous is signal.SIG_IGN:
-                return
-            if previous is signal.SIG_DFL:  # the caller asked for the system's action: give it back and let it act
-                signal.signal(signal.SIGINT, signal.SIG_DFL)
-                self.installed = False
-                signal.raise_signal(signal.SIGINT)
+            if not callable(previous):  # the caller has since chosen one the holder does not front: it acts on it
+                if previous is not signal.SIG_IGN:
+                    signal.raise_signal(signal.SIGINT)
                 return
             # The caller's handler runs with the mask as the caller left it, so whatever it blocks stays blocked.
             self.busy = True
@@ -309,29 +306,26 @@ class Interrupts:
             self.again = False  # one more arrived while it ran: hand it over now, not at the end of the run
 
     def adopt(self):
-        """If something other than this holder is now SIGINT's handler, the caller replaced it: remember the
-        caller's latest choice and put the holder back in front of it. A handler set outside Python reads as None
-        and could never be handed back once replaced, so the holder steps aside and leaves that one in place."""
-        current = signal.getsignal(signal.SIGINT)
-        if not self.installed or current is self.callback:
+        """Take note of SIGINT's handler as the caller's latest choice whenever it is not the holder. A Python
+        callable gets the holder in front of it, whatever happened before; an ignore, the system's action, or a
+        handler set outside Python (which reads as None and could not be put back) is left exactly where it is."""
+        if not self.live:
             return
-        if current is None:
-            self.installed, self.previous = False, None
+        current = signal.getsignal(signal.SIGINT)
+        if current is self.callback:
             return
         self.previous = current
-        signal.signal(signal.SIGINT, self.callback)
+        if callable(current):
+            signal.signal(signal.SIGINT, self.callback)
 
     def install(self):
-        current = signal.getsignal(signal.SIGINT)
-        if callable(current):
-            self.previous = current
-            self.installed = True  # first, so a release after an interrupt inside the next call still restores
-            signal.signal(signal.SIGINT, self.callback)
+        self.live = True  # first, so a release after an interrupt inside the next call still restores
+        self.adopt()
 
     def adopt_guarded(self):
         """Adopt with SIGINT blocked, so an interrupt cannot reach a new handler in the moment between reading it
         and fronting it. No caller code runs inside that block, so lifting it undoes only the holder's own."""
-        if not self.installed or signal.getsignal(signal.SIGINT) is self.callback:
+        if not self.live or signal.getsignal(signal.SIGINT) is self.callback:
             return
         blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
         try:
@@ -347,16 +341,14 @@ class Interrupts:
     def release(self):
         """Give the caller back its latest SIGINT handler. An interrupt noted while held is sent again unless that
         handler is Python's default, whose case the run decides (fetch_pinned), or ignores interrupts."""
-        if not self.installed:
+        if not self.live:
             return
         current = signal.getsignal(signal.SIGINT)
         if current is self.callback:
             signal.signal(signal.SIGINT, self.previous)
-        elif current is not None:  # the caller's latest choice is already in place: leave it there
-            self.previous = current
-        self.installed = False
-        previous = self.previous
-        if self.held and previous is not signal.default_int_handler and previous is not signal.SIG_IGN:
+            current = self.previous
+        self.live = False
+        if self.held and current is not signal.default_int_handler and current is not signal.SIG_IGN:
             self.held = False
             signal.raise_signal(signal.SIGINT)
 
