@@ -467,8 +467,13 @@ def run(argv):
     problems = []
     found = []
     try:
-        for number in SIGNALS:
-            signal.signal(number, stop)
+        # Held while the handlers change, so none reaches a handler not yet replaced; released, it meets stop.
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            for number in SIGNALS:
+                signal.signal(number, stop)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
         found = check(args, probe, entries)
     except (Broken, Stopped) as error:
         problems.append(str(error))

@@ -14,8 +14,28 @@ if [ -n "$private" ] && [ ! -x "$private/tools/gates/leak-guard-private" ]; then
     exit 1
 fi
 remote_name="$1"
+# Git writes one line per pushed ref: local ref, local name, remote ref, remote name, single spaces, names in full.
+case $(git -C "$top" rev-parse --show-object-format 2>/dev/null) in
+    sha1) hex='[0-9a-f]\{40\}' ;;
+    sha256) hex='[0-9a-f]\{64\}' ;;
+    *) echo "leak-guard: broken: cannot read this repository's object format" >&2; exit 1 ;;
+esac
+shape="[^[:space:]][^[:space:]]* $hex [^[:space:]][^[:space:]]* $hex\$"
 status=0
-while read -r local_ref local_sha remote_ref remote_sha; do
+while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+        continue  # names no ref: a chainer that re-emits git's input adds one newline to an empty list
+    fi
+    if ! expr "$line" : "$shape" >/dev/null; then
+        echo "leak-guard: refused: malformed ref line from git (want four fields with two full object names); nothing in this push was checked" >&2
+        exit 1
+    fi
+    local_ref=${line%% *}; rest=${line#* }
+    local_sha=${rest%% *}; rest=${rest#* }
+    rest=${rest#* }; remote_sha=${rest#* }  # the remote ref name is not needed
+    if [ "$local_sha" = "$remote_sha" ]; then
+        continue  # the remote already holds this commit: nothing new to check
+    fi
     if expr "$local_sha" : '0*$' >/dev/null; then
         continue  # deleting a remote branch pushes no content
     fi
