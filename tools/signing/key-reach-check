@@ -418,6 +418,9 @@ def main(argv):
     except Exception as error:  # an uncaught exception exits 1, which this tool defines as "something reachable"
         say(f"broken: an unexpected {type(error).__name__} ended the run")
         return 2
+    except KeyboardInterrupt:  # before the stop handler is in place, or after it is gone: the same exit 1 otherwise
+        say("broken: interrupted before the check finished")
+        return 2
 
 
 def run(argv):
@@ -460,10 +463,12 @@ def run(argv):
         say("broken: another key-reach-check run holds this keychain, and the fixed control names cannot be shared")
         return 2
     probe = Probe(SECURITY, args.keychain, args.signer, CODESIGN, args.timeout)
-    previous = {number: signal.signal(number, stop) for number in SIGNALS}
+    previous = {number: signal.getsignal(number) for number in SIGNALS}  # all noted before any is changed
     problems = []
     found = []
     try:
+        for number in SIGNALS:
+            signal.signal(number, stop)
         found = check(args, probe, entries)
     except (Broken, Stopped) as error:
         problems.append(str(error))
@@ -472,10 +477,15 @@ def run(argv):
     except Exception as error:  # nothing unexpected may escape: an uncaught exception exits 1, which means reachable
         problems.append(f"an unexpected {type(error).__name__} ended the run")
     finally:
-        ignore_signals()
+        try:
+            ignore_signals()
+        except Stopped as error:  # it landed before the line above took effect; stop ignored all three first
+            problems.append(str(error))
+            ignore_signals()
         problems += probe.remove_planted()
         for number, handler in previous.items():
-            signal.signal(number, handler)
+            if handler is not None:  # one set outside Python cannot be put back from Python; the run is ending
+                signal.signal(number, handler)
     if problems:
         for problem in problems:
             say(f"broken: {problem}")
