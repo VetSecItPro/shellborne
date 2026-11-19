@@ -4,69 +4,61 @@
 Usage: fetch-pinned <https-url> <sha256> <destination>
 
 Builds bring files in from the network through this program and nothing else; the pin gate refuses any other
-download in a file a build executes.
+download in a file a build executes. The program is used only as a command: each run is its own process, and the
+functions below exist for its tests, not as a library promise.
 
-How a run goes. The body lands in a hidden scratch file next to the destination, hashed and size-limited as it
-arrives, and is renamed over the destination only once the hash checks out. Whatever already sits at the
-destination is dealt with before anything else is written. That first change to the destination moves whatever sits
-at that name to a scratch name, or deletes it when the move is impossible or the run fails before reaching it. That old
-file is reused, with no download, only if a fresh copy of it hashes to the pin; otherwise it and its copy are gone
-before the download starts. Until that first change the program only reads, so a run stopped by any means at that
-stage finds the destination untouched. Afterward the destination name is, at every moment, either vacant or holding
-a checked file, even if the process is killed. The price is a short gap in which a good existing file is away from
-its name while it is checked. One deadline of 15 minutes bounds the request, any redirects and the body.
+Two processes. The program's own process does every step on disk. The network is reached by a separate process that
+it starts with Python's isolated mode and the URL and byte cap as arguments: that one opens the URL, follows
+redirects only to https, stops at the cap, and sends every byte it receives into a scratch file that this program
+made and noted first, handed to it as its standard output. The command line has no option that runs that part alone,
+so the tool offers no way to fetch without the check. Before it opens anything, the program blocks every signal
+except the few that report a fault in its own code (and SIGKILL and SIGSTOP, which nothing can block), so no handler
+ever runs in it again and no step can be cut off half way. A request to stop (an interrupt, a terminate, a hangup
+and the like) waits as a pending signal; the program looks for one while the download runs, between chunks of a
+local copy, and once more just before the commit point. Found before that point, it ends the download process and
+refuses the run, after the whole cleanup; found later, it changes nothing. The other process unblocks everything
+first, so a Ctrl-C to the terminal ends it at once. One deadline of 15 minutes bounds the request, any redirects and
+the body: when it passes, the download process is killed, which also covers looking up the host. The program
+measures and hashes the scratch file itself and never relies on the other process for either.
 
-Outcome and exit status. A run turns final at its commit point: the checked file is in place, interrupts are held,
-the deadline is switched off, and one store marks the run as placed. Before that store the cleanup undoes the
-placement; after it, nothing can. Interrupts arriving during the commit or anywhere in the cleanup wait instead of
-raising, so a second Ctrl-C cannot stop a rollback half way, and each cleanup step runs even when an earlier step
-failed. Hence a status of 1 always means no file was written, and a status of 0 always means one was. A waiting
-interrupt is discarded when the run failed anyway; after a placement the command line still reports success, while
-a library call raises the interrupt once the caller's handlers are back. Python runs signal handlers between
-bytecodes, so the cleanup's first lines soak up the one interrupt and the one deadline signal that could arrive
-just as it starts.
+How a run goes. The body lands in a hidden scratch file next to the destination and is renamed over the destination
+only once its hash checks out. Whatever already sits at the destination is dealt with before anything else is
+written. That first change to the destination moves whatever sits at that name to a scratch name, or deletes it when
+the move is impossible or the run fails before reaching it. That old file is reused, with no download, only if a
+fresh copy of it hashes to the pin; otherwise it and its copy are gone before the download starts. Until that first
+change the program only reads, so a run stopped by any means at that stage finds the destination untouched.
+Afterward the destination name is, at every moment, either vacant or holding a checked file, even if the process is
+killed. The price is a short gap in which a good existing file is away from its name while it is checked.
 
-Process-wide state. Only the command-line entry point changes it for good: it installs the last-resort report, and
-from the commit point to exit an interrupt is merely noted, so the status reported is the status on disk. A library
-call, or main used in process, returns the interrupt and alarm handlers and installs no report. For the run, the
-program sits in front of whatever Python-level SIGINT handler the caller has: while the download can still be stopped,
-each interrupt goes through to that handler, which can raise only once, and one that comes while the handler is
-still busy is passed on as soon as it returns; during the commit and the cleanup it is noted instead, and a caller's
-own handler receives it once the cleanup is over. Should that handler install a different one, the program puts
-itself in front of the new choice and hands that back at the end. An ignored interrupt stays ignored. The deadline
-needs the alarm handler and the real-time timer, so a caller already running that timer, or whose alarm handler was
-installed outside Python (one Python cannot put back), is turned away before anything changes; a timer that starts
-during that check shows up in the program's own swap, which puts it back and fails the run. Both stay the run's
-until it ends: whatever a callback the caller passes does to them meanwhile, the end of the run stops the timer and
-reinstates the handler it began with, and such a callback can only give up the deadline, never inherit it. A timer or
-handler that cannot be returned afterward raises StateNotRestored rather than passing silently, and the outcome of
-the run stands; after a placement the command line keeps status 0 and prints the problem as one warning line.
+Outcome and exit status. A run turns final at its commit point: the checked file is in place and one store marks the
+run as placed. Before that store the cleanup undoes the placement; after it, nothing can. Each cleanup step runs even
+when an earlier one failed. Hence a status of 1 always means no file was written, and a status of 0 always means one
+was. A failure after a placement keeps status 0 and is printed as one warning line.
 
-Output. Every line printed is printable ASCII. Any other character, whether from a file name, a system error
-message or anything a server sent back, appears as an escape, so no input can split or fake a log line. Every exception,
-an interrupt included, ends as a single such line; the last-resort report prints one line and no chained text.
+Output. Every line printed is printable ASCII. Any other character, whether from a file name, a system error message,
+the download process or anything a server sent back, appears as an escape, so no input can split or fake a log line.
+Every exception ends as a single such line; the last-resort report prints one line and no chained text.
 
-Permissions. Only the mode bits carry over: a checked copy of an existing file keeps its mode, but not its ACLs,
-flags or extended attributes; a caller that needs those applies them after placement.
+Permissions. Only the mode bits carry over: a checked copy of an existing file keeps its mode, but not its ACLs, flags
+or extended attributes; a caller that needs those applies them after placement.
 
 Threat model. Covered: an untrusted network, and a destination holding an old, truncated or wrong file. Not covered:
 another process writing into the destination folder during the run, since such a process already has the build's
-trust. The cleanup deletes a scratch name, or a file this run put at the destination, only while that name still
-holds that exact file; each cleanup step runs regardless of earlier failures, and any name left behind is listed
-in the refusal.
+trust; and SIGKILL or SIGSTOP of this process, or a signal in the instant between the interpreter starting and the
+block, before anything is opened. The cleanup deletes a scratch name, or a file this run put at the destination, only
+while that name still holds that exact file; any name left behind is listed in the refusal.
 
-Inputs. The URL must be https, name a host, and carry no user name or password; redirects are followed only to
-https. The digest is 64 hex digits. The destination must lie inside the working folder (an absolute path may reach
-it through the shell's $PWD spelling when that resolves to the same place); every folder on its path must exist and
-be a real folder, not a link, checked one level at a time and kept open for the write; the destination itself is
-either missing or a regular file; it is valid UTF-8 without control characters, it plainly names a file (no trailing
-slash, no empty, . or .. segment, though a leading ./ is fine), and its name is short enough for the scratch name
-placed next to it.
+Inputs. The URL must be https, name a host, and carry no user name or password. The digest is 64 hex digits. The
+destination must lie inside the working folder (an absolute path may reach it through the shell's $PWD spelling when
+that resolves to the same place); every folder on its path must exist and be a real folder, not a link, checked one
+level at a time and kept open for the write; the destination itself is either missing or a regular file; it is valid
+UTF-8 without control characters, it plainly names a file (no trailing slash, no empty, . or .. segment, though a
+leading ./ is fine), and its name is short enough for the scratch name placed next to it.
 
-Exit status. 0: placed. 1: refused, because the download failed or ran past its deadline, the bytes went over the
-cap or hashed to something else, the run was interrupted, or the program could not clear the destination or its
-scratch files. 2: malformed arguments. A status of 1 or 2 leaves nothing written, apart from any name the refusal
-reports as not removed.
+Exit status. 0: placed. 1: refused, because the download failed or ran past its deadline, the bytes went over the cap
+or hashed to something else, the run was interrupted, or the program could not clear the destination or its scratch
+files. 2: malformed arguments. A status of 1 or 2 leaves nothing written, apart from any name the refusal reports as
+not removed.
 """
 import hashlib
 import http.client
@@ -78,8 +70,9 @@ import secrets
 import signal
 import socket
 import stat
+import subprocess
 import sys
-import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -87,11 +80,33 @@ import urllib.request
 MAX_BYTES = 512 * 1024 * 1024
 TIMEOUT_SECONDS = 120
 DEADLINE_SECONDS = 900
+POLL_SECONDS = 0.05
+MESSAGE_BYTES = 4096
 CHUNK = 1024 * 1024
 HEX64 = re.compile(r"[0-9A-Fa-f]{64}")
 PRINTABLE = re.compile(r"[\x21-\x7e]+")
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 LABEL = re.compile(r"(?!-)[A-Za-z0-9_-]{1,63}(?<!-)")
+
+# Signals that ask a process to end. Blocked in this process, each one waits as pending and is read as a stop request.
+STOPS = frozenset(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGPIPE", "SIGALRM",
+                                                     "SIGUSR1", "SIGUSR2", "SIGXCPU", "SIGXFSZ", "SIGVTALRM",
+                                                     "SIGPROF") if hasattr(signal, name))
+# Signals that report a fault in this program's own code stay deliverable; SIGKILL and SIGSTOP cannot be blocked.
+UNBLOCKED = frozenset(getattr(signal, name) for name in ("SIGKILL", "SIGSTOP", "SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL",
+                                                         "SIGTRAP", "SIGSYS", "SIGABRT") if hasattr(signal, name))
+
+# What the download process runs: unblock every signal it inherited blocked, load this file, and fetch.
+CHILD_CODE = """import signal, sys
+signal.pthread_sigmask(signal.SIG_SETMASK, set())
+import importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader("fetch_pinned_download", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+sys.exit(module.download_child(sys.argv[2], int(sys.argv[3])))
+"""
+REPORTED = 3  # the download process's status when it printed its own reason
 
 
 class Refused(Exception):
@@ -104,11 +119,6 @@ class Malformed(Refused):
 
 class TooLarge(Refused):
     """The bytes passed the cap."""
-
-
-class StateNotRestored(Exception):
-    """The run ended, placed or refused as its outcome records, but a timer or handler the helper changed could not
-    be put back, so the caller learns of it instead of inheriting it silently."""
 
 
 class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
@@ -226,30 +236,6 @@ def open_destination(dest, root):
         raise
 
 
-class Deadline:
-    """The run's single deadline. It raises once at most, and only while armed. If the time runs out before arming,
-    arming raises it; after disarming, running out has no effect, so a late alarm can neither interrupt the cleanup
-    nor turn a checked placement into a failure."""
-
-    def __init__(self):
-        self.armed, self.passed = False, False
-
-    def expired(self, signum, frame):
-        self.passed = True
-        if self.armed:
-            self.armed = False
-            raise Refused("the fetch passed its deadline")
-
-    def arm(self):
-        self.armed = True
-        if self.passed:
-            self.armed = False
-            raise Refused("the fetch passed its deadline")
-
-    def disarm(self):
-        self.armed = False
-
-
 class Outcome:
     """The run's record of its one commit point: placed is set by a single store once the verified file is in place,
     and the cleanup and main read it. A record belongs to one run: one already marked placed is refused."""
@@ -258,236 +244,23 @@ class Outcome:
         self.placed = False
 
 
-class Interrupts:
-    """How the run treats SIGINT. While armed, an interrupt behaves as the caller set it up: Python's default handler
-    raises KeyboardInterrupt, and a caller's own handler is called, with the signal mask exactly as the caller left
-    it. An interrupt that lands while that handler is still busy is passed to it the moment it returns. Whichever
-    handler raises disarms the holder, so it can raise only once. Once held, an interrupt is only noted, so the
-    commit and the cleanup always run to their end. The holder sits in front of any Python-level handler for the run;
-    an ignored interrupt, or one left to the operating system, is not touched."""
-
-    def __init__(self):
-        self.armed, self.held, self.live, self.previous = True, False, False, None
-        self.busy, self.again = False, False
-        self.callback = self.fired  # one object, known by identity: a bound method is a new object on each read
-
-    def fired(self, signum, frame):
-        if not self.armed:
-            self.held = True
-            return
-        if self.busy:  # the caller's handler is still running: it gets this one as soon as it returns
-            self.again = True
-            return
-        while True:
-            previous = self.previous
-            if previous is signal.default_int_handler:
-                self.armed = False
-                raise KeyboardInterrupt
-            if not callable(previous):  # the caller has since chosen one the holder does not front: it acts on it
-                if previous is not signal.SIG_IGN:
-                    signal.raise_signal(signal.SIGINT)
-                return
-            # The caller's handler runs with the mask as the caller left it, so whatever it blocks stays blocked.
-            self.busy = True
-            try:
-                previous(signum, frame)
-            except BaseException:
-                self.armed = False  # it raised, so the run is ending: from here on interrupts wait for the cleanup
-                if self.again:
-                    self.again, self.held = False, True
-                raise
-            finally:
-                try:
-                    self.adopt_guarded()  # it may have installed another handler: front that one from now on
-                finally:
-                    self.busy = False
-            if not self.again:
-                return
-            self.again = False  # one more arrived while it ran: hand it over now, not at the end of the run
-
-    def adopt(self):
-        """Take note of SIGINT's handler as the caller's latest choice whenever it is not the holder. A Python
-        callable gets the holder in front of it, whatever happened before; an ignore, the system's action, or a
-        handler set outside Python (which reads as None and could not be put back) is left exactly where it is."""
-        if not self.live:
-            return
-        current = signal.getsignal(signal.SIGINT)
-        if current is self.callback:
-            return
-        self.previous = current
-        if callable(current):
-            signal.signal(signal.SIGINT, self.callback)
-
-    def install(self):
-        self.live = True  # first, so a release after an interrupt inside the next call still restores
-        self.adopt()
-
-    def adopt_guarded(self):
-        """Adopt with SIGINT blocked, so an interrupt cannot reach a new handler in the moment between reading it
-        and fronting it. No caller code runs inside that block, so lifting it undoes only the holder's own."""
-        if not self.live or signal.getsignal(signal.SIGINT) is self.callback:
-            return
-        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-        try:
-            self.adopt()
-        finally:
-            if signal.SIGINT not in blocked:
-                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
-
-    def hold(self):
-        self.armed = False
-        self.adopt_guarded()
-
-    def release(self):
-        """Give the caller back its latest SIGINT handler. An interrupt noted while held is sent again unless that
-        handler is Python's default, whose case the run decides (fetch_pinned), or ignores interrupts."""
-        if not self.live:
-            return
-        current = signal.getsignal(signal.SIGINT)
-        if current is self.callback:
-            signal.signal(signal.SIGINT, self.previous)
-            current = self.previous
-        self.live = False
-        if self.held and current is not signal.default_int_handler and current is not signal.SIG_IGN:
-            self.held = False
-            signal.raise_signal(signal.SIGINT)
+def pending_stop():
+    """The reason to stop if a stop signal is waiting (only blocked signals can wait), or None. Reading it leaves the
+    signal pending; the process ends with the run."""
+    waiting = signal.sigpending() & STOPS
+    if waiting:
+        return "interrupted by " + ", ".join(sorted(signal.Signals(number).name for number in waiting))
+    return None
 
 
-def fetch_pinned(url, digest, dest, open_url=None, root=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
-                 outcome=None, interrupts=None):
-    """Put url's body at dest if its SHA-256 equals digest, and raise Refused if not. An existing file at dest is
-    reused without a download only when a fresh copy of it hashes correctly; anything else there is cleared first,
-    so after argument checking, dest holds only checked content whether the call returns or raises. The deadline
-    starts once the arguments pass and covers hashing an existing file, connecting, redirects, the body and the
-    rename; only the closing cleanup runs without it, so the cleanup is never cut off. outcome is a record the
-    caller can read for the commit point. interrupts is a holder the caller supplies (main does); without one, the
-    call manages interrupts itself for the duration, returns the handler at the end, and re-raises a held interrupt
-    only if the file was placed. Malformed: a deadline other than a positive finite number, a byte cap that is
-    negative or not an integer, and a holder or record reused from another run. Every timer and handler this call
-    changes is returned on every path, or StateNotRestored names the one that could not be; the call turns away a
-    caller whose real-time timer is running or whose alarm handler Python cannot put back, before changing anything."""
-    check_url(url)
-    if not HEX64.fullmatch(digest or ""):
-        raise Malformed("the digest must be 64 hex digits")
-    if threading.current_thread() is not threading.main_thread():
-        raise Malformed("the helper runs its deadline on the main thread only")
-    if outcome is not None and outcome.placed:
-        raise Malformed("the outcome record is from an earlier run; each run needs a fresh one")
-    if interrupts is not None and (not interrupts.armed or interrupts.held):
-        raise Malformed("the interrupt holder is from an earlier run; each run needs a fresh one")
-    if (isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, (int, float))
-            or not math.isfinite(deadline_seconds) or deadline_seconds <= 0):
-        raise Malformed("the deadline must be a positive, finite number of seconds")  # 0 would cancel the timer
-    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
-        raise Malformed("the byte cap must be a whole number, 0 or more")
-    alarm = signal.getsignal(signal.SIGALRM)
-    if alarm is None:
-        raise Malformed("the alarm handler was set outside Python, which cannot put it back, so the deadline cannot "
-                        "borrow it")
-    if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
-        raise Malformed("a real-time timer is already running, and the helper's deadline needs it")
-    state = outcome if outcome is not None else Outcome()
-    holder = interrupts if interrupts is not None else Interrupts()
-    deadline, folder, unrestored, deferred, timer = Deadline(), None, [], None, None
-    try:
-        if interrupts is None:
-            holder.install()
-        folder, name = open_destination(dest, root if root is not None else os.getcwd())
-        signal.signal(signal.SIGALRM, deadline.expired)
-        timer = signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
-        if timer[0] > 0:  # a timer started after the check: the final block puts it back as it was
-            raise Refused("a real-time timer started while the helper was taking it, so it was put back")
-        place(url, digest.lower(), folder, name, open_url, max_bytes, deadline, state, holder)
-    except (Exception, KeyboardInterrupt):
-        raise
-    except BaseException as error:  # an exit request in flight: nothing below may replace it
-        deferred = error
-        raise
-    finally:
-        # The steps below each run even if an earlier one failed. Python delivers signals between bytecodes, so these
-        # repeated attempts soak up the single interrupt and the single deadline alarm that might still arrive.
-        try:
-            holder.hold()
-            deadline.disarm()
-        except (Exception, KeyboardInterrupt):
-            pass
-        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
-            deferred = deferred or error
-        try:
-            holder.hold()
-            deadline.disarm()
-        except (Exception, KeyboardInterrupt):
-            pass
-        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
-            deferred = deferred or error
-        try:
-            holder.hold()
-            deadline.disarm()
-        except (Exception, KeyboardInterrupt):
-            pass
-        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
-            deferred = deferred or error
-        # Each restoration is tried twice, and one that still fails is named after the others have run. The order keeps
-        # every alarm with its own handler: the helper's timer is cancelled, then the caller's handler goes back, and
-        # only then is a timer the helper's swap displaced re-armed, and only if that handler is back.
-        stopped = True
-        try:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        except Exception:
-            try:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-            except Exception as error:
-                stopped = False
-                unrestored.append(f"the real-time timer ({described(error)})")
-        handler_back = stopped
-        if not stopped:  # a live timer of the helper's must not reach the caller's handler: leave a disarmed one there
-            try:
-                deadline.disarm()
-                signal.signal(signal.SIGALRM, deadline.expired)
-            except Exception:
-                pass
-            unrestored.append("the alarm handler (the helper's disarmed one stays while its timer runs)")
-        else:
-            try:
-                signal.signal(signal.SIGALRM, alarm)
-            except Exception:
-                try:
-                    signal.signal(signal.SIGALRM, alarm)
-                except Exception as error:
-                    handler_back = False
-                    unrestored.append(f"the alarm handler ({described(error)})")
-        if timer is not None and timer[0] > 0:  # a timer the swap displaced
-            if not handler_back:
-                unrestored.append("the caller's real-time timer (not re-armed: its handler could not be put back)")
-            else:
-                try:
-                    signal.setitimer(signal.ITIMER_REAL, *timer)
-                except Exception:
-                    try:
-                        signal.setitimer(signal.ITIMER_REAL, *timer)
-                    except Exception as error:
-                        unrestored.append(f"the caller's real-time timer ({described(error)})")
-        if folder is not None:
-            try:
-                close_quietly(folder)
-            except Exception:
-                pass
-        if interrupts is None:
-            try:
-                holder.release()
-            except Exception:
-                try:
-                    holder.release()
-                except Exception as error:
-                    unrestored.append(f"the interrupt handler ({described(error)})")
-        if deferred is not None:
-            raise deferred  # an exit request outranks a report the caller can no longer act on
-        if unrestored:
-            raise StateNotRestored(f"could not restore {', '.join(unrestored)}")
-        if interrupts is None and state.placed and holder.held:  # the caller's handler is back: raise it now
-            holder.held = False
-            raise KeyboardInterrupt
-    return dest
+def halt(end, stop):
+    """Refuse the run if a stop was asked for or the deadline has passed. It is consulted at fixed points only, so a
+    refusal from here is an ordinary exception and the cleanup that follows runs in full."""
+    reason = stop() if stop is not None else None
+    if reason:
+        raise Refused(reason)
+    if end is not None and time.monotonic() >= end:
+        raise Refused("the fetch passed its deadline")
 
 
 def close_quietly(handle):
@@ -534,43 +307,150 @@ def remove_own(folder, name, own):
     remove(folder, name)
 
 
-def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644):
-    """Copy everything read() returns into a fresh scratch file next to the destination, hashing along the way and
-    stopping at the cap; return (scratch name, SHA-256, open handle). The name is added to pending before the file
-    is created and its identity noted right after; the handle goes into handles. That lets the caller's cleanup
-    delete and close both after a failure at any point, and keeping the handle open lets the rename step confirm
-    that the file it installs is this one."""
+def scratch(folder, name, pending, handles):
+    """Create a fresh scratch file next to the destination and return (its name, an open read-write handle). The name
+    is added to pending before the file is created and its identity noted right after; the handle goes into handles.
+    That lets the cleanup delete and close both after a failure at any point."""
     temporary = temporary_name(name)
     entry = [temporary, None]
     pending.append(entry)
-    handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
+    handle = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
     handles.append(handle)
     entry[1] = identity(os.fstat(handle))
-    hasher, size = hashlib.sha256(), 0
-    while chunk := read(CHUNK):
+    return temporary, handle
+
+
+def copy_body(read, handle, max_bytes, end=None, stop=None):
+    """Write everything read() returns into handle, stopping at the cap, and looking for a stop or the deadline before
+    each chunk. The download process runs this on the network reply; the program runs it on a file it reuses."""
+    size = 0
+    while True:
+        halt(end, stop)
+        chunk = read(CHUNK)
+        if not chunk:
+            return size
         size += len(chunk)
         if size > max_bytes:
             raise TooLarge(f"the bytes pass the cap of {max_bytes}")
-        hasher.update(chunk)
         view = memoryview(chunk)
         while view:
             view = view[os.write(handle, view):]
+
+
+def finish(handle, max_bytes, mode=0o644):
+    """Flush the scratch file, set its mode, then measure and hash it from its first byte through this handle, so the
+    result describes exactly the bytes that will be renamed into place, whoever wrote them."""
     os.fsync(handle)
     os.fchmod(handle, mode)
-    return temporary, hasher.hexdigest(), handle
+    size = os.fstat(handle).st_size
+    if size > max_bytes:
+        raise TooLarge(f"the bytes pass the cap of {max_bytes}")
+    hasher, offset = hashlib.sha256(), 0
+    while offset < size:
+        chunk = os.pread(handle, min(CHUNK, size - offset), offset)
+        if not chunk:
+            break
+        hasher.update(chunk)
+        offset += len(chunk)
+    if offset != size:
+        raise Refused("the scratch file changed while it was checked")
+    return hasher.hexdigest()
+
+
+def to_temporary(folder, name, read, max_bytes, pending, handles, mode=0o644, end=None, stop=None):
+    """Copy what read() returns into a fresh scratch file; return (scratch name, SHA-256, open handle)."""
+    temporary, handle = scratch(folder, name, pending, handles)
+    copy_body(read, handle, max_bytes, end, stop)
+    return temporary, finish(handle, max_bytes, mode), handle
+
+
+def https_open(url):
+    return https_only_opener().open(url, timeout=TIMEOUT_SECONDS)
+
+
+def in_process(open_url):
+    """A download that runs in this process: open_url(url) gives a reply, and its body is copied into the scratch
+    handle under the cap. The download process runs exactly this with the https-only opener; the tests run it with a
+    stand-in for the network."""
+    def download(url, handle, max_bytes, end, stop):
+        try:
+            with open_url(url) as body:
+                copy_body(body.read, handle, max_bytes, end, stop)
+        except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
+            raise Refused(f"the fetch failed: {error}") from None
+    return download
+
+
+def download_child(url, max_bytes):
+    """The download process's whole job: check the URL again, fetch it into standard output under the cap, and on any
+    failure print one escaped reason and return REPORTED. It never raises."""
+    try:
+        check_url(url)
+        in_process(https_open)(url, sys.stdout.fileno(), max_bytes, None, None)
+        return 0
+    except BaseException as error:
+        try:
+            reason = described(error) if isinstance(error, Refused) else f"the fetch failed: {type(error).__name__}"
+            say(reason, sys.stderr)
+        except BaseException:
+            pass
+        return REPORTED
+
+
+def child_argv(url, max_bytes, prefix=None):
+    """The download process's command: this file run in Python's isolated mode, given the URL and the cap. prefix
+    replaces everything before the URL; the tests use it to stand in for the network."""
+    head = list(prefix) if prefix is not None else [sys.executable, "-I", "-c", CHILD_CODE, os.path.abspath(__file__)]
+    return head + [url, str(max_bytes)]
+
+
+def spawned(prefix=None):
+    """The program's download: start the download process with the scratch file as its standard output, wait for it
+    while looking for a stop request and the deadline, and end it with SIGKILL if either comes first. Its own reason
+    is read back only when it reported one, at most MESSAGE_BYTES of it."""
+    def download(url, handle, max_bytes, end, stop):
+        process = subprocess.Popen(child_argv(url, max_bytes, prefix), stdin=subprocess.DEVNULL, stdout=handle,
+                                   stderr=subprocess.PIPE, close_fds=True)
+        message = b""
+        try:
+            while True:
+                try:
+                    process.wait(timeout=POLL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    halt(end, stop)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                process.wait()
+            try:
+                message = process.stderr.read(MESSAGE_BYTES)
+            except Exception:
+                pass
+            try:
+                process.stderr.close()
+            except Exception:
+                pass
+        halt(None, stop)  # a stop that came as the download process ended outranks the reason it gave
+        status = process.returncode
+        if status == 0:
+            return
+        if status == REPORTED and message.strip():
+            raise Refused(message.decode("utf-8", "replace").strip())
+        if status < 0:
+            raise Refused(f"the download process was ended by {signal.Signals(-status).name}")
+        raise Refused(f"the download process failed with status {status}")
+    return download
+
+
+def commit(state):
+    """Make the placement final: the checked file is already at the destination, and a single assignment marks the run
+    placed. The cleanup consults that mark: without it the placement is undone, with it the destination is kept."""
+    state.placed = True
 
 
 def same_file(info, other):
     return identity(info) == identity(other)
-
-
-def commit(deadline, interrupts, state):
-    """Make the placement final. The checked file is already at the destination; hold interrupts, switch the
-    deadline off, then mark the run placed with a single assignment. The cleanup consults that mark: without it the
-    placement is undone, with it the destination is kept, so only events before the assignment can reverse it."""
-    interrupts.hold()
-    deadline.disarm()
-    state.placed = True
 
 
 def discard(folder, pending):
@@ -645,19 +525,16 @@ def set_aside(folder, name, pending):
     return entry
 
 
-def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=None, interrupts=None):
+def place(url, digest, folder, name, download, max_bytes, end=None, stop=None, state=None):
     """All file work here uses the folder handle; the path is not consulted again. An existing destination is moved
     away first, then copied to a scratch file and hashed as that copy, so a good result never depends on reading a
-    name twice. The deadline remains armed until the placement is confirmed. A single cleanup is responsible for
-    every scratch file and for anything this run put at the destination, deleting each only while its name still
-    refers to that file. It runs with interrupts held and reads the placed mark, so once a run is marked placed, no
-    later error removes the destination."""
-    deadline = deadline or Deadline()
+    name twice. A single cleanup is responsible for every scratch file and for anything this run put at the
+    destination, deleting each only while its name still refers to that file. It reads the placed mark, so once a
+    run is marked placed, no later error removes the destination."""
     state = state if state is not None else Outcome()
-    interrupts = interrupts if interrupts is not None else Interrupts()
-    pending, handles, failure, cleared, deferred = [], [], None, False, None
+    pending, handles, failure, cleared = [], [], None, False
     try:
-        deadline.arm()
+        halt(end, stop)  # the last moment at which the destination is still untouched
         aside = set_aside(folder, name, pending)
         cleared = True  # the name is empty now, or its file is set aside under a temporary name
         if aside is not None:
@@ -666,93 +543,39 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
                 handle = os.open(aside[0], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
             except OSError:
                 handle = None  # it cannot be read, so it cannot be verified: it goes like any other wrong file
-        if aside is not None and handle is not None:
-            try:
-                found_info = os.fstat(handle)
-                if identity(found_info) != aside[1] or not stat.S_ISREG(found_info.st_mode):
-                    raise Refused("the destination changed during the run")
-                mode = stat.S_IMODE(found_info.st_mode)  # the copy keeps the existing file's mode bits
+            if handle is not None:
                 try:
-                    temporary, found, copy = to_temporary(folder, name, lambda size: os.read(handle, size),
-                                                          max_bytes, pending, handles, mode)
-                except TooLarge:
-                    found = None  # over the cap, so it is not the pinned file
-            finally:
-                close_quietly(handle)
-        if aside is not None:
+                    found_info = os.fstat(handle)
+                    if identity(found_info) != aside[1] or not stat.S_ISREG(found_info.st_mode):
+                        raise Refused("the destination changed during the run")
+                    mode = stat.S_IMODE(found_info.st_mode)  # the copy keeps the existing file's mode bits
+                    try:
+                        temporary, found, copy = to_temporary(folder, name, lambda size: os.read(handle, size),
+                                                              max_bytes, pending, handles, mode, end, stop)
+                    except TooLarge:
+                        found = None  # over the cap, so it is not the pinned file
+                finally:
+                    close_quietly(handle)
             if found == digest:
                 remove_own(folder, aside[0], aside[1])  # the verified copy replaces it, so the original goes first
                 pending.remove(aside)
                 if settle(folder, temporary, copy, found, digest, name):
-                    commit(deadline, interrupts, state)
+                    halt(end, stop)  # the last check before the commit point
+                    commit(state)
                     return
             discard(folder, pending)  # the file set aside and its copy did not verify: both go before the fetch
-        if open_url is None:
-            opener = https_only_opener()
-
-            def open_url(address):
-                return opener.open(address, timeout=TIMEOUT_SECONDS)
-        # The callback, its reply, entering and leaving that reply, and each read on it are caller code that may
-        # install a SIGINT handler. The holder is put back in front each time control returns from them, so no such
-        # handler is still exposed when the commit or the cleanup takes hold.
-        def from_caller(call, *arguments):
-            try:
-                return call(*arguments)
-            finally:
-                interrupts.adopt_guarded()
-
-        class Entered:  # entering and leaving the reply are caller code as well
-            def __init__(inner, reply):
-                inner.reply = reply
-
-            def __enter__(inner):
-                return from_caller(type(inner.reply).__enter__, inner.reply)
-
-            def __exit__(inner, *raised):
-                return from_caller(type(inner.reply).__exit__, inner.reply, *raised)
-
-        try:
-            with Entered(from_caller(open_url, url)) as body:
-                temporary, found, written = to_temporary(folder, name, lambda size: from_caller(body.read, size),
-                                                         max_bytes, pending, handles)
-        except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as error:
-            raise Refused(f"the fetch failed: {error}") from None
+        temporary, written = scratch(folder, name, pending, handles)
+        download(url, written, max_bytes, end, stop)
+        found = finish(written, max_bytes)
         if not settle(folder, temporary, written, found, digest, name):
             raise Refused(f"digest mismatch: expected {digest}, got {found}")
-        commit(deadline, interrupts, state)
+        halt(end, stop)  # the last check before the commit point
+        commit(state)
     except BaseException as error:
         failure = error
         raise
     finally:
-        # Nothing may stop this cleanup early, so interrupts are held and the deadline switched off before anything
-        # else. Signals arrive between bytecodes; these repeated attempts catch the one interrupt and the one alarm
-        # that might still land here, while an exception already propagating keeps propagating.
-        try:
-            interrupts.hold()
-            deadline.disarm()
-        except (Exception, KeyboardInterrupt):
-            pass
-        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
-            deferred = deferred or error
-        try:
-            interrupts.hold()
-            deadline.disarm()
-        except (Exception, KeyboardInterrupt):
-            pass
-        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
-            deferred = deferred or error
-        try:
-            interrupts.hold()
-            deadline.disarm()
-        except (Exception, KeyboardInterrupt):
-            pass
-        except BaseException as error:  # not the cleanup's to drop: raised once every step has run
-            deferred = deferred or error
         # Each step below is attempted regardless of how the previous ones went.
-        try:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        except Exception:
-            pass
         for handle in handles:
             try:
                 close_quietly(handle)
@@ -771,11 +594,40 @@ def place(url, digest, folder, name, open_url, max_bytes, deadline=None, state=N
                 left.append(name)
         # Exit 1 never hides a leftover: the refusal names it, after the reason the run failed, if any. A placed run has
         # renamed every pending name away, so a failure while checking one leaves nothing and refuses nothing.
-        if deferred is not None:
-            raise deferred
         if left and not state.placed:
             reason = f" after: {failure}" if failure is not None else ""
             raise Refused(f"could not remove {', '.join(left)}{reason}") from failure
+
+
+def fetch_pinned(url, digest, dest, root=None, download=None, max_bytes=MAX_BYTES, deadline_seconds=DEADLINE_SECONDS,
+                 stop=None, outcome=None):
+    """Put url's body at dest if its SHA-256 equals digest, and raise Refused if not. An existing file at dest is
+    reused without a download only when a fresh copy of it hashes correctly; anything else there is cleared first,
+    so after argument checking, dest holds only checked content whether the call returns or raises. download fetches
+    into the scratch handle (by default the download process); stop reports a waiting stop request (by default a
+    pending stop signal). The deadline starts once the arguments pass. Malformed: a deadline other than a positive
+    finite number, a byte cap that is negative or not an integer, and an outcome record from an earlier run."""
+    check_url(url)
+    if not HEX64.fullmatch(digest or ""):
+        raise Malformed("the digest must be 64 hex digits")
+    if outcome is not None and outcome.placed:
+        raise Malformed("the outcome record is from an earlier run; each run needs a fresh one")
+    if (isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, (int, float))
+            or not math.isfinite(deadline_seconds) or deadline_seconds <= 0):
+        raise Malformed("the deadline must be a positive, finite number of seconds")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise Malformed("the byte cap must be a whole number, 0 or more")
+    state = outcome if outcome is not None else Outcome()
+    end = time.monotonic() + deadline_seconds
+    folder = None
+    try:
+        folder, name = open_destination(dest, root if root is not None else os.getcwd())
+        place(url, digest.lower(), folder, name, download if download is not None else spawned(), max_bytes, end,
+              stop if stop is not None else pending_stop, state)
+    finally:
+        if folder is not None:
+            close_quietly(folder)
+    return dest
 
 
 def shown(text):
@@ -798,10 +650,9 @@ def described(error):
 
 
 def last_resort(kind, value, trace):
-    """Handle an exception that gets past main, such as an interrupt during a report. Python's default output would
-    include chained text without escaping, so this prints a single escaped line naming only the exception type. It
-    never raises, because if it did Python would fall back to its full default output. The status is still nonzero:
-    1 in general, 130 for an interrupt."""
+    """Handle an exception that gets past main, such as one raised while a report is printed. Python's default output
+    would include chained text without escaping, so this prints a single escaped line naming only the exception type.
+    It never raises, because if it did Python would fall back to its full default output. The status is nonzero."""
     try:
         say(f"fetch-pinned: refused: {getattr(kind, '__name__', 'error')}", sys.stderr)
     except BaseException:
@@ -819,61 +670,49 @@ def refusal(error):
     return 1, f"fetch-pinned: refused: {type(error).__name__}: {described(error)}"  # an interrupt included
 
 
-def main(argv, interrupts=None):
+def main(argv, child=None, deadline_seconds=DEADLINE_SECONDS):
     """Run once and return the exit status; a report that cannot be printed never changes it, and a failure after
-    placement keeps exit 0 and is printed as one warning line. interrupts is the
-    executable's holder, kept held until the process exits. Called in process without one, main takes over
-    interrupts for the run only and puts the handler back before it returns, dropping one it held, and it sets no
-    last-resort report."""
+    placement keeps exit 0 and is printed as one warning line. child replaces the download process's command up to
+    the URL (see child_argv); the tests use it."""
     if len(argv) != 4:
         try:
             say("fetch-pinned: usage: fetch-pinned <https-url> <sha256> <destination>", sys.stderr)
         except BaseException:
             pass
         return 2
-    holder = interrupts if interrupts is not None else Interrupts()
     outcome = Outcome()
+    late = None
     try:
-        if interrupts is None:
-            holder.install()
-        late = None
-        try:
-            fetch_pinned(argv[1], argv[2], argv[3], outcome=outcome, interrupts=holder)
-        except BaseException as error:
-            late = error
-            if not outcome.placed:  # before the commit point: rolled back, so the run is refused
-                status = 1
-                try:
-                    status, line = refusal(error)
-                    say(line, sys.stderr)
-                except BaseException:
-                    pass
-                return status
-        try:  # past the commit point the file is verified and in place, so even a report that fails is exit 0
-            say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
-        except BaseException:
-            pass
-        if late is not None and not isinstance(late, KeyboardInterrupt):  # after placement: reported, not swallowed
+        fetch_pinned(argv[1], argv[2], argv[3], download=spawned(child), deadline_seconds=deadline_seconds,
+                     outcome=outcome)
+    except BaseException as error:
+        late = error
+        if not outcome.placed:  # before the commit point: rolled back, so the run is refused
+            status = 1
             try:
-                say(f"fetch-pinned: warning: {type(late).__name__}: {described(late)}", sys.stderr)
+                status, line = refusal(error)
+                say(line, sys.stderr)
             except BaseException:
                 pass
-        return 0
-    finally:
-        if interrupts is None:
-            try:
-                holder.release()
-            except Exception:
-                holder.release()
+            return status
+    try:  # past the commit point the file is verified and in place, so even a report that fails is exit 0
+        say(f"fetch-pinned: placed {argv[3]}", sys.stdout)
+    except BaseException:
+        pass
+    if late is not None:  # after placement: reported, not swallowed
+        try:
+            say(f"fetch-pinned: warning: {type(late).__name__}: {described(late)}", sys.stderr)
+        except BaseException:
+            pass
+    return 0
 
 
-def command(argv):
-    """The executable's entry, and the one place that changes process-wide state, since the process ends with the
-    run: it sets the last-resort report and holds interrupts from the commit point until the process exits."""
+def command(argv, child=None, deadline_seconds=DEADLINE_SECONDS):
+    """The executable's entry. Its first act blocks every signal that can be blocked, apart from those reporting a
+    fault in this program, so that from here to exit no handler runs; then it sets the last-resort report and runs."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals() - UNBLOCKED)
     sys.excepthook = last_resort
-    interrupts = Interrupts()
-    interrupts.install()
-    return main(argv, interrupts)
+    return main(argv, child, deadline_seconds)
 
 
 if __name__ == "__main__":
