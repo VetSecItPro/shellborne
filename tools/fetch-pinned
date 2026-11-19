@@ -80,7 +80,7 @@ import os  # already loaded while Python started, so nothing beside this file ca
 import sys
 
 # SIGKILL and SIGSTOP cannot be blocked, and the fault signals must not be: with one blocked, a genuine fault in this
-# program never ends it on macOS. Like SIGKILL, a fault signal sent from outside ends the run with no cleanup.
+# program never ends it on macOS. So a fault signal from another process acts as SIGKILL would, skipping the cleanup.
 UNBLOCKABLE_NAMES = ("SIGKILL", "SIGSTOP", "SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGTRAP", "SIGSYS", "SIGABRT")
 # Variables telling Python or the crypto library to load code from elsewhere. The restart and the download process
 # never see them; proxy and certificate settings stay, since the pin decides what is kept whoever serves it.
