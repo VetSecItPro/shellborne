@@ -249,8 +249,16 @@ def pending_stop():
     signal pending; the process ends with the run."""
     waiting = signal.sigpending() & STOPS
     if waiting:
-        return "interrupted by " + ", ".join(sorted(signal.Signals(number).name for number in waiting))
+        return "interrupted by " + ", ".join(sorted(signal_name(number) for number in waiting))
     return None
+
+
+def signal_name(number):
+    """A signal's name, or its number for one Python has no name for (a real-time signal on Linux)."""
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return f"signal {number}"
 
 
 def halt(end, stop):
@@ -438,7 +446,7 @@ def spawned(prefix=None):
         if status == REPORTED and message.strip():
             raise Refused(message.decode("utf-8", "replace").strip())
         if status < 0:
-            raise Refused(f"the download process was ended by {signal.Signals(-status).name}")
+            raise Refused(f"the download process was ended by {signal_name(-status)}")
         raise Refused(f"the download process failed with status {status}")
     return download
 
