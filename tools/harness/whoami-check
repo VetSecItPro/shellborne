@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""whoami-check: is the dedicated macOS test account present and not an administrator?
+
+Usage: whoami-check [--name-file <path>] [--dscl <path>] [--dseditgroup <path>]
+
+Destructive, soak and exhaustion suites run only under one standard macOS account, so a crash or a panic they cause
+costs that account, never the person's own. This reads the account's name from tools/harness/test-user (one line:
+a lowercase account name), looks the account up with `dscl . -read /Users/<name>` and its admin membership with
+`dseditgroup -o checkmember -m <name> admin`, and needs no password.
+
+Exit 0: the account exists and is not in the admin group. Exit 1: a named refusal (the account is missing, or it is
+an admin). Exit 2: broken (the name file is missing, unreadable or malformed, or a lookup answered in a way this
+tool does not know). The lookups' exit codes it knows: dscl 0 found, 56 not found; dseditgroup 0 member, 67 not a
+member. --dscl and --dseditgroup name stand-ins for tests; callers that guard a suite use the defaults.
+"""
+import argparse
+import pathlib
+import re
+import subprocess
+import sys
+
+NAME = re.compile(r"[a-z_][a-z0-9_]{0,30}")
+DEFAULT_NAMES = pathlib.Path(__file__).resolve().parent / "test-user"
+
+
+def say(line):
+    print(f"whoami-check: {line}", flush=True)
+
+
+def account_name(path):
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"cannot read the name file {path}: {error}") from None
+    lines = text.split("\n")
+    if len(lines) != 2 or lines[1] != "" or not NAME.fullmatch(lines[0]):
+        raise ValueError(f"the name file {path} must hold one lowercase account name and a newline")
+    return lines[0]
+
+
+def run(argv):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL).returncode
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="whoami-check")
+    parser.add_argument("--name-file", default=str(DEFAULT_NAMES))
+    parser.add_argument("--dscl", default="/usr/bin/dscl")
+    parser.add_argument("--dseditgroup", default="/usr/sbin/dseditgroup")
+    args = parser.parse_args(argv)
+    try:
+        name = account_name(pathlib.Path(args.name_file))
+    except ValueError as error:
+        say(f"broken: {error}")
+        return 2
+    try:
+        found = run([args.dscl, ".", "-read", f"/Users/{name}", "UniqueID"])
+        if found == 56:
+            say(f"refused: the test account {name} does not exist")
+            return 1
+        if found != 0:
+            say(f"broken: dscl answered {found} for {name}")
+            return 2
+        member = run([args.dseditgroup, "-o", "checkmember", "-m", name, "admin"])
+    except (OSError, subprocess.TimeoutExpired) as error:
+        say(f"broken: a lookup could not run: {error}")
+        return 2
+    if member == 0:
+        say(f"refused: the test account {name} is an admin; destructive suites need a standard account")
+        return 1
+    if member != 67:
+        say(f"broken: dseditgroup answered {member} for {name}")
+        return 2
+    say(f"{name} exists and is a standard account")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
