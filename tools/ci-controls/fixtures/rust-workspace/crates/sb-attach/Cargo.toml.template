@@ -1,0 +1,10 @@
+[package]
+name = "sb-attach"
+description = "The attach client: applies the policy filter before bytes reach a terminal (layer 2)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

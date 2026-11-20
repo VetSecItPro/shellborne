@@ -1,0 +1,10 @@
+[package]
+name = "sb-bounds"
+description = "Bounded queue, map, set, list and byte ring: every one takes a cap and an eviction rule (layer 2)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

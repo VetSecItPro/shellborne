@@ -1,8 +1,8 @@
 #!/bin/sh
 # Leak guard before every push: check every commit being pushed, its whole tree and its message.
-# Each pushed commit first goes through tools/ci-local, which proves every gate's controls and then runs the gates on
-# that commit. When git config shellborne.privateFolder is set, also run the private comparison from that folder, and
-# its local CI companion once per push.
+# Each pushed ref first goes through tools/ci-local, once, on the commit at its tip: it proves every gate's controls,
+# then runs the gates, the history gates over every commit the push adds. When git config shellborne.privateFolder
+# is set, also run the private comparison from that folder, and its local CI companion once per push.
 # Plan-Step: P0.20.5
 top=$(git rev-parse --show-toplevel) || exit 1
 guard="$top/tools/gates/leak-guard"
@@ -43,7 +43,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     fi
     # Bytes, not characters: ${#line} counts characters under a UTF-8 locale, so measure and match in the C locale.
     if [ "$(printf '%s' "$line" | LC_ALL=C wc -c)" -gt 4096 ] || ! LC_ALL=C expr "$line" : "$shape" >/dev/null; then
-        echo "leak-guard: refused: malformed ref line from git (want four fields with two full object names); nothing in this push was checked" >&2
+        echo "leak-guard: refused: malformed ref line from git (want four fields with two full object names);" \
+            "nothing in this push was checked" >&2
         exit 1
     fi
     local_ref=${line%% *}; rest=${line#* }
@@ -93,7 +94,8 @@ while IFS= read -r line || [ -n "$line" ]; do
             else
                 plan_range="$range"
             fi
-            "$private/tools/sb-plan" check --root "$private" --clone "$top" --range "$plan_range" --branch "$local_ref" || status=1
+            "$private/tools/sb-plan" check --root "$private" --clone "$top" --range "$plan_range" \
+                --branch "$local_ref" || status=1
         fi
     fi
 done <<EOF

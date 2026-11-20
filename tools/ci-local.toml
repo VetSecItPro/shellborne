@@ -24,7 +24,8 @@ args = ["{repo}"]
 
 [gates.unsafe-code]
 args = ["--rust", "{repo}"]
-copy = ["Cargo.toml", "Cargo.lock", "clippy.toml", "rust-toolchain.toml", "crates/", "apple/"]
+copy = ["clippy.toml", "rust-toolchain.toml"]
+fixture = "rust-workspace"
 timeout = 1800
 
 [gates.who-frees]
@@ -58,8 +59,8 @@ args = ["{repo}"]
 
 [gates.boundaries]
 args = ["{repo}"]
-copy = ["Cargo.toml", "Cargo.lock", "clippy.toml", "rust-toolchain.toml", "crates/", "apple/",
-        "tools/gates/allowed-deps.toml"]
+copy = ["clippy.toml", "rust-toolchain.toml", "tools/gates/allowed-deps.toml"]
+fixture = "rust-workspace"
 
 [gates.dco]
 args = ["{repo}", "{range}"]
@@ -75,3 +76,16 @@ body = true
 [gates.test-first]
 args = ["{repo}", "{range}"]
 body = true
+
+# Executables under tools/gates that ci-local does not run, each with where or when it runs instead. ci-local refuses
+# an executable there that is neither a gate above nor named here.
+[others]
+bundle-check = "checks a built app bundle; pull requests do not build one yet"
+codeql-results = "runs in the CodeQL workflow, on that workflow's own results"
+deps = "checks vendored dependencies; the gates workflow does not run it"
+entitlements = "checks a built app's entitlements; pull requests do not build one yet"
+link-check = "checks built binaries' links; pull requests do not build binaries yet"
+lipo = "checks universal binaries; pull requests do not build binaries yet"
+plan-attestation = "runs in the plan-attestation workflow"
+repo-settings = "reads the repository's settings from GitHub, with a token the gates workflow does not have"
+toolchain = "checks the pinned toolchain; the gates workflow does not run it"
