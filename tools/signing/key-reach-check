@@ -72,18 +72,22 @@ Plan-Step: P0.11.12
 Plan-Step: P0.24.1
 """
 import argparse
+import contextlib
 import errno
 import fcntl
 import hashlib
+import math
 import os
 import pathlib
 import re
+import select
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 CONTROL_PREFIX = "shellborne-keyreach-control-"
@@ -97,6 +101,7 @@ SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 FIXTURE = pathlib.Path(__file__).resolve().parent / "sign-probe-fixture.txt"
 NOT_FOUND = 44
 DEFAULT_TIMEOUT = 30.0
+MAX_TIMEOUT = 600.0  # a deadline has to be one: --timeout is finite and no longer than this
 MAX_NAMES_BYTES = 64 * 1024
 MAX_ENTRIES = 200
 MAX_FIELD = 512
@@ -120,7 +125,13 @@ class Stopped(Exception):
 
 
 def say(line):
-    print(f"key-reach-check: {line}", flush=True)
+    """Every line this tool prints, as one line of printable ASCII: anything else (a control character, a newline,
+    non-ASCII text in an identity name the keychain returned) is shown as an escape, so no name can forge a line."""
+    shown = "".join(ch if 32 <= ord(ch) < 127 and ch != "\\" else
+                    ("\\\\" if ch == "\\" else f"\\x{ord(ch):02x}" if ord(ch) < 256 else
+                     f"\\u{ord(ch):04x}" if ord(ch) < 0x10000 else f"\\U{ord(ch):08x}")
+                    for ch in str(line))
+    print(f"key-reach-check: {shown}", flush=True)
 
 
 def ignore_signals():
@@ -135,7 +146,10 @@ def stop(signum, _frame):
 
 def read_names(path):
     try:
-        with open(path, "rb") as handle:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # a pipe or a link never holds the run
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise Broken("the names list is not a regular file")
             data = handle.read(MAX_NAMES_BYTES + 1)
     except OSError as error:
         raise Broken(f"cannot read the names list: {error.strerror}") from None
@@ -185,45 +199,168 @@ def launch(argv, stdout):
         raise Broken(f"could not start {os.path.basename(argv[0])}: {error.strerror}") from None
 
 
+@contextlib.contextmanager
+def signals_held():
+    """Blocks the handled signals while a child's group is ended and the child reaped, so a stop cannot cut that
+    short; one that arrives meanwhile is delivered when the block ends."""
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
+
 def run_quiet(argv, timeout):
     """Runs argv with no input and its output discarded unread. Returns the exit status, or None on a timeout.
-    The whole process group is killed on a timeout, so nothing is left waiting at a prompt."""
-    process = launch(argv, subprocess.DEVNULL)
+    The exit is seen without reaping (leader_exited); then the process group is ended whether the probe finished or
+    ran out of time, so nothing it started outlives it, and the leader is reaped last, within a bound."""
+    held = start_held()
     try:
-        return process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None
+        process = launch(argv, subprocess.DEVNULL)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        raise
+    finished = False
+    collected = False
+    deadline = time.monotonic() + timeout
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)  # first thing inside: a stop now lands where cleanup runs
+        while True:
+            if leader_exited(process):
+                finished = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
     finally:
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                process.kill()
-            process.wait()
+        with signals_held():
+            end_group(process)
+            collected = reap_bounded(process, 5)
+    if not collected:
+        raise Broken(f"{os.path.basename(argv[0])} could not be collected after it was stopped")
+    if getattr(process, "lost", False):
+        raise Broken(f"{os.path.basename(argv[0])}'s exit status was lost (is SIGCHLD ignored?)")
+    return process.returncode if finished else None
 
 
 def run_listing(argv, timeout):
-    """Runs argv with no input and stderr discarded, reading at most MAX_INVENTORY_BYTES of stdout.
-    Returns (status, text). The status is None on a timeout or an over-cap listing."""
-    with tempfile.TemporaryFile() as out:
-        process = launch(argv, out)
-        try:
-            status = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            status = None
-        finally:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    process.kill()
-                process.wait()
-        out.seek(0)
-        data = out.read(MAX_INVENTORY_BYTES + 1)
-    if len(data) > MAX_INVENTORY_BYTES:
+    """Runs argv with no input and stderr discarded, reading its stdout from a pipe as it arrives and stopping its
+    process group once more than MAX_INVENTORY_BYTES has come, so a listing never runs on past the cap.
+    The listing's exit is seen without reaping it (leader_exited), its group is ended while it is still a zombie that
+    holds its id, and it is reaped last, so no signal can reach a reused group id; a leftover child holding the pipe
+    is ended at once. Returns (status, text). The status is None on a timeout or an over-cap listing."""
+    held = start_held()
+    try:
+        process = launch(argv, subprocess.PIPE)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        raise
+    data = bytearray()
+    over = False
+    timed_out = False
+    stopped = False
+    deadline = time.monotonic() + timeout
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)  # first thing inside: a stop now lands where cleanup runs
+        fd = process.stdout.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True  # the pipe is still open: a timeout, whatever the listing itself returned
+                break
+            if not stopped and leader_exited(process):
+                end_group(process)  # a child it left would keep the pipe open
+                stopped = True
+            ready, _, _ = select.select([fd], [], [], min(left, 0.25))
+            if not ready:
+                continue
+            chunk = os.read(fd, 64 * 1024)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_INVENTORY_BYTES:
+                over = True
+                break
+        if not (over or timed_out):
+            while not leader_exited(process):  # the pipe ended; wait for the exit itself, still without reaping
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(0.02)
+    finally:
+        with signals_held():
+            if not stopped:
+                end_group(process)  # alive or a zombie, the leader is unreaped: its group id is still its own
+            collected = reap_bounded(process, 5)  # reaped only after the last signal, and never waited on forever
+            process.stdout.close()
+    if not collected:
+        raise Broken("the identity listing could not be collected after it was stopped")
+    if getattr(process, "lost", False):
+        raise Broken("the identity listing's exit status was lost (is SIGCHLD ignored?)")
+    if over or timed_out:
         return None, ""
-    return status, data.decode("utf-8", errors="replace")
+    return process.returncode, bytes(data).decode("utf-8", errors="replace")
 
+
+def start_held():
+    """SIGCHLD back to its default (a launcher that ignores it lets the kernel reap children and free their ids),
+    then the handled signals blocked until the caller's cleanup block is in place. Returns the mask to restore."""
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    except ValueError:
+        pass  # not the main thread; leader_held still refuses to signal a group it does not hold
+    return signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+
+
+def leader_held(process):
+    """True while the process is still this one's child to collect, running or a zombie; only then are its ids
+    still its own. False once something else reaped it, and its group is then never signalled."""
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        process.lost = True
+        return False
+    return True
+
+
+def reap_bounded(process, seconds):
+    """Collects the leader once it has exited, waiting at most seconds; False when it cannot be collected, which the
+    caller turns into a broken run rather than a wait without end."""
+    end = time.monotonic() + seconds
+    while not leader_exited(process):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    if not leader_held(process):
+        return True  # something else collected it; the caller reports the lost status
+    process.wait()  # it has exited, so this returns at once
+    return True
+
+
+def end_group(process):
+    """SIGKILL to a child's process group, sent only while its leader is unreaped (alive or a zombie), so the group
+    id is still the child's own. A refusal for the group falls back to the leader alone. Signals held."""
+    with signals_held():
+        if not leader_held(process):
+            return  # something else reaped it, so its group id may already belong to someone else
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:  # macOS refuses a group whose only member is the zombie leader
+            try:
+                os.kill(process.pid, signal.SIGKILL)  # never Popen.kill, which polls and so reaps the leader
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def leader_exited(process):
+    """True once the process has exited, seen with waitid and WNOWAIT so it is not reaped and keeps its ids taken."""
+    try:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        process.lost = True  # reaped by something else: its status is gone and its group is never signalled
+        return True
 
 def parse_identities(text):
     """Reads the Matching identities section of find-identity output into (hash, name) pairs, one per hash.
@@ -284,8 +421,8 @@ class Probe:
         written until security opens --keychain as one."""
         status = self.security_status("show-keychain-info")
         if status != 0:
-            raise Broken(f"security cannot open --keychain as a keychain (exit {status}), and a write would land in the "
-                         "default keychain")
+            raise Broken(f"security cannot open --keychain as a keychain (exit {status}), and a write would land "
+                         "in the default keychain")
 
     def clear(self, service, account):
         """Remove a control a killed run left: deleted, or already absent."""
@@ -478,8 +615,10 @@ def probe_only(probe, entries):
     """--probe-only: every probe, nothing written. Returns the reachable lines."""
     try:
         os.stat(probe.keychain)
-    except OSError:
-        pass  # this account may not even look at it, which is the confined session's case
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM):  # gone, or some other fault: never read as out of reach
+            raise Broken(f"cannot look at --keychain: {error.strerror}") from None
+        # this account may not even look at it, which is the confined session's case
     else:
         probe.require_keychain()  # read-only; a file that is not a keychain would read as empty
     found = []
@@ -549,8 +688,8 @@ def run(argv):
         say("broken: usage: key-reach-check [--plant | --probe-only | --remove] --keychain <path> --names <file> "
             "--signer <path> [--timeout <seconds>]")
         return 2
-    if not args.timeout > 0:
-        say("broken: --timeout must be a positive number of seconds")
+    if not (math.isfinite(args.timeout) and 0 < args.timeout <= MAX_TIMEOUT):
+        say(f"broken: --timeout must be a number of seconds above 0 and at most {MAX_TIMEOUT:g}")
         return 2
     try:
         entries = read_names(args.names)
