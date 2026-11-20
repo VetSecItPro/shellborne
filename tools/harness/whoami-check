@@ -15,13 +15,14 @@ member. --dscl and --dseditgroup name stand-ins for tests.
 
 Without --guard this answers whether the account is ready, from any account, as setting it up needs. --guard, which
 every destructive, soak or exhaustion suite calls before it starts, also refuses (exit 1) unless the process runs as
-that account, found by its uid in the user database.
+that account: the real and the effective uid must both be that account's, found in the user database.
 """
 import argparse
 import os
 import pathlib
 import pwd
 import re
+import stat
 import subprocess
 import sys
 
@@ -33,10 +34,25 @@ def say(line):
     print(f"whoami-check: {line}", flush=True)
 
 
+MAX_NAME_FILE = 64  # the longest name NAME allows is 31 characters, plus its newline
+
+
 def account_name(path):
+    """The one account name the file holds, read as at most MAX_NAME_FILE + 1 bytes, so a file that is longer, or a
+    pipe that never ends, is refused without reading the rest."""
     try:
-        text = path.read_text()
-    except (OSError, UnicodeDecodeError) as error:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # a pipe or a link never holds the check
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ValueError(f"the name file {path} is not a regular file")
+            data = handle.read(MAX_NAME_FILE + 1)
+    except OSError as error:
+        raise ValueError(f"cannot read the name file {path}: {error.strerror}") from None
+    if len(data) > MAX_NAME_FILE:
+        raise ValueError(f"the name file {path} is longer than any account name")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
         raise ValueError(f"cannot read the name file {path}: {error}") from None
     lines = text.split("\n")
     if len(lines) != 2 or lines[1] != "" or not NAME.fullmatch(lines[0]):
@@ -45,7 +61,9 @@ def account_name(path):
 
 
 def run(argv):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL).returncode
+    """The exit status of a lookup; only the status is read, so its output goes to /dev/null."""
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=30).returncode
 
 
 def main(argv):
@@ -81,11 +99,16 @@ def main(argv):
     if args.guard:
         try:
             current = pwd.getpwuid(os.getuid()).pw_name
+            wanted = pwd.getpwnam(name).pw_uid
         except KeyError:
-            say("broken: this process's uid has no entry in the user database")
+            say("broken: this process's uid, or the test account, has no entry in the user database")
             return 2
         if current != name:
             say(f"refused: this runs as {current}, not the test account {name}")
+            return 1
+        if os.geteuid() != wanted:
+            say(f"refused: the effective uid {os.geteuid()} is not the test account's {wanted}; "
+                "elevated runs are refused")
             return 1
         say(f"{name} exists, is a standard account, and is the account running this")
         return 0
