@@ -11,6 +11,7 @@ never key material:
     [[item]]      a Keychain generic password, looked up by service and account only
     [[eddsa]]     an EdDSA key account, probed by a signing attempt
     [[path]]      a named key path, checked with access(R_OK) and lstat, never opened
+    [[identity]]  a codesigning identity to try by its 40-character SHA-1 hash, whatever its name
 
 Lookups run /usr/bin/security against the --keychain path, never with -w, -g, -X, -p, an export
 verb or dump-keychain, and keep only the exit status: 0 reachable, 44 unreachable, anything else
@@ -20,8 +21,11 @@ unreachable only when the control signed, and anything else (another code, a sig
 prompt that waits) is broken.
 
 Codesigning identities in --keychain are listed with `security find-identity -p codesigning <keychain>`,
-without -v, because codesign still signs with an identity that list would hide as untrusted. Each listed
-identity makes a real codesign attempt, with /usr/bin/codesign, on a copy of the fixture in a temp folder:
+without -v, because codesign still signs with an identity that list would hide as untrusted. Three kinds get a
+real codesign attempt: the control, anything named "Developer ID Application:" or "Developer ID Installer:" (the
+identities that sign builds other people run, so leaving one out of --names never hides it), and anything --names
+lists. A development identity, say, gets a "skipped identity" line and is never counted. Each attempt runs
+/usr/bin/codesign on a copy of the fixture in a temp folder:
 `codesign --keychain <keychain> -s <hash> -f <copy>`, its output discarded unread. An identity whose name
 starts with shellborne-keyreach-control- is the control, set up once by the owner in --keychain, and must
 sign, or the run is broken; any other identity that signs is reachable. This tool never creates, imports or
@@ -101,7 +105,10 @@ MAX_IDENTITIES = 200
 IDENTITY_LINE = re.compile(r'^\s*\d+\) ([0-9A-F]{40}) "(.*)"(?: \(.*\))?$')
 COUNT_LINE = re.compile(r"^\s*(\d+) identities found$")
 CERTIFICATE_HASH_LINE = re.compile(r"^SHA-1 hash: ([0-9A-F]{40})$")
-FIELDS = {"item": ("service", "account"), "eddsa": ("account",), "path": ("path",)}
+FIELDS = {"item": ("service", "account"), "eddsa": ("account",), "path": ("path",), "identity": ("hash",)}
+HASH = re.compile(r"[0-9A-Fa-f]{40}")
+# Identities that can sign a build other people run: always tried, listed or not.
+RELEASE_PREFIXES = ("Developer ID Application:", "Developer ID Installer:")
 
 
 class Broken(Exception):
@@ -156,7 +163,10 @@ def read_names(path):
                     raise Broken(f"[[{kind}]] {field} must be a non-empty string under {MAX_FIELD} characters")
                 if value.startswith(CONTROL_PREFIX):
                     raise Broken(f"[[{kind}]] {field} uses the control prefix")
-            entries[kind].append(tuple(entry[field] for field in fields))
+                if kind == "identity" and not HASH.fullmatch(value):
+                    raise Broken("[[identity]] hash must be the identity's 40-character SHA-1 hash")
+            entries[kind].append(tuple(entry[field].upper() if kind == "identity" else entry[field]
+                                       for field in fields))
     total = sum(len(listed) for listed in entries.values())
     if total == 0:
         raise Broken("the names list is empty, so nothing would be probed")
@@ -261,6 +271,7 @@ class Probe:
         self.codesign = codesign
         self.timeout = timeout
         self.planted = []
+        self.skipped = []
 
     def security_status(self, *args):
         status = run_quiet([self.security, *args, self.keychain], self.timeout)
@@ -379,13 +390,26 @@ def path_reachable(path):
     return os.access(path, os.R_OK)
 
 
-def check_identities(probe):
+def tried(probe, identities, listed_hashes):
+    """The identities worth a signing attempt: every release identity and every listed one. The rest are noted on
+    the probe's skipped lines and never count as reachable."""
+    chosen = []
+    for digest, name in identities:
+        if name.startswith(RELEASE_PREFIXES) or digest in listed_hashes:
+            chosen.append((digest, name))
+        else:
+            probe.skipped.append(f"skipped identity {digest} {name} (not a release identity and not listed)")
+    return chosen
+
+
+def check_identities(probe, listed_hashes=frozenset()):
     """Returns the reachable identity lines. Raises Broken when the codesign probe cannot be trusted."""
     listed = probe.identities()
     if probe.control_certificates() - {digest for digest, _name in listed}:
         raise Broken("a control certificate is in the keychain without a usable private key")
     controls = [(digest, name) for digest, name in listed if name.startswith(CONTROL_PREFIX)]
-    others = [(digest, name) for digest, name in listed if not name.startswith(CONTROL_PREFIX)]
+    others = tried(probe, [(digest, name) for digest, name in listed if not name.startswith(CONTROL_PREFIX)],
+                   listed_hashes)
     if not controls:
         raise Broken(f"no {CONTROL_PREFIX} identity is listed, so the codesign probe is blind; the owner sets up "
                      "the control identity once in this keychain")
@@ -417,7 +441,7 @@ def check(args, probe, entries):
         raise Broken("the control item read as unreachable, so the lookup is blind")
     if not probe.signs(control_eddsa):
         raise Broken("the control EdDSA account did not sign, so the signing probe is blind")
-    found = check_identities(probe)
+    found = check_identities(probe, {digest for (digest,) in entries["identity"]})
     for service, account in entries["item"]:
         if probe.item_reachable(service, account):
             found.append(f"reachable item service {service} account {account}")
@@ -452,12 +476,22 @@ def remove(probe):
 
 def probe_only(probe, entries):
     """--probe-only: every probe, nothing written. Returns the reachable lines."""
+    try:
+        os.stat(probe.keychain)
+    except OSError:
+        pass  # this account may not even look at it, which is the confined session's case
+    else:
+        probe.require_keychain()  # read-only; a file that is not a keychain would read as empty
     found = []
     if probe.item_reachable(CONTROL_ITEM, CONTROL_ITEM):
         found.append(f"reachable item service {CONTROL_ITEM} account {CONTROL_ITEM}")
     if probe.signs(CONTROL_EDDSA):
         found.append(f"reachable eddsa account {CONTROL_EDDSA}")
-    for digest, name in probe.identities():
+    listed_hashes = {digest for (digest,) in entries["identity"]}
+    identities = probe.identities()
+    chosen = [(d, n) for d, n in identities if n.startswith(CONTROL_PREFIX)]
+    chosen += tried(probe, [(d, n) for d, n in identities if not n.startswith(CONTROL_PREFIX)], listed_hashes)
+    for digest, name in chosen:
         status = probe.codesigns(digest)
         if status == 0:
             found.append(f"reachable identity {digest} {name}")
@@ -550,6 +584,7 @@ def run(argv):
     previous = {number: signal.getsignal(number) for number in SIGNALS}  # all noted before any is changed
     problems = []
     found = []
+    planted_and_proven = False
     held = None  # the launcher's mask, given back at the very end
     try:
         # Held while the handlers change, so none reaches a handler not yet replaced. Then unblocked for the run even
@@ -561,7 +596,7 @@ def run(argv):
         signal.pthread_sigmask(signal.SIG_SETMASK, set(held).difference(SIGNALS))
         if args.mode == "plant":
             plant(probe)
-            probe.planted = []  # proven reachable: they stay for the session's probe, and --remove takes them
+            planted_and_proven = True
         elif args.mode == "remove":
             remove(probe)
         elif args.mode == "probe-only":
@@ -580,6 +615,8 @@ def run(argv):
         except Stopped as error:  # it landed before the line above took effect; stop ignored all three first
             problems.append(str(error))
             ignore_signals()
+        if planted_and_proven and not problems:
+            probe.planted = []  # proven, and nothing went wrong after: they stay for the session's probe
         problems += probe.remove_planted()
         # Every previous handler comes back under a block, then the launcher's mask in one call, so no handled signal
         # meets a half-restored table, and one the launcher had blocked keeps waiting for the launcher.
@@ -592,6 +629,8 @@ def run(argv):
         for problem in problems:
             say(f"broken: {problem}")
         return 2
+    for line in probe.skipped:
+        say(line)
     for line in found:
         say(line)
     return 1 if found else 0
