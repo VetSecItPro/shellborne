@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """whoami-check: is the dedicated macOS test account present and not an administrator?
 
-Usage: whoami-check [--name-file <path>] [--dscl <path>] [--dseditgroup <path>]
+Usage: whoami-check [--guard] [--name-file <path>] [--dscl <path>] [--dseditgroup <path>]
 
 Destructive, soak and exhaustion suites run only under one standard macOS account, so a crash or a panic they cause
 costs that account, never the person's own. This reads the account's name from tools/harness/test-user (one line:
@@ -11,10 +11,16 @@ a lowercase account name), looks the account up with `dscl . -read /Users/<name>
 Exit 0: the account exists and is not in the admin group. Exit 1: a named refusal (the account is missing, or it is
 an admin). Exit 2: broken (the name file is missing, unreadable or malformed, or a lookup answered in a way this
 tool does not know). The lookups' exit codes it knows: dscl 0 found, 56 not found; dseditgroup 0 member, 67 not a
-member. --dscl and --dseditgroup name stand-ins for tests; callers that guard a suite use the defaults.
+member. --dscl and --dseditgroup name stand-ins for tests.
+
+Without --guard this answers whether the account is ready, from any account, as setting it up needs. --guard, which
+every destructive, soak or exhaustion suite calls before it starts, also refuses (exit 1) unless the process runs as
+that account, found by its uid in the user database.
 """
 import argparse
+import os
 import pathlib
+import pwd
 import re
 import subprocess
 import sys
@@ -44,6 +50,7 @@ def run(argv):
 
 def main(argv):
     parser = argparse.ArgumentParser(prog="whoami-check")
+    parser.add_argument("--guard", action="store_true")
     parser.add_argument("--name-file", default=str(DEFAULT_NAMES))
     parser.add_argument("--dscl", default="/usr/bin/dscl")
     parser.add_argument("--dseditgroup", default="/usr/sbin/dseditgroup")
@@ -71,6 +78,17 @@ def main(argv):
     if member != 67:
         say(f"broken: dseditgroup answered {member} for {name}")
         return 2
+    if args.guard:
+        try:
+            current = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            say("broken: this process's uid has no entry in the user database")
+            return 2
+        if current != name:
+            say(f"refused: this runs as {current}, not the test account {name}")
+            return 1
+        say(f"{name} exists, is a standard account, and is the account running this")
+        return 0
     say(f"{name} exists and is a standard account")
     return 0
 
