@@ -1,0 +1,1 @@
+deny-calls: refused analytics-package: crates/extra/Cargo.toml:7

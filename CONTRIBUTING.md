@@ -11,8 +11,10 @@ Thank you for your interest in Shellborne.
 ## Checks on your machine
 
 Run `tools/install-hooks` once after cloning. From then on, every push runs `tools/ci-local` on each commit
-you send. It starts by feeding every gate one input it must accept and one it must reject, and only when all of
-them answer correctly does it run the gates on your commit, the same gates the pull request checks run.
+you send. It starts by feeding every gate an input it must accept and at least one it must reject, each with the
+message the gate should give, and only when all of them answer correctly does it run the gates on your commit. Three
+gates read the pull request's own description, so a push lists them as NOT RUN; they run once the pull request is
+open. The last line of every run counts what passed, failed, broke and did not run.
 
 You can run it at any time with `tools/ci-local`. If it stops before judging your commit, one of the gates no
 longer tells good input from bad; please open an issue rather than working around it.

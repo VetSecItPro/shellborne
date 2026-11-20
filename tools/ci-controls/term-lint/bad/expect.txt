@@ -1,0 +1,1 @@
+term-lint: refused schedule-term: docs/intel-support-policy.md:3

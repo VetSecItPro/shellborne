@@ -11,17 +11,29 @@ push sends. Nothing is written to this repository.
 Steps, in order, and the run stops at the first step that does not hold:
 
 1. Coverage. Every gate that .github/workflows/gates.yml calls, by path or through its `for pair in` list, needs an
-   entry in tools/ci-local.toml; every entry needs an executable in tools/gates and two folders, one named good and
-   one named bad, under tools/ci-controls/<gate>. A gate that reads a pull request body also needs pr-body.md in each.
+   entry in tools/ci-local.toml; every entry needs an executable in tools/gates and, under tools/ci-controls/<gate>,
+   a folder named good and one or more named bad or bad-<label>. Each bad folder holds expect.txt, the message
+   that gate gives for that particular input, so a gate that fails some other way is not counted as refusing. A
+   gate that reads a pull request body also needs pr-body.md in each folder.
+   The workflow text is read whole: wherever it says tools/gates, that spot has to be a gate path, a table file
+   (.toml, .txt or .json), or "tools/gates/$name" inside a `for pair in` loop this reader understood. A spot that is
+   none of these stops the run, because a gate called that way would get no controls.
 2. Controls. Each folder becomes a throwaway repository: an empty first commit, then the folder's files in a second
-   commit whose message is commit-message.txt if present (that file and pr-body.md are not committed). A file named
+   commit whose message is commit-message.txt if present (that file, pr-body.md and expect.txt are not committed). A
+   file named
    <name>.template is written as <name> with {{}} removed and each {{U+XXXX}} turned into that character, so the
    stored copy of a bad case never matches what the gates look for in this repository. The gate runs
-   on it with the range first..second and, for a body gate, PR_BODY set from pr-body.md. good must exit 0 and bad must
-   exit 1. Anything else (another status, no exit within the entry's timeout) prints why on stderr, and the run ends
-   with status 2 before any gate looks at this repository.
+   on it with the range first..second and, for a body gate, PR_BODY set from pr-body.md. good must exit 0; each bad
+   folder must exit 1 and print its expect.txt text, since a crash exits 1 too. Output holding a Python traceback is a
+   crash in either case. Anything else (another status, no exit within the entry's timeout, more than 4 MiB on either
+   stream) prints why on stderr, and the run ends with status 2 before any gate looks at this repository.
 3. This repository. Each gate runs once, with the range <base>..HEAD (default base origin/main; --base none means
-   no commit is published yet, so the range is HEAD and all of its history), and prints PASS, FAIL or BROKEN. A body gate is printed as NOT RUN unless --body names the text to use.
+   no commit is published yet, so the range is HEAD and all of its history), and prints PASS, FAIL or BROKEN. A body
+   gate is NOT RUN unless --body names the text to use, and a gate that takes the range is NOT RUN when the range
+   holds no commit. The last line counts them: "summary: P passed, F failed, B broken, N not run".
+
+A gate starts a new session, and when it returns, times out, overflows its output or ci-local is stopped, every
+process still in that session's group gets SIGTERM and then SIGKILL; nothing a gate left behind keeps running.
 
 Every gate gets a reduced environment: PATH, HOME, the Rust homes if set, a fresh TMPDIR, no git config, and PR_BODY
 for body gates. Nothing else the caller has set reaches it.
@@ -35,7 +47,8 @@ Manifest entries:
 
 Locally a gate reads the tables in this tree; the gates workflow alone judges with the base commit's tables.
 
-Exit 0 all passed, 1 a gate failed on this repository, 2 broken or refused.
+Exit 0: every gate that ran passed; the NOT RUN lines and the summary say what did not run. 1: a gate failed on this
+repository. 2: broken or refused.
 """
 import os
 import pathlib
@@ -45,6 +58,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 WORKFLOW = pathlib.Path(".github/workflows/gates.yml")
@@ -62,6 +76,14 @@ TEMPLATE = ".template"
 PLACEHOLDER = re.compile(r"\{\{(.*?)\}\}")
 CODE_POINT = re.compile(r"U\+([0-9A-F]{4,6})")
 BODY = "pr-body.md"
+EXPECT = "expect.txt"
+BAD_FOLDER = re.compile(r"bad(-[a-z0-9][a-z0-9-]*)?")
+OUTPUT_CAP = 4 * 1024 * 1024
+TRACEBACK = b"Traceback (most recent call last)"
+MENTION = re.compile(r"tools/gates")
+TABLE_MENTION = re.compile(r"tools/gates/[a-z0-9][a-z0-9-]*\.(?:toml|txt|json)(?![A-Za-z0-9._-])")
+LOOP_VARIABLE = re.compile(r"tools/gates/\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_{])")
+DONE = re.compile(r"\bdone\b")
 IDENTITY = {"GIT_AUTHOR_NAME": "ci-local", "GIT_AUTHOR_EMAIL": "ci-local@example.invalid",
             "GIT_COMMITTER_NAME": "ci-local", "GIT_COMMITTER_EMAIL": "ci-local@example.invalid"}
 
@@ -95,6 +117,24 @@ def called_gates(text):
                 raise Broken(f"cannot read the gate name {name!r} in the workflow's `for pair in` list")
             names.add(name)
     return names
+
+
+def unaccounted_mentions(text):
+    """Every mention of tools/gates the coverage reader cannot account for, as (line number, line)."""
+    loops = []
+    for found in LOOP.finditer(text):
+        end = DONE.search(text, found.end())
+        loops.append((found.start(), end.end() if end else len(text)))
+    odd = []
+    for mention in MENTION.finditer(text):
+        at = mention.start()
+        if CALLED.match(text, at) or TABLE_MENTION.match(text, at):
+            continue
+        if LOOP_VARIABLE.match(text, at) and any(start <= at < end for start, end in loops):
+            continue
+        number = text.count("\n", 0, at) + 1
+        odd.append((number, text.splitlines()[number - 1].strip()))
+    return odd
 
 
 def load_manifest(repo):
@@ -136,6 +176,11 @@ def check_coverage(repo, entries):
         workflow = (repo / WORKFLOW).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
         raise Broken(f"cannot read {WORKFLOW}: {error}") from None
+    odd = unaccounted_mentions(workflow)
+    if odd:
+        number, line = odd[0]
+        raise Broken(f"{WORKFLOW} line {number} mentions tools/gates in a form ci-local cannot account for, so a "
+                     f"gate there could escape its controls: {line[:200]}")
     for name in sorted(called_gates(workflow)):
         if name not in entries:
             raise Broken(f"the gates workflow runs {name}, which {MANIFEST} does not list")
@@ -145,12 +190,29 @@ def check_coverage(repo, entries):
         gate = repo / GATES / name
         if not gate.is_file() or not os.access(gate, os.X_OK):
             raise Broken(f"{MANIFEST} lists {name}, which is not an executable in {GATES}")
-        for kind in ("good", "bad"):
+        entry["kinds"] = control_kinds(repo, name)
+        for kind in entry["kinds"]:
             folder = repo / CONTROLS / name / kind
-            if not folder.is_dir() or folder.is_symlink():
-                raise Broken(f"{name} has no {kind} control")
             if entry["body"] and not (folder / BODY).is_file():
                 raise Broken(f"{name} reads a pull request body, and its {kind} control has no {BODY}")
+            if kind != "good":
+                expected = folder / EXPECT
+                if expected.is_symlink() or not expected.is_file() or not expected.read_text(encoding="utf-8").strip():
+                    raise Broken(f"{name}/{kind} has no {EXPECT} naming the text the gate prints when it refuses")
+
+
+def control_kinds(repo, name):
+    """good first, then every bad and bad-<label> folder; good and bad must exist."""
+    root = repo / CONTROLS / name
+    for kind in ("good", "bad"):
+        folder = root / kind
+        if not folder.is_dir() or folder.is_symlink():
+            raise Broken(f"{name} has no {kind} control")
+    bad = sorted(path.name for path in root.iterdir() if path.is_dir() and BAD_FOLDER.fullmatch(path.name))
+    for path in root.iterdir():
+        if path.is_symlink() and BAD_FOLDER.fullmatch(path.name):
+            raise Broken(f"{name}/{path.name} is a symbolic link, not a control folder")
+    return ["good", *bad]
 
 
 def copied_files(repo, name, copy, tracked):
@@ -183,28 +245,50 @@ def gate_env(tmp, body=None):
 
 
 def run_gate(gate, args, cwd, env, timeout):
-    """The gate's exit status, or None when it did not finish in time (its whole process group is then stopped)."""
-    process = subprocess.Popen([str(gate), *args], cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    try:
-        output, errors = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        stop_group(process)
-        return None, b"", b""
-    return process.returncode, output, errors
+    """(status, stdout, stderr, why). status is None when the gate did not finish in time or wrote past the cap; why
+    then says which. The gate's whole process group is stopped on every way out, an interrupt of ci-local included,
+    so nothing it started outlives it."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        process = subprocess.Popen([str(gate), *args], cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                                   stdout=out, stderr=err, start_new_session=True)
+        why = None
+        try:
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if os.fstat(out.fileno()).st_size > OUTPUT_CAP or os.fstat(err.fileno()).st_size > OUTPUT_CAP:
+                    why = f"wrote more than {OUTPUT_CAP // (1024 * 1024)} MiB of output"
+                    break
+                if time.monotonic() > deadline:
+                    why = f"did not finish within {timeout} seconds"
+                    break
+                time.sleep(0.05)
+        finally:
+            stop_group(process)
+        if why is None and (os.fstat(out.fileno()).st_size > OUTPUT_CAP or os.fstat(err.fileno()).st_size > OUTPUT_CAP):
+            why = f"wrote more than {OUTPUT_CAP // (1024 * 1024)} MiB of output"
+        out.seek(0)
+        err.seek(0)
+        output, errors = out.read(OUTPUT_CAP), err.read(OUTPUT_CAP)
+    return (None if why else process.returncode), output, errors, why
 
 
 def stop_group(process):
-    for number, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+    """Stop the gate's process group: what is still running in it gets SIGTERM, then SIGKILL, and the gate is reaped.
+    Run after every gate, since a gate that exits can leave children in its group."""
+    for number in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, number)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             break
         try:
-            process.communicate(timeout=wait)
-            return
+            process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             continue
+        time.sleep(0.05)  # let the group's other members take the signal before the next is sent
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def build_control(folder, target, env, repo, copy):
@@ -228,6 +312,8 @@ def build_control(folder, target, env, repo, copy):
             message = path.read_text(encoding="utf-8")
         elif rel.as_posix() == BODY:
             body = path.read_text(encoding="utf-8")
+        elif rel.as_posix() == EXPECT:
+            continue
         elif rel.name.endswith(TEMPLATE) and len(rel.name) > len(TEMPLATE):
             out = target / rel.with_name(rel.name[:-len(TEMPLATE)])
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -262,42 +348,64 @@ def expand(args, repo, commit_range):
 def run_controls(repo, entries, tmp):
     problems, count = [], 0
     for name, entry in entries.items():
-        for kind, wanted in (("good", 0), ("bad", 1)):
+        for kind in entry["kinds"]:
+            wanted = 0 if kind == "good" else 1
+            folder = repo / CONTROLS / name / kind
             work = tmp / "controls" / name / kind
             env = dict(gate_env(tmp), **IDENTITY)
-            commit_range, body = build_control(repo / CONTROLS / name / kind, work / "repo", env, repo, entry["files"])
-            status, output, errors = run_gate(repo / GATES / name, expand(entry["args"], work / "repo", commit_range),
-                                              work / "repo", gate_env(tmp, body if entry["body"] else None),
-                                              entry["timeout"])
+            commit_range, body = build_control(folder, work / "repo", env, repo, entry["files"])
+            status, output, errors, why = run_gate(repo / GATES / name,
+                                                   expand(entry["args"], work / "repo", commit_range), work / "repo",
+                                                   gate_env(tmp, body if entry["body"] else None), entry["timeout"])
             count += 1
-            if status is None:
-                problems.append((f"control {name}/{kind} did not finish within {entry['timeout']} seconds", b""))
+            said = errors or output
+            if why:
+                problems.append((f"control {name}/{kind} {why}", b""))
+            elif TRACEBACK in output or TRACEBACK in errors:
+                problems.append((f"control {name}/{kind} crashed (a Python traceback), which is never a verdict", said))
             elif status != wanted:
-                problems.append((f"control {name}/{kind} exited {status}, wanted {wanted}", errors or output))
+                problems.append((f"control {name}/{kind} exited {status}, wanted {wanted}", said))
+            elif kind != "good":
+                expected = (folder / EXPECT).read_text(encoding="utf-8").strip()
+                if expected.encode("utf-8") not in output + errors:
+                    problems.append((f"control {name}/{kind} refused without printing what {EXPECT} names: "
+                                     f"{expected[:200]}", said))
     return problems, count
 
 
 def run_tree(repo, entries, commit_range, body, tmp):
-    worst = 0
+    worst, counts = 0, {"passed": 0, "failed": 0, "broken": 0, "not run": 0}
+    commits = int(git(["rev-list", "--count", commit_range], repo, gate_env(tmp)).strip() or 0)
     for name, entry in entries.items():
         if entry["body"] and body is None:
             say(f"NOT RUN {name} (no pull request body)")
+            counts["not run"] += 1
             continue
-        status, output, errors = run_gate(repo / GATES / name, expand(entry["args"], repo, commit_range), repo,
-                                          gate_env(tmp, body if entry["body"] else None), entry["timeout"])
-        if status == 0:
+        if commits == 0 and any("{range}" in arg for arg in entry["args"]):
+            say(f"NOT RUN {name} (no commit in the range)")
+            counts["not run"] += 1
+            continue
+        status, output, errors, why = run_gate(repo / GATES / name, expand(entry["args"], repo, commit_range), repo,
+                                               gate_env(tmp, body if entry["body"] else None), entry["timeout"])
+        crashed = TRACEBACK in output or TRACEBACK in errors
+        if status == 0 and not crashed:
             say(f"PASS {name}")
+            counts["passed"] += 1
             continue
         detail = errors.decode("utf-8", "replace").strip() or output.decode("utf-8", "replace").strip()
-        if status == 1:
+        if status == 1 and not crashed:
             say(f"FAIL {name}")
+            counts["failed"] += 1
             worst = max(worst, 1)
         else:
-            why = f"no exit within {entry['timeout']} seconds" if status is None else f"exit {status}"
-            say(f"BROKEN {name} ({why})")
+            reason = why or ("a Python traceback" if crashed else f"exit {status}")
+            say(f"BROKEN {name} ({reason})")
+            counts["broken"] += 1
             worst = 2
         for line in detail.splitlines()[:20]:
             say(f"    {line}")
+    say(f"summary: {counts['passed']} passed, {counts['failed']} failed, {counts['broken']} broken, "
+        f"{counts['not run']} not run")
     return worst
 
 
@@ -370,10 +478,19 @@ def main(argv):
     except Broken as error:
         complain(f"ci-local: broken: {error}")
         return 2
+    except KeyboardInterrupt:
+        complain("ci-local: broken: interrupted; every gate it started was stopped, and nothing was judged")
+        return 2
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
         complain(f"ci-local: broken: {type(error).__name__}: {error}")
         return 2
 
 
+def interrupted(_number, _frame):
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, interrupted)  # so a stop runs the same cleanup as Ctrl-C
     sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,6 @@
+//! Redaction of terminal text before anything reaches a log, report or counter (layer 2).
+
+/// A known-bad case for the clippy half of the unsafe-code gate: unwrap is denied.
+pub fn control_unwrap(value: Option<u8>) -> u8 {
+    value.unwrap()
+}

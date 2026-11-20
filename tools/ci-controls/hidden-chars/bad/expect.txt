@@ -1,0 +1,1 @@
+hidden-chars: refused hidden-character: note.md:1
