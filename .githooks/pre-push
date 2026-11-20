@@ -14,8 +14,36 @@ if [ -n "$private" ] && [ ! -x "$private/tools/gates/leak-guard-private" ]; then
     exit 1
 fi
 remote_name="$1"
+# Git writes one line per pushed ref: local ref, local name, remote ref, remote name, single spaces, names in full.
+case $(git -C "$top" rev-parse --show-object-format 2>/dev/null) in
+    sha1) hex='[0-9a-f]\{40\}' ;;
+    sha256) hex='[0-9a-f]\{64\}' ;;
+    *) echo "leak-guard: broken: cannot read this repository's object format" >&2; exit 1 ;;
+esac
+shape="[^[:space:]][^[:space:]]* $hex [^[:space:]][^[:space:]]* $hex\$"
+# Every buffer has a cap: the whole ref list is read through 1 MiB, and one ref line may hold at most 4 KiB.
+refs=$(head -c 1048577; printf x)
+refs=${refs%x}
+if [ "$(printf '%s' "$refs" | wc -c)" -gt 1048576 ]; then
+    echo "leak-guard: refused: the ref list from git is over 1 MiB; nothing in this push was checked" >&2
+    exit 1
+fi
 status=0
-while read -r local_ref local_sha remote_ref remote_sha; do
+while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+        continue  # names no ref: a chainer that re-emits git's input adds one newline to an empty list
+    fi
+    # Bytes, not characters: ${#line} counts characters under a UTF-8 locale, so measure and match in the C locale.
+    if [ "$(printf '%s' "$line" | LC_ALL=C wc -c)" -gt 4096 ] || ! LC_ALL=C expr "$line" : "$shape" >/dev/null; then
+        echo "leak-guard: refused: malformed ref line from git (want four fields with two full object names); nothing in this push was checked" >&2
+        exit 1
+    fi
+    local_ref=${line%% *}; rest=${line#* }
+    local_sha=${rest%% *}; rest=${rest#* }
+    rest=${rest#* }; remote_sha=${rest#* }  # the remote ref name is not needed
+    if [ "$local_sha" = "$remote_sha" ]; then
+        continue  # the remote already holds this commit: nothing new to check
+    fi
     if expr "$local_sha" : '0*$' >/dev/null; then
         continue  # deleting a remote branch pushes no content
     fi
@@ -49,5 +77,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             "$private/tools/sb-plan" check --root "$private" --clone "$top" --range "$plan_range" --branch "$local_ref" || status=1
         fi
     fi
-done
+done <<EOF
+$refs
+EOF
 exit $status

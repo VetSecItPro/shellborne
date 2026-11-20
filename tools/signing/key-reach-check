@@ -466,9 +466,15 @@ def run(argv):
     previous = {number: signal.getsignal(number) for number in SIGNALS}  # all noted before any is changed
     problems = []
     found = []
+    held = None  # the launcher's mask, given back at the very end
     try:
+        # Held while the handlers change, so none reaches a handler not yet replaced. Then unblocked for the run even
+        # if the launcher had blocked one, so a pending signal meets stop instead of waiting out the check.
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
         for number in SIGNALS:
             signal.signal(number, stop)
+        # Only once every handler is in place; if one failed, the signals stay blocked until the cleanup.
+        signal.pthread_sigmask(signal.SIG_SETMASK, set(held).difference(SIGNALS))
         found = check(args, probe, entries)
     except (Broken, Stopped) as error:
         problems.append(str(error))
@@ -483,9 +489,13 @@ def run(argv):
             problems.append(str(error))
             ignore_signals()
         problems += probe.remove_planted()
+        # Every previous handler comes back under a block, then the launcher's mask in one call, so no handled signal
+        # meets a half-restored table, and one the launcher had blocked keeps waiting for the launcher.
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
         for number, handler in previous.items():
             if handler is not None:  # one set outside Python cannot be put back from Python; the run is ending
                 signal.signal(number, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, held if held is not None else before)
     if problems:
         for problem in problems:
             say(f"broken: {problem}")
