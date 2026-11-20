@@ -1,0 +1,379 @@
+#!/usr/bin/env -S python3 -I
+"""ci-local: run the repository's gates on this Mac, after showing that each one still tells good input from bad.
+
+Usage:
+    tools/ci-local [--base <ref>] [--body <file>] [--controls-only] [--commit <rev>]
+
+With --commit the run judges that commit, not the working tree: it is checked out in a throwaway clone that shares
+this repository's objects, and the manifest, controls and gates are read from it, so what is judged is exactly what a
+push sends. Nothing is written to this repository.
+
+Steps, in order, and the run stops at the first step that does not hold:
+
+1. Coverage. Every gate that .github/workflows/gates.yml calls, by path or through its `for pair in` list, needs an
+   entry in tools/ci-local.toml; every entry needs an executable in tools/gates and two folders, one named good and
+   one named bad, under tools/ci-controls/<gate>. A gate that reads a pull request body also needs pr-body.md in each.
+2. Controls. Each folder becomes a throwaway repository: an empty first commit, then the folder's files in a second
+   commit whose message is commit-message.txt if present (that file and pr-body.md are not committed). A file named
+   <name>.template is written as <name> with {{}} removed and each {{U+XXXX}} turned into that character, so the
+   stored copy of a bad case never matches what the gates look for in this repository. The gate runs
+   on it with the range first..second and, for a body gate, PR_BODY set from pr-body.md. good must exit 0 and bad must
+   exit 1. Anything else (another status, no exit within the entry's timeout) prints why on stderr, and the run ends
+   with status 2 before any gate looks at this repository.
+3. This repository. Each gate runs once, with the range <base>..HEAD (default base origin/main; --base none means
+   no commit is published yet, so the range is HEAD and all of its history), and prints PASS, FAIL or BROKEN. A body gate is printed as NOT RUN unless --body names the text to use.
+
+Every gate gets a reduced environment: PATH, HOME, the Rust homes if set, a fresh TMPDIR, no git config, and PR_BODY
+for body gates. Nothing else the caller has set reaches it.
+
+Manifest entries:
+    [gates.<name>]
+    args = ["{repo}", "{range}"]   # {repo} is the repository path, {range} the commit range
+    body = true                    # optional: the gate reads PR_BODY
+    timeout = 600                  # optional: seconds per run
+    copy = ["LICENSE", "crates/"]  # optional: tracked files (a folder: all under it) put in both controls first
+
+Locally a gate reads the tables in this tree; the gates workflow alone judges with the base commit's tables.
+
+Exit 0 all passed, 1 a gate failed on this repository, 2 broken or refused.
+"""
+import os
+import pathlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+WORKFLOW = pathlib.Path(".github/workflows/gates.yml")
+MANIFEST = pathlib.Path("tools/ci-local.toml")
+CONTROLS = pathlib.Path("tools/ci-controls")
+GATES = pathlib.Path("tools/gates")
+KEYS = {"args", "body", "timeout", "copy"}
+PLACEHOLDERS = {"{repo}", "{range}"}
+DEFAULT_TIMEOUT = 600
+NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+CALLED = re.compile(r"tools/gates/([a-z0-9][a-z0-9-]*)(?![A-Za-z0-9._-])")
+LOOP = re.compile(r"\bfor\s+pair\s+in\s+([^;\n]*);")
+MESSAGE = "commit-message.txt"
+TEMPLATE = ".template"
+PLACEHOLDER = re.compile(r"\{\{(.*?)\}\}")
+CODE_POINT = re.compile(r"U\+([0-9A-F]{4,6})")
+BODY = "pr-body.md"
+IDENTITY = {"GIT_AUTHOR_NAME": "ci-local", "GIT_AUTHOR_EMAIL": "ci-local@example.invalid",
+            "GIT_COMMITTER_NAME": "ci-local", "GIT_COMMITTER_EMAIL": "ci-local@example.invalid"}
+
+
+class Broken(Exception):
+    pass
+
+
+def say(text):
+    print(text, flush=True)
+
+
+def complain(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def git(args, cwd, env, timeout=120):
+    done = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, env=env, timeout=timeout)
+    if done.returncode != 0:
+        raise Broken(f"git {' '.join(args[:2])} failed: {done.stderr.strip()[:300]}")
+    return done.stdout
+
+
+def called_gates(text):
+    """The gate names the workflow runs: each tools/gates/<name> path and each name in a `for pair in` list."""
+    names = set(CALLED.findall(text))
+    for listing in LOOP.findall(text):
+        for pair in listing.split():
+            name = pair.split(":", 1)[0]
+            if not NAME.fullmatch(name):
+                raise Broken(f"cannot read the gate name {name!r} in the workflow's `for pair in` list")
+            names.add(name)
+    return names
+
+
+def load_manifest(repo):
+    try:
+        data = tomllib.loads((repo / MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise Broken(f"cannot read {MANIFEST}: {error}") from None
+    if set(data) != {"gates"} or not isinstance(data["gates"], dict):
+        raise Broken(f"{MANIFEST} must hold one [gates] table and nothing else")
+    entries = {}
+    for name, entry in data["gates"].items():
+        if not NAME.fullmatch(name) or not isinstance(entry, dict):
+            raise Broken(f"{MANIFEST} has a malformed entry {name!r}")
+        extra = set(entry) - KEYS
+        if extra:
+            raise Broken(f"{MANIFEST} entry {name} has unknown keys: {', '.join(sorted(extra))}")
+        args = entry.get("args")
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise Broken(f"{MANIFEST} entry {name} needs args, a list of strings")
+        for arg in args:
+            for token in re.findall(r"\{[^}]*\}", arg):
+                if token not in PLACEHOLDERS:
+                    raise Broken(f"{MANIFEST} entry {name} uses {token}; only {{repo}} and {{range}} exist")
+        body = entry.get("body", False)
+        timeout = entry.get("timeout", DEFAULT_TIMEOUT)
+        if not isinstance(body, bool):
+            raise Broken(f"{MANIFEST} entry {name}: body must be true or false")
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 3600:
+            raise Broken(f"{MANIFEST} entry {name}: timeout must be whole seconds from 1 to 3600")
+        copy = entry.get("copy", [])
+        if not isinstance(copy, list) or not all(isinstance(c, str) and c for c in copy):
+            raise Broken(f"{MANIFEST} entry {name}: copy must be a list of paths")
+        entries[name] = {"args": args, "body": body, "timeout": timeout, "copy": copy}
+    return entries
+
+
+def check_coverage(repo, entries):
+    try:
+        workflow = (repo / WORKFLOW).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise Broken(f"cannot read {WORKFLOW}: {error}") from None
+    for name in sorted(called_gates(workflow)):
+        if name not in entries:
+            raise Broken(f"the gates workflow runs {name}, which {MANIFEST} does not list")
+    tracked = set(git(["ls-files", "-z"], repo, gate_env(repo)).split("\0")) - {""}
+    for name, entry in entries.items():
+        entry["files"] = copied_files(repo, name, entry["copy"], tracked)
+        gate = repo / GATES / name
+        if not gate.is_file() or not os.access(gate, os.X_OK):
+            raise Broken(f"{MANIFEST} lists {name}, which is not an executable in {GATES}")
+        for kind in ("good", "bad"):
+            folder = repo / CONTROLS / name / kind
+            if not folder.is_dir() or folder.is_symlink():
+                raise Broken(f"{name} has no {kind} control")
+            if entry["body"] and not (folder / BODY).is_file():
+                raise Broken(f"{name} reads a pull request body, and its {kind} control has no {BODY}")
+
+
+def copied_files(repo, name, copy, tracked):
+    """The tracked regular files a copy list names: a path as given, or every tracked file under a path ending in /."""
+    files = []
+    for rel in copy:
+        if rel.endswith("/"):
+            under = sorted(path for path in tracked if path.startswith(rel))
+            if not under or rel.startswith("/") or ".." in rel.split("/"):
+                raise Broken(f"{MANIFEST} entry {name} copies {rel}, a folder holding no tracked file here")
+        else:
+            under = [rel]
+        for path in under:
+            source = repo / path
+            if path not in tracked or source.is_symlink() or not source.is_file():
+                raise Broken(f"{MANIFEST} entry {name} copies {path}, which is not a tracked regular file here")
+            files.append(path)
+    return files
+
+
+def gate_env(tmp, body=None):
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", str(tmp)),
+           "TMPDIR": str(tmp), "LANG": "en_US.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    for name in ("RUSTUP_HOME", "CARGO_HOME"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    if body is not None:
+        env["PR_BODY"] = body
+    return env
+
+
+def run_gate(gate, args, cwd, env, timeout):
+    """The gate's exit status, or None when it did not finish in time (its whole process group is then stopped)."""
+    process = subprocess.Popen([str(gate), *args], cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        output, errors = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_group(process)
+        return None, b"", b""
+    return process.returncode, output, errors
+
+
+def stop_group(process):
+    for number, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(process.pid, number)
+        except ProcessLookupError:
+            break
+        try:
+            process.communicate(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def build_control(folder, target, env, repo, copy):
+    """A two-commit repository from a control folder, on top of the listed tracked files of this repository; returns
+    the range and the body text, if any."""
+    target.mkdir(parents=True)
+    git(["init", "-q", "-b", "main"], target, env)
+    git(["commit", "-q", "--allow-empty", "-m", "Control base"], target, env)
+    first = git(["rev-parse", "HEAD"], target, env).strip()
+    for rel in copy:
+        (target / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo / rel, target / rel)
+    message, body = "Control fixture\n", None
+    for path in sorted(folder.rglob("*")):
+        rel = path.relative_to(folder)
+        if path.is_symlink():
+            raise Broken(f"control {folder} holds a symbolic link, {rel}")
+        if path.is_dir():
+            continue
+        if rel.as_posix() == MESSAGE:
+            message = path.read_text(encoding="utf-8")
+        elif rel.as_posix() == BODY:
+            body = path.read_text(encoding="utf-8")
+        elif rel.name.endswith(TEMPLATE) and len(rel.name) > len(TEMPLATE):
+            out = target / rel.with_name(rel.name[:-len(TEMPLATE)])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(expand_template(path, rel), encoding="utf-8")
+        else:
+            (target / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target / rel)
+    git(["add", "-A"], target, env)
+    git(["commit", "-q", "--allow-empty", "-m", message], target, env)
+    return f"{first}..HEAD", body
+
+
+def expand_template(path, rel):
+    """The fixture text with {{}} removed and each {{U+XXXX}} replaced by that character; any other {{...}} is an
+    error, so a typo cannot quietly leave a control that tests nothing."""
+    def one(match):
+        inner = match.group(1)
+        if inner == "":
+            return ""
+        point = CODE_POINT.fullmatch(inner)
+        if point and int(point.group(1), 16) <= 0x10FFFF and not 0xD800 <= int(point.group(1), 16) <= 0xDFFF:
+            return chr(int(point.group(1), 16))
+        raise Broken(f"control template {rel.as_posix()} has the placeholder {{{{{inner}}}}}; "
+                     "only {{}} and {{U+XXXX}} exist")
+    return PLACEHOLDER.sub(one, path.read_text(encoding="utf-8"))
+
+
+def expand(args, repo, commit_range):
+    return [arg.replace("{repo}", str(repo)).replace("{range}", commit_range) for arg in args]
+
+
+def run_controls(repo, entries, tmp):
+    problems, count = [], 0
+    for name, entry in entries.items():
+        for kind, wanted in (("good", 0), ("bad", 1)):
+            work = tmp / "controls" / name / kind
+            env = dict(gate_env(tmp), **IDENTITY)
+            commit_range, body = build_control(repo / CONTROLS / name / kind, work / "repo", env, repo, entry["files"])
+            status, output, errors = run_gate(repo / GATES / name, expand(entry["args"], work / "repo", commit_range),
+                                              work / "repo", gate_env(tmp, body if entry["body"] else None),
+                                              entry["timeout"])
+            count += 1
+            if status is None:
+                problems.append((f"control {name}/{kind} did not finish within {entry['timeout']} seconds", b""))
+            elif status != wanted:
+                problems.append((f"control {name}/{kind} exited {status}, wanted {wanted}", errors or output))
+    return problems, count
+
+
+def run_tree(repo, entries, commit_range, body, tmp):
+    worst = 0
+    for name, entry in entries.items():
+        if entry["body"] and body is None:
+            say(f"NOT RUN {name} (no pull request body)")
+            continue
+        status, output, errors = run_gate(repo / GATES / name, expand(entry["args"], repo, commit_range), repo,
+                                          gate_env(tmp, body if entry["body"] else None), entry["timeout"])
+        if status == 0:
+            say(f"PASS {name}")
+            continue
+        detail = errors.decode("utf-8", "replace").strip() or output.decode("utf-8", "replace").strip()
+        if status == 1:
+            say(f"FAIL {name}")
+            worst = max(worst, 1)
+        else:
+            why = f"no exit within {entry['timeout']} seconds" if status is None else f"exit {status}"
+            say(f"BROKEN {name} ({why})")
+            worst = 2
+        for line in detail.splitlines()[:20]:
+            say(f"    {line}")
+    return worst
+
+
+def judged_clone(caller, revision, tmp):
+    """A throwaway clone sharing the caller's objects, checked out at the commit the revision names, so the gates
+    read exactly that commit; nothing is written to the caller's repository."""
+    env = gate_env(tmp)
+    found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"], cwd=str(caller),
+                           capture_output=True, text=True, env=env, timeout=60)
+    if found.returncode != 0 or not found.stdout.strip():
+        raise Broken(f"--commit {revision} names no commit in this repository")
+    sha = found.stdout.strip()
+    target = tmp / "judged"
+    git(["clone", "--quiet", "--shared", "--no-checkout", str(caller), str(target)], tmp, env, timeout=300)
+    git(["checkout", "--quiet", "--detach", sha], target, env, timeout=300)
+    return target
+
+
+def parse(argv):
+    options = {"base": "origin/main", "body": None, "controls_only": False, "commit": None}
+    items = list(argv)
+    while items:
+        item = items.pop(0)
+        if item == "--controls-only":
+            options["controls_only"] = True
+        elif item in ("--base", "--body", "--commit") and items:
+            options[item[2:]] = items.pop(0)
+        else:
+            raise Broken(f"unexpected argument {item!r}; see the usage at the top of tools/ci-local")
+    return options
+
+
+def main(argv):
+    try:
+        options = parse(argv)
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=60)
+        if top.returncode != 0:
+            raise Broken("run it inside the repository")
+        caller = pathlib.Path(top.stdout.strip())
+        body = None
+        if options["body"] is not None:
+            try:
+                body = pathlib.Path(options["body"]).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as error:
+                raise Broken(f"cannot read the pull request body: {error}") from None
+        with tempfile.TemporaryDirectory(prefix="ci-local-") as scratch:
+            tmp = pathlib.Path(scratch)
+            repo = caller if options["commit"] is None else judged_clone(caller, options["commit"], tmp)
+            entries = load_manifest(repo)
+            check_coverage(repo, entries)
+            problems, count = run_controls(repo, entries, tmp)
+            if problems:
+                for problem, said in problems:
+                    complain(f"ci-local: refused: {problem}")
+                    for line in said.decode("utf-8", "replace").strip().splitlines()[:10]:
+                        complain(f"    {line[:300]}")
+                complain("ci-local: refused: a gate whose controls misbehave proves nothing, so this repository was "
+                         "not checked")
+                return 2
+            say(f"controls: {count} of {count} behaved")
+            if options["controls_only"]:
+                return 0
+            if options["base"] == "none":  # nothing is published yet: every commit up to the judged one is new
+                commit_range = git(["rev-parse", "--verify", "HEAD^{commit}"], repo, gate_env(tmp)).strip()
+            else:
+                base = git(["rev-parse", "--verify", "--quiet", f"{options['base']}^{{commit}}"], caller,
+                           gate_env(tmp)).strip()
+                commit_range = f"{base}..HEAD"
+            return run_tree(repo, entries, commit_range, body, tmp)
+    except Broken as error:
+        complain(f"ci-local: broken: {error}")
+        return 2
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+        complain(f"ci-local: broken: {type(error).__name__}: {error}")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

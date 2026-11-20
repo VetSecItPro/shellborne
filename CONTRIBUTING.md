@@ -8,6 +8,15 @@ Thank you for your interest in Shellborne.
 - Keep each pull request to one change.
 - Include tests for any change in behavior. A test should fail without your change and pass with it.
 
+## Checks on your machine
+
+Run `tools/install-hooks` once after cloning. From then on, every push runs `tools/ci-local` on each commit
+you send. It starts by feeding every gate one input it must accept and one it must reject, and only when all of
+them answer correctly does it run the gates on your commit, the same gates the pull request checks run.
+
+You can run it at any time with `tools/ci-local`. If it stops before judging your commit, one of the gates no
+longer tells good input from bad; please open an issue rather than working around it.
+
 ## Sign-off (Developer Certificate of Origin)
 
 Every commit must be signed off under the Developer Certificate of Origin

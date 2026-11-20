@@ -1,6 +1,8 @@
 #!/bin/sh
 # Leak guard before every push: check every commit being pushed, its whole tree and its message.
-# When git config shellborne.privateFolder is set, also run the private comparison from that folder.
+# Each pushed commit first goes through tools/ci-local, which proves every gate's controls and then runs the gates on
+# that commit. When git config shellborne.privateFolder is set, also run the private comparison from that folder, and
+# its local CI companion once per push.
 # Plan-Step: P0.20.5
 top=$(git rev-parse --show-toplevel) || exit 1
 guard="$top/tools/gates/leak-guard"
@@ -34,6 +36,7 @@ if [ "$(printf '%s' "$refs" | wc -c)" -gt 1048576 ]; then
     exit 1
 fi
 status=0
+checked=0
 while IFS= read -r line || [ -n "$line" ]; do
     if [ -z "$line" ]; then
         continue  # names no ref: a chainer that re-emits git's input adds one newline to an empty list
@@ -65,6 +68,17 @@ while IFS= read -r line || [ -n "$line" ]; do
         range="$remote_sha..$local_sha"
         private_range="$range"
     fi
+    checked=1
+    if [ ! -x "$top/tools/ci-local" ]; then
+        echo "leak-guard: refused: tools/ci-local is missing" >&2
+        exit 1
+    fi
+    if [ -n "$base" ]; then
+        ci_base="$base"
+    else
+        ci_base=none  # nothing this commit builds on is published, so all of its history is new
+    fi
+    "$top/tools/ci-local" --commit "$local_sha" --base "$ci_base" || status=1
     "$guard" commits "$top" "$range" || status=1
     "$top/tools/gates/secrets" commits "$top" "$range" || status=1
     if [ -n "$private" ]; then
@@ -85,4 +99,11 @@ while IFS= read -r line || [ -n "$line" ]; do
 done <<EOF
 $refs
 EOF
+if [ "$checked" = 1 ] && [ -n "$private" ]; then
+    if [ ! -x "$private/tools/ci-local-private" ]; then
+        echo "leak-guard: refused: shellborne.privateFolder is set but ci-local-private is missing" >&2
+        exit 1
+    fi
+    "$private/tools/ci-local-private" --root "$private" || status=1
+fi
 exit $status
