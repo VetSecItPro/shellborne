@@ -2,7 +2,8 @@
 """key-reach-check: show the builder account cannot read or sign with the release keys.
 
 Usage:
-    key-reach-check --keychain <path> --names <file> --signer <path> [--timeout <seconds>]
+    key-reach-check [--plant | --probe-only | --remove] --keychain <path> --names <file> --signer <path>
+                    [--timeout <seconds>]
 
 Run on this Mac from the builder account, never in CI. --names is a TOML list of what to probe, and
 never key material:
@@ -48,7 +49,23 @@ PATH cannot answer for them. The only stand-in is the module constants SECURITY 
 after loading this file as a module; no environment variable or argument moves them. A named key path whose
 folder the account cannot search (lstat fails with EACCES or EPERM) is unreachable. Once the first signal or the
 end of the probes is reached, SIGINT, SIGTERM and SIGHUP are ignored until every planted control is removed.
+
+Inside a session that is denied the keychain, the default run can only ever say broken: its own controls are out
+of reach there too. Three modes split the run for that case (P0.24.1); give at most one.
+  --plant       outside the session. Checks --keychain opens, clears anything an interrupted run left, adds the
+                two control items, confirms both answer, and exits 0 with them still there. If either stays silent
+                it takes them out again and exits 2.
+  --probe-only  inside the session, and outside it for comparison. Adds, deletes and locks nothing. It tries the
+                two control items, each name in --names and each codesigning identity in --keychain, the control
+                identity among them, and prints one line per success. Exit 0 when nothing answered, 1 when
+                anything did, 2 broken. A silent control is a finding here, not a fault, because the comparison
+                run outside must report both controls and the control identity. A --keychain this account is not
+                even allowed to stat is treated as out of reach; one that does not exist is broken.
+  --remove      outside the session. Checks --keychain opens, then deletes both control items; one already gone
+                counts as deleted.
+--plant and --remove take the same per-keychain lock and handle signals the same way as the default run.
 Plan-Step: P0.11.12
+Plan-Step: P0.24.1
 """
 import argparse
 import errno
@@ -59,6 +76,7 @@ import pathlib
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -412,6 +430,64 @@ def check(args, probe, entries):
     return found
 
 
+def plant(probe):
+    """--plant: the two controls, planted and proven reachable. Raises Broken when either reads as unreachable."""
+    probe.require_keychain()
+    for service in (CONTROL_ITEM, CONTROL_EDDSA):
+        probe.clear(service, service)  # what a killed run left, before this run plants its own
+    probe.plant(CONTROL_ITEM, CONTROL_ITEM)
+    probe.plant(CONTROL_EDDSA, CONTROL_EDDSA)
+    if not probe.item_reachable(CONTROL_ITEM, CONTROL_ITEM):
+        raise Broken("the planted control item read as unreachable, so the lookup is blind")
+    if not probe.signs(CONTROL_EDDSA):
+        raise Broken("the planted control EdDSA account did not sign, so the signing probe is blind")
+
+
+def remove(probe):
+    """--remove: both controls deleted; absent counts as removed."""
+    probe.require_keychain()
+    for service in (CONTROL_ITEM, CONTROL_EDDSA):
+        probe.clear(service, service)
+
+
+def probe_only(probe, entries):
+    """--probe-only: every probe, nothing written. Returns the reachable lines."""
+    found = []
+    if probe.item_reachable(CONTROL_ITEM, CONTROL_ITEM):
+        found.append(f"reachable item service {CONTROL_ITEM} account {CONTROL_ITEM}")
+    if probe.signs(CONTROL_EDDSA):
+        found.append(f"reachable eddsa account {CONTROL_EDDSA}")
+    for digest, name in probe.identities():
+        status = probe.codesigns(digest)
+        if status == 0:
+            found.append(f"reachable identity {digest} {name}")
+        elif status != 1:
+            raise Broken(f"codesign exited {status} for identity {digest}, neither signed nor refused")
+    for service, account in entries["item"]:
+        if probe.item_reachable(service, account):
+            found.append(f"reachable item service {service} account {account}")
+    for (account,) in entries["eddsa"]:
+        if probe.signs(account):
+            found.append(f"reachable eddsa account {account}")
+    for (path,) in entries["path"]:
+        if path_reachable(path):
+            found.append(f"reachable path {path}")
+    return found
+
+
+def keychain_present(keychain, mode):
+    """Whether --keychain may be used. The default run and the writing modes need a file. --probe-only also takes
+    one this account may not look at, since inside a confined session the keychain itself is what is out of reach;
+    a path that does not exist is broken in every mode, or a typo would read as unreachable."""
+    try:
+        details = os.stat(keychain)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        return mode == "probe-only" and error.errno in (errno.EACCES, errno.EPERM)
+    return stat.S_ISREG(details.st_mode)
+
+
 def main(argv):
     try:
         return run(argv)
@@ -429,10 +505,15 @@ def run(argv):
     parser.add_argument("--names", required=True)
     parser.add_argument("--signer", required=True)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--plant", dest="mode", action="store_const", const="plant")
+    modes.add_argument("--probe-only", dest="mode", action="store_const", const="probe-only")
+    modes.add_argument("--remove", dest="mode", action="store_const", const="remove")
     try:
         args = parser.parse_args(argv)
     except SystemExit:
-        say("broken: usage: key-reach-check --keychain <path> --names <file> --signer <path> [--timeout <seconds>]")
+        say("broken: usage: key-reach-check [--plant | --probe-only | --remove] --keychain <path> --names <file> "
+            "--signer <path> [--timeout <seconds>]")
         return 2
     if not args.timeout > 0:
         say("broken: --timeout must be a positive number of seconds")
@@ -451,17 +532,20 @@ def run(argv):
     if not os.access(CODESIGN, os.X_OK):
         say("broken: /usr/bin/codesign is not an executable file")
         return 2
-    if not os.path.isfile(args.keychain):
+    if not keychain_present(args.keychain, args.mode):
         say("broken: the --keychain path is not a file, and security would list it as empty")
         return 2
     if not FIXTURE.is_file():
         say("broken: the signing fixture is missing")
         return 2
-    try:
-        lock = hold_keychain(args.keychain)
-    except OSError:
-        say("broken: another key-reach-check run holds this keychain, and the fixed control names cannot be shared")
-        return 2
+    lock = None  # --probe-only writes nothing, so it takes no lock and leaves no lock file
+    if args.mode != "probe-only":
+        try:
+            lock = hold_keychain(args.keychain)
+        except OSError:
+            say("broken: another key-reach-check run holds this keychain, and the fixed control names cannot be "
+                "shared")
+            return 2
     probe = Probe(SECURITY, args.keychain, args.signer, CODESIGN, args.timeout)
     previous = {number: signal.getsignal(number) for number in SIGNALS}  # all noted before any is changed
     problems = []
@@ -475,7 +559,15 @@ def run(argv):
             signal.signal(number, stop)
         # Only once every handler is in place; if one failed, the signals stay blocked until the cleanup.
         signal.pthread_sigmask(signal.SIG_SETMASK, set(held).difference(SIGNALS))
-        found = check(args, probe, entries)
+        if args.mode == "plant":
+            plant(probe)
+            probe.planted = []  # proven reachable: they stay for the session's probe, and --remove takes them
+        elif args.mode == "remove":
+            remove(probe)
+        elif args.mode == "probe-only":
+            found = probe_only(probe, entries)
+        else:
+            found = check(args, probe, entries)
     except (Broken, Stopped) as error:
         problems.append(str(error))
     except OSError as error:
