@@ -605,8 +605,10 @@ def plant(probe):
 
 
 def remove(probe):
-    """--remove: both controls deleted; absent counts as removed."""
+    """--remove: both controls deleted; absent counts as removed. Both are owed to the cleanup before the first
+    delete, so a stop between the two still leaves neither behind."""
     probe.require_keychain()
+    probe.planted = [(service, service) for service in (CONTROL_ITEM, CONTROL_EDDSA)]
     for service in (CONTROL_ITEM, CONTROL_EDDSA):
         probe.clear(service, service)
 

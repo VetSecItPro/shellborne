@@ -22,7 +22,8 @@ Steps, in order, and the run stops at the first step that does not hold:
    string is no comment), must be a manifest gate or an [others] entry whose runs_in is that workflow. Every
    executable in tools/gates is a manifest gate or an [others] entry, and an [others] entry either names the
    workflow that runs it, which must name the gate on a line outside a comment, or says not_run with a reason, so no
-   gate is left run by nothing. Local actions under .github/actions are not read; there are none today.
+   gate is left run by nothing. ci-local does not read local actions, so a tracked one (anything under
+   .github/actions, or any action.yml or action.yaml) stops the run until it does.
 2. Controls. Each folder becomes a throwaway repository: an empty first commit, then the folder's files in a second
    commit whose message is commit-message.txt if present (that file, pr-body.md and expect.txt are not committed). A
    file named
@@ -402,6 +403,11 @@ def check_coverage(repo, entries):
     tracked = set(tracked_paths(repo).split("\0")) - {""}
     if len(tracked) > MAX_TRACKED:
         raise Broken(f"the repository has {len(tracked)} tracked paths, more than the {MAX_TRACKED} ci-local will list")
+    actions = sorted(p for p in tracked if p.startswith(".github/actions/")
+                     or pathlib.PurePosixPath(p).name in ("action.yml", "action.yaml"))
+    if actions:
+        raise Broken(f"{actions[0][:200]} is a local action, which ci-local does not read, so a gate it runs would go "
+                     "uncounted")
     workflows = tracked_workflows(repo, tracked)
     if WORKFLOW.as_posix() not in workflows:
         raise Broken(f"{WORKFLOW} is not a tracked file")
