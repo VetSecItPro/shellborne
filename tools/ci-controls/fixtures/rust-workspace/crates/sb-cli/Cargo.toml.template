@@ -1,0 +1,10 @@
+[package]
+name = "sb-cli"
+description = "The shellborne command-line tool (layer 2)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

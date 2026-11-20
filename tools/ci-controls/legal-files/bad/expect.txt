@@ -1,0 +1,1 @@
+legal-files: LICENSE: is not the canonical Apache License 2.0 text

@@ -1,0 +1,815 @@
+#!/usr/bin/env -S python3 -I
+"""ci-local: run the repository's gates on this Mac, after showing that each one still tells good input from bad.
+
+Usage:
+    tools/ci-local [--base <ref>] [--body <file>] [--controls-only] [--commit <rev>]
+
+With --commit the run judges that commit, not the working tree: it is checked out in a throwaway clone that shares
+this repository's objects, and the manifest, controls and gates are read from it, so what is judged is exactly what a
+push sends. Nothing is written to this repository.
+
+Steps, in order, and the run stops at the first step that does not hold:
+
+1. Coverage. Every gate that .github/workflows/gates.yml calls, by path or through its `for pair in` list, needs an
+   entry in tools/ci-local.toml; every entry needs an executable in tools/gates and, under tools/ci-controls/<gate>,
+   a folder named good and one or more named bad or bad-<label>. Each bad folder holds expect.txt, the message
+   that gate gives for that particular input, so a gate that fails some other way is not counted as refusing. A
+   gate that reads a pull request body also needs pr-body.md in each folder.
+   The workflow text is read whole: wherever it says tools/gates, that spot has to be a gate path, a table file
+   (.toml, .txt or .json), or "tools/gates/$name" inside a `for pair in` loop this reader understood. A spot that is
+   none of these stops the run, because a gate called that way would get no controls.
+2. Controls. Each folder becomes a throwaway repository: an empty first commit, then the folder's files in a second
+   commit whose message is commit-message.txt if present (that file, pr-body.md and expect.txt are not committed). A
+   file named
+   <name>.template is written as <name> with {{}} removed and each {{U+XXXX}} turned into that character, so the
+   stored copy of a bad case never matches what the gates look for in this repository. The gate runs
+   on it with the range first..second and, for a body gate, PR_BODY set from pr-body.md. good must exit 0; each bad
+   folder must exit 1 and print its expect.txt text, since a crash exits 1 too. Output holding a Python traceback is a
+   crash in either case. Anything else (another status, no exit within the entry's timeout, more than 4 MiB on either
+   stream) prints why on stderr, and the run ends with status 2 before any gate looks at this repository.
+3. This repository. Each gate runs once, with the range <base>..HEAD (default base origin/main; --base none means
+   no commit is published yet, so the range is HEAD and all of its history), and prints PASS, FAIL or BROKEN. A body
+   gate is NOT RUN unless --body names the text to use, and a gate that takes the range is NOT RUN when the range
+   holds no commit. The last line counts them: "summary: P passed, F failed, B broken, N not run".
+
+A gate starts a new session, and when it returns, times out, overflows its output or ci-local is stopped, every
+process still in that session's group gets SIGTERM and then SIGKILL. That reaches only the group: a child that calls
+setsid on its own walks out of it. Gates are code from the commit under test and run as you, so this tool limits
+what they leave lying around by accident; it does not contain them.
+
+Every gate gets a reduced environment: a PATH of one fresh folder, holding links to the caller's own python3, git
+and Rust tools as the caller's PATH finds them, then the system folders; its own fresh HOME, CARGO_HOME and TMPDIR
+for each invocation; RUSTUP_HOME for the installed toolchains; no global or system git config; and PR_BODY for body
+gates. Nothing else the caller has set reaches it, so a Cargo config on this Mac changes no result. One thing does:
+a run on the working tree is a run inside this repository, so its own .git/config applies to the gates' git commands
+as it does to any git command here; --commit judges a fresh clone, which has none of it. Stopping a gate's group and
+reaping it run with SIGINT, SIGTERM and SIGHUP held, only the first stop counts, a stop that arrives while a gate is
+being started waits until its cleanup is in place, no group is signalled once its leader is gone, and a gate that
+cannot be collected makes the run broken.
+
+Manifest entries:
+    [gates.<name>]
+    args = ["{repo}", "{range}"]   # {repo} is the repository path, {range} the commit range
+    body = true                    # optional: the gate reads PR_BODY
+    timeout = 600                  # optional: seconds per run
+    copy = ["LICENSE", "crates/"]  # optional: tracked files (a folder: all under it) put in both controls first
+    fixture = "rust-workspace"     # optional: a fixed tree under tools/ci-controls/fixtures laid down first, so a
+                                   # control never depends on the product it is about to judge; its files, like a
+                                   # control's, may end in .template to stay out of the gates' view of this repo
+
+Locally a gate reads the tables in this tree; the gates workflow alone judges with the base commit's tables.
+
+Exit 0: every gate that ran passed; the NOT RUN lines and the summary say what did not run. 1: a gate failed on this
+repository. 2: broken or refused.
+"""
+import contextlib
+import os
+import pathlib
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+
+WORKFLOW = pathlib.Path(".github/workflows/gates.yml")
+MANIFEST = pathlib.Path("tools/ci-local.toml")
+CONTROLS = pathlib.Path("tools/ci-controls")
+FIXTURES = CONTROLS / "fixtures"
+GATES = pathlib.Path("tools/gates")
+KEYS = {"args", "body", "timeout", "copy", "fixture"}
+PLACEHOLDERS = {"{repo}", "{range}"}
+DEFAULT_TIMEOUT = 600
+NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+CALLED = re.compile(r"tools/gates/([a-z0-9][a-z0-9-]*)(?![A-Za-z0-9._-])")
+LOOP = re.compile(r"\bfor\s+pair\s+in\s+([^;\n]*);")
+MESSAGE = "commit-message.txt"
+TEMPLATE = ".template"
+PLACEHOLDER = re.compile(r"\{\{(.*?)\}\}")
+CODE_POINT = re.compile(r"U\+([0-9A-F]{4,6})")
+BODY = "pr-body.md"
+EXPECT = "expect.txt"
+BAD_FOLDER = re.compile(r"bad(-[a-z0-9][a-z0-9-]*)?")
+OUTPUT_CAP = 4 * 1024 * 1024
+TRACEBACK = b"Traceback (most recent call last)"
+MENTION = re.compile(r"tools/gates")
+PIECE = re.compile(r"gates/")
+TABLE_MENTION = re.compile(r"tools/gates/[a-z0-9][a-z0-9-]*\.(?:toml|txt|json)(?![A-Za-z0-9._-])")
+LOOP_VARIABLE = re.compile(r"tools/gates/\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_{])")
+DONE = re.compile(r"\bdone\b")
+MAX_MANIFEST = 256 * 1024
+MAX_WORKFLOW = 1024 * 1024
+MAX_TRACKED = 20000
+MAX_TRACKED_BYTES = 16 * 1024 * 1024
+MAX_BODY = 256 * 1024
+GIT_OUTPUT_CAP = 1024 * 1024
+CHUNK = 64 * 1024
+MAX_CONTROL_FILES = 500
+MAX_CONTROL_BYTES = 8 * 1024 * 1024
+IDENTITY = {"GIT_AUTHOR_NAME": "ci-local", "GIT_AUTHOR_EMAIL": "ci-local@example.invalid",
+            "GIT_COMMITTER_NAME": "ci-local", "GIT_COMMITTER_EMAIL": "ci-local@example.invalid"}
+
+
+class Broken(Exception):
+    pass
+
+
+def say(text):
+    print(text, flush=True)
+
+
+def complain(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def git(args, cwd, env, timeout=120, cap=GIT_OUTPUT_CAP):
+    status, output, errors, why = run_bounded(["git", *args], cwd, env, timeout, cap)
+    if why:
+        raise Broken(f"git {' '.join(args[:2])} {why}")
+    if status != 0:
+        raise Broken(f"git {' '.join(args[:2])} failed: {errors.decode('utf-8', 'replace').strip()[:300]}")
+    return output.decode("utf-8", "surrogateescape")
+
+
+def run_bounded(argv, cwd, env, timeout, cap):
+    """(status, stdout, stderr, why) for argv, run with no input in a session of its own. Both pipes are read as data
+    arrives and counted; once either passes cap bytes, or the deadline passes, the process group is stopped and status
+    is None, with why saying which. When the process itself exits its group is stopped too, and the pipes are read to
+    their end, so a child it left in the group cannot hold the run open; one that moved to a session of its own and
+    keeps a pipe open runs the clock out instead. Pipes that end first are not the end: a process that closed its
+    output is waited for until the deadline. Nothing goes to a file and nothing is read whole: every subprocess
+    ci-local reads from runs here."""
+    keep_child_status()
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)  # no stop between the start and the cleanup block below
+    try:
+        process = subprocess.Popen([str(part) for part in argv], cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        raise
+    out_fd, err_fd = process.stdout.fileno(), process.stderr.fileno()
+    taken = {out_fd: bytearray(), err_fd: bytearray()}
+    why = None
+    stopped = False
+    collected = False
+    deadline = time.monotonic() + timeout
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)  # first thing inside: a stop now lands where cleanup runs
+        with selectors.DefaultSelector() as watch:
+            for stream in (process.stdout, process.stderr):
+                watch.register(stream.fileno(), selectors.EVENT_READ)
+            while watch.get_map() and why is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    why = f"did not finish within {timeout} seconds"
+                    break
+                if not stopped and leader_exited(process):
+                    stop_group(process)  # what it left in its group would hold the pipes; the leader is not reaped yet
+                    stopped = True
+                for key, _events in watch.select(timeout=min(left, 0.25)):
+                    data = os.read(key.fd, CHUNK)
+                    if not data:
+                        watch.unregister(key.fd)
+                        continue
+                    taken[key.fd] += data
+                    if len(taken[key.fd]) > cap:
+                        why = f"wrote more than {cap // (1024 * 1024)} MiB of output"
+                        break
+        if why is None and not wait_exit(process, deadline - time.monotonic()):  # pipes ended; it may still work
+            why = f"did not finish within {timeout} seconds"
+    finally:
+        with stops_held():  # a stop arriving now waits until the gate's group is gone and its leader reaped
+            if not stopped:
+                stop_group(process)
+            collected = reap(process)  # only now: every signal above went to a group whose leader still held its id
+            process.stdout.close()
+            process.stderr.close()
+    if not collected:
+        raise Broken(f"{os.path.basename(str(argv[0]))} could not be collected after its group was stopped")
+    if process.returncode is None or not leader_was_held(process):
+        raise Broken(f"{os.path.basename(str(argv[0]))}'s exit status was lost (is SIGCHLD ignored?)")
+    return (None if why else process.returncode), bytes(taken[out_fd][:cap]), bytes(taken[err_fd][:cap]), why
+
+
+def called_gates(text):
+    """The gate names the workflow runs: each tools/gates/<name> path and each name in a `for pair in` list."""
+    names = set(CALLED.findall(text))
+    for listing in LOOP.findall(text):
+        for pair in listing.split():
+            name = pair.split(":", 1)[0]
+            if not NAME.fullmatch(name):
+                raise Broken(f"cannot read the gate name {name!r} in the workflow's `for pair in` list")
+            names.add(name)
+    return names
+
+
+def read_capped(path, cap, what):
+    """The file's text, refused when it holds more than cap bytes, so nothing a commit carries is read unbounded."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # a pipe or device never holds the run
+    except OSError as error:
+        raise Broken(f"cannot read {what}: {error.strerror}") from None
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise Broken(f"{what} is not a regular file")
+        data = handle.read(cap + 1)
+    if len(data) > cap:
+        raise Broken(f"{what} is over {cap // 1024} KiB, more than ci-local will read")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Broken(f"{what} is not UTF-8 text") from None
+
+
+def tracked_paths(repo):
+    """git ls-files -z, read as it arrives and stopped past MAX_TRACKED_BYTES, so a longer listing is refused before
+    it is all written anywhere."""
+    status, output, _errors, why = run_bounded(["git", "ls-files", "-z"], repo, git_env(repo), 120, MAX_TRACKED_BYTES)
+    if why and "more than" in why:
+        raise Broken(f"git lists more than {MAX_TRACKED_BYTES // (1024 * 1024)} MiB of tracked paths, more than "
+                     "ci-local will read")
+    if why or status != 0:
+        raise Broken(f"git ls-files failed{': ' + why if why else ''}")
+    return output.decode("utf-8", "surrogateescape")
+
+
+def control_within_caps(folder, label, copied):
+    """Holds the control tree, the folder plus the files the manifest copies into it, to MAX_CONTROL_FILES entries and
+    MAX_CONTROL_BYTES. The copied files count first, then the folder is walked lazily and the walk stops one entry
+    past the limit (folders count, so a tree of empty folders is bounded too); runs before anything is copied."""
+    seen = len(copied)
+    size = sum(path.lstat().st_size for path in copied[:MAX_CONTROL_FILES + 1])
+    if seen > MAX_CONTROL_FILES:
+        raise Broken(f"control {label} holds more than {MAX_CONTROL_FILES} entries, copied files included")
+    if size > MAX_CONTROL_BYTES:
+        raise Broken(f"control {label} holds more than {MAX_CONTROL_BYTES // (1024 * 1024)} MiB, copied files included")
+    for path in folder.rglob("*"):
+        seen += 1
+        if seen > MAX_CONTROL_FILES:
+            raise Broken(f"control {label} holds more than {MAX_CONTROL_FILES} entries")
+        size += path.lstat().st_size if not path.is_dir() or path.is_symlink() else 0
+        if size > MAX_CONTROL_BYTES:
+            raise Broken(f"control {label} holds more than {MAX_CONTROL_BYTES // (1024 * 1024)} MiB")
+
+
+def accounted_executables(repo, entries, others, tracked):
+    """Every executable file directly under tools/gates is a gate the manifest lists or a name under [others], so a
+    workflow that builds a gate's path from pieces cannot bring in a gate nobody declared; and every name under
+    [others] is such an executable. A gate already declared under [others] and reached by a built path is beyond
+    this check; the workflow's review covers it."""
+    prefix = f"{GATES.as_posix()}/"
+    executables = set()
+    for path in tracked:
+        name = path[len(prefix):] if path.startswith(prefix) else None
+        if name and "/" not in name and ((repo / path).is_symlink() or os.access(repo / path, os.X_OK)):
+            executables.add(name)  # a symlink there is a way to run something, so it must be declared too
+    for name in sorted(executables - set(entries) - set(others)):
+        raise Broken(f"{prefix}{name} is executable, but {MANIFEST} neither lists it as a gate nor declares it under "
+                     "[others]")
+    for name in sorted(set(others) - executables):
+        raise Broken(f"{MANIFEST} declares {name} under [others], but {prefix}{name} is not an executable here")
+
+
+def unaccounted_mentions(text):
+    """Every mention of tools/gates the coverage reader cannot account for, as (line number, line)."""
+    loops = []
+    for found in LOOP.finditer(text):
+        end = DONE.search(text, found.end())
+        loops.append((found.start(), end.end() if end else len(text)))
+    odd = []
+    for mention in MENTION.finditer(text):
+        at = mention.start()
+        if CALLED.match(text, at) or TABLE_MENTION.match(text, at):
+            continue
+        if LOOP_VARIABLE.match(text, at) and any(start <= at < end for start, end in loops):
+            continue
+        number = text.count("\n", 0, at) + 1
+        odd.append((number, text.splitlines()[number - 1].strip()))
+    for piece in PIECE.finditer(text):  # gates/ reached by a built path, such as "$root/gates/x"
+        if text[max(0, piece.start() - len("tools/")):piece.start()] != "tools/":
+            number = text.count("\n", 0, piece.start()) + 1
+            odd.append((number, text.splitlines()[number - 1].strip()))
+    return sorted(set(odd))
+
+
+def manifest_data(repo):
+    """The parsed manifest: a [gates] table and, optionally, an [others] table and nothing else."""
+    try:
+        data = tomllib.loads(read_capped(repo / MANIFEST, MAX_MANIFEST, str(MANIFEST)))
+    except tomllib.TOMLDecodeError as error:
+        raise Broken(f"cannot read {MANIFEST}: {error}") from None
+    if not set(data) <= {"gates", "others"} or not isinstance(data.get("gates"), dict) or \
+            not isinstance(data.get("others", {}), dict):
+        raise Broken(f"{MANIFEST} must hold one [gates] table, an optional [others] table, and nothing else")
+    return data
+
+
+def load_others(repo):
+    """[others]: each executable under tools/gates that ci-local does not run, with the reason, such as the
+    workflow that runs it instead. A name without a reason, or one also listed as a gate, is broken."""
+    data = manifest_data(repo)
+    others = {}
+    for name, reason in data.get("others", {}).items():
+        if not NAME.fullmatch(name) or not isinstance(reason, str) or not reason.strip():
+            raise Broken(f"{MANIFEST} [others] entry {name!r} needs a name and a reason")
+        if name in data["gates"]:
+            raise Broken(f"{MANIFEST} lists {name} both as a gate and under [others]")
+        others[name] = reason
+    return others
+
+
+def load_manifest(repo):
+    data = manifest_data(repo)
+    entries = {}
+    for name, entry in data["gates"].items():
+        if not NAME.fullmatch(name) or not isinstance(entry, dict):
+            raise Broken(f"{MANIFEST} has a malformed entry {name!r}")
+        extra = set(entry) - KEYS
+        if extra:
+            raise Broken(f"{MANIFEST} entry {name} has unknown keys: {', '.join(sorted(extra))}")
+        args = entry.get("args")
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise Broken(f"{MANIFEST} entry {name} needs args, a list of strings")
+        for arg in args:
+            for token in re.findall(r"\{[^}]*\}", arg):
+                if token not in PLACEHOLDERS:
+                    raise Broken(f"{MANIFEST} entry {name} uses {token}; only {{repo}} and {{range}} exist")
+        body = entry.get("body", False)
+        timeout = entry.get("timeout", DEFAULT_TIMEOUT)
+        if not isinstance(body, bool):
+            raise Broken(f"{MANIFEST} entry {name}: body must be true or false")
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 3600:
+            raise Broken(f"{MANIFEST} entry {name}: timeout must be whole seconds from 1 to 3600")
+        copy = entry.get("copy", [])
+        if not isinstance(copy, list) or not all(isinstance(c, str) and c for c in copy):
+            raise Broken(f"{MANIFEST} entry {name}: copy must be a list of paths")
+        fixture = entry.get("fixture")
+        if fixture is not None and (not isinstance(fixture, str) or not NAME.fullmatch(fixture)):
+            raise Broken(f"{MANIFEST} entry {name}: fixture must name a folder under {FIXTURES}")
+        if name == FIXTURES.name:
+            raise Broken(f"{MANIFEST} cannot list a gate named {name}; {FIXTURES} holds the shared fixtures")
+        entries[name] = {"args": args, "body": body, "timeout": timeout, "copy": copy, "fixture": fixture}
+    return entries
+
+
+def check_coverage(repo, entries):
+    workflow = read_capped(repo / WORKFLOW, MAX_WORKFLOW, str(WORKFLOW))
+    odd = unaccounted_mentions(workflow)
+    if odd:
+        number, line = odd[0]
+        raise Broken(f"{WORKFLOW} line {number} mentions tools/gates in a form ci-local cannot account for, so a "
+                     f"gate there could escape its controls: {line[:200]}")
+    for name in sorted(called_gates(workflow)):
+        if name not in entries:
+            raise Broken(f"the gates workflow runs {name}, which {MANIFEST} does not list")
+    tracked = set(tracked_paths(repo).split("\0")) - {""}
+    if len(tracked) > MAX_TRACKED:
+        raise Broken(f"the repository has {len(tracked)} tracked paths, more than the {MAX_TRACKED} ci-local will list")
+    accounted_executables(repo, entries, load_others(repo), tracked)
+    for name, entry in entries.items():
+        entry["files"] = copied_files(repo, name, entry["copy"], tracked)
+        entry["fixture_files"] = fixture_files(repo, name, entry["fixture"])
+        gate = repo / GATES / name
+        if not gate.is_file() or not os.access(gate, os.X_OK):
+            raise Broken(f"{MANIFEST} lists {name}, which is not an executable in {GATES}")
+        entry["kinds"] = control_kinds(repo, name)
+        for kind in entry["kinds"]:
+            folder = repo / CONTROLS / name / kind
+            if entry["body"] and not (folder / BODY).is_file():
+                raise Broken(f"{name} reads a pull request body, and its {kind} control has no {BODY}")
+            copied = [repo / path for path in entry["files"]]
+            control_within_caps(folder, f"{name}/{kind}", [*copied, *(path for _rel, path in entry["fixture_files"])])
+            if kind != "good":
+                expected = folder / EXPECT
+                if expected.is_symlink() or not expected.is_file() or not expected.read_text(encoding="utf-8").strip():
+                    raise Broken(f"{name}/{kind} has no {EXPECT} naming the text the gate prints when it refuses")
+
+
+def control_kinds(repo, name):
+    """good first, then every bad and bad-<label> folder; good and bad must exist."""
+    root = repo / CONTROLS / name
+    for kind in ("good", "bad"):
+        folder = root / kind
+        if not folder.is_dir() or folder.is_symlink():
+            raise Broken(f"{name} has no {kind} control")
+    bad = sorted(path.name for path in root.iterdir() if path.is_dir() and BAD_FOLDER.fullmatch(path.name))
+    for path in root.iterdir():
+        if path.is_symlink() and BAD_FOLDER.fullmatch(path.name):
+            raise Broken(f"{name}/{path.name} is a symbolic link, not a control folder")
+    return ["good", *bad]
+
+
+def fixture_files(repo, name, fixture):
+    """The (relative path, file) pairs of the fixture a gate's controls start from: a fixed known-good tree under
+    tools/ci-controls/fixtures, so a control never depends on the product it is about to judge. Regular files only,
+    and no more than MAX_CONTROL_FILES of them."""
+    if fixture is None:
+        return []
+    root = repo / FIXTURES / fixture
+    if root.is_symlink() or not root.is_dir():
+        raise Broken(f"{MANIFEST} entry {name} names fixture {fixture}, which is not a folder under {FIXTURES}")
+    found = []
+    for seen, path in enumerate(root.rglob("*"), 1):
+        if seen > MAX_CONTROL_FILES:  # every entry counts, folders too, so the walk itself is bounded
+            raise Broken(f"fixture {fixture} holds more than {MAX_CONTROL_FILES} entries")
+        if path.is_symlink():
+            raise Broken(f"fixture {fixture} holds a symbolic link, {path.relative_to(root)}")
+        if path.is_file():
+            found.append((path.relative_to(root), path))
+    return sorted(found)
+
+
+def copied_files(repo, name, copy, tracked):
+    """The tracked regular files a copy list names: a path as given, or every tracked file under a path ending in /."""
+    files = []
+    for rel in copy:
+        if rel.endswith("/"):
+            under = sorted(path for path in tracked if path.startswith(rel))
+            if not under or rel.startswith("/") or ".." in rel.split("/"):
+                raise Broken(f"{MANIFEST} entry {name} copies {rel}, a folder holding no tracked file here")
+        else:
+            under = [rel]
+        for path in under:
+            source = repo / path
+            if path not in tracked or source.is_symlink() or not source.is_file():
+                raise Broken(f"{MANIFEST} entry {name} copies {path}, which is not a tracked regular file here")
+            files.append(path)
+    return files
+
+
+SYSTEM_FOLDERS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+NAMED_TOOLS = ("python3", "git", "cargo", "rustc", "rustup", "cargo-clippy", "clippy-driver", "rustfmt", "cargo-fmt",
+               "gitleaks", "actionlint")  # the tools gates look up by name that the system folders do not hold
+
+
+def caller_tool(name):
+    """Where the caller's PATH finds name, or None."""
+    return shutil.which(name, path=os.environ.get("PATH", ":".join(SYSTEM_FOLDERS)))
+
+
+def link_folder(folder):
+    """A folder of links, one for each tool in NAMED_TOOLS the caller has, to the copy the caller's PATH finds.
+    These are the caller's own tools, wrappers included; nothing else from the caller's PATH reaches a gate."""
+    folder.mkdir()
+    for name in NAMED_TOOLS:
+        found = caller_tool(name)
+        if found:
+            (folder / name).symlink_to(os.path.abspath(found))  # a relative PATH entry must not leave a dangling link
+    return folder
+
+
+def git_env(tmp):
+    """The environment for ci-local's own git commands: the folder of the caller's git and the system folders, no
+    git config, and nothing created."""
+    git = caller_tool("git")
+    path = ":".join(dict.fromkeys([*([os.path.dirname(git)] if git else []), *SYSTEM_FOLDERS]))
+    return {"PATH": path, "HOME": str(tmp), "TMPDIR": str(tmp), "LANG": "en_US.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+
+def gate_env(tmp, body=None):
+    """The whole environment one gate or control invocation sees. Each call makes a folder of its own under the run's
+    scratch, holding a fresh HOME, CARGO_HOME and TMPDIR, so nothing one invocation leaves can reach another and no
+    Cargo config on this Mac changes a result; RUSTUP_HOME alone points at the installed toolchains."""
+    own = pathlib.Path(tempfile.mkdtemp(prefix="gate-", dir=str(tmp)))
+    for name in ("home", "cargo-home", "tmp"):
+        (own / name).mkdir()
+    tools = link_folder(own / "bin")
+    env = {"PATH": ":".join([str(tools), *SYSTEM_FOLDERS]), "HOME": str(own / "home"),
+           "CARGO_HOME": str(own / "cargo-home"),
+           "TMPDIR": str(own / "tmp"), "LANG": "en_US.UTF-8", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null"}
+    rustup = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    if os.environ.get("RUSTUP_HOME") or os.path.isdir(rustup):
+        env["RUSTUP_HOME"] = rustup
+    if body is not None:
+        env["PR_BODY"] = body
+    return env
+
+
+def run_gate(gate, args, cwd, env, timeout):
+    """(status, stdout, stderr, why) for one gate, under run_bounded with the OUTPUT_CAP: status is None when it did
+    not finish in time or wrote past the cap, and why says which. The gate's process group is stopped on every way
+    out, an interrupt of ci-local included; a process that moved to a session of its own is not in that group."""
+    return run_bounded([gate, *args], cwd, env, timeout, OUTPUT_CAP)
+
+
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+@contextlib.contextmanager
+def stops_held():
+    """Blocks the stop signals while cleanup runs, so a stop cannot cut it short; one that arrives meanwhile is
+    delivered when the block ends, after the group is ended and the leader reaped."""
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
+
+def keep_child_status():
+    """SIGCHLD back to its default, so the kernel keeps every exited child until it is collected here; a launcher
+    that ignores SIGCHLD would otherwise let children vanish, their ids free for reuse and their status lost."""
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    except ValueError:
+        pass  # not the main thread; leader_held still refuses to signal a group it does not hold
+
+
+def leader_held(process):
+    """True while the process is still this one's child to collect, running or a zombie: only then are its pid and
+    group id still its own. False once something else reaped it; that group is never signalled."""
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        process.lost = True
+        return False
+    return True
+
+
+def leader_was_held(process):
+    """False when the leader was found already reaped by something else, its status lost."""
+    return not getattr(process, "lost", False)
+
+
+def leader_exited(process):
+    """True once the process has exited, seen with waitid and WNOWAIT so it is not reaped: until reap() collects it,
+    the zombie keeps its pid and its group id taken, so a signal sent to the group cannot reach a reused id. A
+    leader something else already reaped counts as exited, and leader_held keeps its group from any signal."""
+    try:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        process.lost = True
+        return True
+
+
+def wait_exit(process, seconds):
+    """Waits up to seconds for the process to exit, without reaping it. True when it has exited."""
+    end = time.monotonic() + max(0.0, seconds)
+    while not leader_exited(process):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def reap(process):
+    """Collects the leader once its group has been signalled for the last time; never before. Stop signals held.
+    False when the leader could not be collected within five seconds; the caller makes that a broken run."""
+    with stops_held():
+        if getattr(process, "lost", False) is True:
+            return True  # something else collected it (seen by leader_exited or leader_held); reported by the caller
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return False
+    return True
+
+
+def stop_group(process):
+    """Ends the gate's process group while its leader is still unreaped: SIGTERM, up to 5 seconds for the leader to
+    exit, then SIGKILL for whatever is left. Run after every gate, since a gate that exits can leave children in its
+    group; the caller reaps the leader afterward with reap(). The stop signals are held for the whole of it."""
+    with stops_held():
+        end_group(process)
+
+
+def end_group(process):
+    """SIGTERM, up to five seconds for the leader to exit, SIGKILL; never reaps. Called only under stops_held."""
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        if not leader_held(process):
+            return  # its group id may already belong to someone else
+        try:
+            os.killpg(process.pid, number)
+        except (ProcessLookupError, PermissionError):
+            break
+        if number == signal.SIGTERM:
+            wait_exit(process, 5)
+            time.sleep(0.05)  # let the group's other members take the signal before the next is sent
+    wait_exit(process, 5)
+
+
+def build_control(folder, target, env, repo, copy, fixture=()):
+    """A two-commit repository from a control folder, laid over the gate's fixture, if any, and the listed tracked
+    files of this repository; returns the range and the body text, if any."""
+    target.mkdir(parents=True)
+    git(["init", "-q", "-b", "main"], target, env)
+    git(["commit", "-q", "--allow-empty", "-m", "Control base"], target, env)
+    first = git(["rev-parse", "HEAD"], target, env).strip()
+    for rel, path in fixture:
+        place(path, rel, target)
+    for rel in copy:
+        (target / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo / rel, target / rel)
+    message, body = "Control fixture\n", None
+    for path in sorted(folder.rglob("*")):
+        rel = path.relative_to(folder)
+        if path.is_symlink():
+            raise Broken(f"control {folder} holds a symbolic link, {rel}")
+        if path.is_dir():
+            continue
+        if rel.as_posix() == MESSAGE:
+            message = path.read_text(encoding="utf-8")
+        elif rel.as_posix() == BODY:
+            body = path.read_text(encoding="utf-8")
+        elif rel.as_posix() == EXPECT:
+            continue
+        else:
+            place(path, rel, target)
+    git(["add", "-A"], target, env)
+    git(["commit", "-q", "--allow-empty", "-m", message], target, env)
+    return f"{first}..HEAD", body
+
+
+def place(path, rel, target):
+    """Writes one control or fixture file into the control repository: a name ending in .template loses that suffix
+    and has its placeholders expanded, so a Cargo.toml or source file kept for a control is never read as part of
+    this repository by the gates themselves; any other file is copied as it is."""
+    if rel.name.endswith(TEMPLATE) and len(rel.name) > len(TEMPLATE):
+        out = target / rel.with_name(rel.name[:-len(TEMPLATE)])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(expand_template(path, rel), encoding="utf-8")
+    else:
+        (target / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target / rel)
+
+
+def expand_template(path, rel):
+    """The fixture text with {{}} removed and each {{U+XXXX}} replaced by that character; any other {{...}} is an
+    error, so a typo cannot quietly leave a control that tests nothing."""
+    def one(match):
+        inner = match.group(1)
+        if inner == "":
+            return ""
+        point = CODE_POINT.fullmatch(inner)
+        if point and int(point.group(1), 16) <= 0x10FFFF and not 0xD800 <= int(point.group(1), 16) <= 0xDFFF:
+            return chr(int(point.group(1), 16))
+        raise Broken(f"control template {rel.as_posix()} has the placeholder {{{{{inner}}}}}; "
+                     "only {{}} and {{U+XXXX}} exist")
+    return PLACEHOLDER.sub(one, path.read_text(encoding="utf-8"))
+
+
+def expand(args, repo, commit_range):
+    return [arg.replace("{repo}", str(repo)).replace("{range}", commit_range) for arg in args]
+
+
+def run_controls(repo, entries, tmp):
+    problems, count = [], 0
+    for name, entry in entries.items():
+        for kind in entry["kinds"]:
+            wanted = 0 if kind == "good" else 1
+            folder = repo / CONTROLS / name / kind
+            work = tmp / "controls" / name / kind
+            env = dict(git_env(tmp), **IDENTITY)
+            commit_range, body = build_control(folder, work / "repo", env, repo, entry["files"], entry["fixture_files"])
+            status, output, errors, why = run_gate(repo / GATES / name,
+                                                   expand(entry["args"], work / "repo", commit_range), work / "repo",
+                                                   gate_env(tmp, body if entry["body"] else None), entry["timeout"])
+            count += 1
+            said = errors or output
+            if why:
+                problems.append((f"control {name}/{kind} {why}", b""))
+            elif TRACEBACK in output or TRACEBACK in errors:
+                problems.append((f"control {name}/{kind} crashed (a Python traceback), which is never a verdict", said))
+            elif status != wanted:
+                problems.append((f"control {name}/{kind} exited {status}, wanted {wanted}", said))
+            elif kind != "good":
+                expected = (folder / EXPECT).read_text(encoding="utf-8").strip()
+                if expected.encode("utf-8") not in output + errors:
+                    problems.append((f"control {name}/{kind} refused without printing what {EXPECT} names: "
+                                     f"{expected[:200]}", said))
+    return problems, count
+
+
+def run_tree(repo, entries, commit_range, body, tmp):
+    worst, counts = 0, {"passed": 0, "failed": 0, "broken": 0, "not run": 0}
+    commits = int(git(["rev-list", "--count", commit_range], repo, git_env(tmp)).strip() or 0)
+    for name, entry in entries.items():
+        if entry["body"] and body is None:
+            say(f"NOT RUN {name} (no pull request body)")
+            counts["not run"] += 1
+            continue
+        if commits == 0 and any("{range}" in arg for arg in entry["args"]):
+            say(f"NOT RUN {name} (no commit in the range)")
+            counts["not run"] += 1
+            continue
+        status, output, errors, why = run_gate(repo / GATES / name, expand(entry["args"], repo, commit_range), repo,
+                                               gate_env(tmp, body if entry["body"] else None), entry["timeout"])
+        crashed = TRACEBACK in output or TRACEBACK in errors
+        if status == 0 and not crashed:
+            say(f"PASS {name}")
+            counts["passed"] += 1
+            continue
+        detail = errors.decode("utf-8", "replace").strip() or output.decode("utf-8", "replace").strip()
+        if status == 1 and not crashed:
+            say(f"FAIL {name}")
+            counts["failed"] += 1
+            worst = max(worst, 1)
+        else:
+            reason = why or ("a Python traceback" if crashed else f"exit {status}")
+            say(f"BROKEN {name} ({reason})")
+            counts["broken"] += 1
+            worst = 2
+        for line in detail.splitlines()[:20]:
+            say(f"    {line}")
+    say(f"summary: {counts['passed']} passed, {counts['failed']} failed, {counts['broken']} broken, "
+        f"{counts['not run']} not run")
+    return worst
+
+
+def judged_clone(caller, revision, tmp):
+    """A throwaway clone sharing the caller's objects, checked out at the commit the revision names, so the gates
+    read exactly that commit; nothing is written to the caller's repository."""
+    env = git_env(tmp)
+    status, output, _errors, why = run_bounded(["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
+                                               caller, env, 60, GIT_OUTPUT_CAP)
+    sha = output.decode("utf-8", "replace").strip()
+    if why or status != 0 or not sha:
+        raise Broken(f"--commit {revision} names no commit in this repository")
+    target = tmp / "judged"
+    git(["clone", "--quiet", "--shared", "--no-checkout", str(caller), str(target)], tmp, env, timeout=300)
+    git(["checkout", "--quiet", "--detach", sha], target, env, timeout=300)
+    return target
+
+
+def parse(argv):
+    options = {"base": "origin/main", "body": None, "controls_only": False, "commit": None}
+    items = list(argv)
+    while items:
+        item = items.pop(0)
+        if item == "--controls-only":
+            options["controls_only"] = True
+        elif item in ("--base", "--body", "--commit") and items:
+            options[item[2:]] = items.pop(0)
+        else:
+            raise Broken(f"unexpected argument {item!r}; see the usage at the top of tools/ci-local")
+    return options
+
+
+def main(argv):
+    try:
+        options = parse(argv)
+        status, output, _errors, why = run_bounded(["git", "rev-parse", "--show-toplevel"], pathlib.Path.cwd(), None,
+                                                   60, GIT_OUTPUT_CAP)
+        if why or status != 0:
+            raise Broken("run it inside the repository")
+        caller = pathlib.Path(output.decode("utf-8", "surrogateescape").strip())
+        body = None
+        if options["body"] is not None:
+            body = read_capped(pathlib.Path(options["body"]), MAX_BODY, "the pull request body")
+        with tempfile.TemporaryDirectory(prefix="ci-local-") as scratch:
+            tmp = pathlib.Path(scratch)
+            repo = caller if options["commit"] is None else judged_clone(caller, options["commit"], tmp)
+            entries = load_manifest(repo)
+            check_coverage(repo, entries)
+            problems, count = run_controls(repo, entries, tmp)
+            if problems:
+                for problem, said in problems:
+                    complain(f"ci-local: refused: {problem}")
+                    for line in said.decode("utf-8", "replace").strip().splitlines()[:10]:
+                        complain(f"    {line[:300]}")
+                complain("ci-local: refused: a gate whose controls misbehave proves nothing, so this repository was "
+                         "not checked")
+                return 2
+            say(f"controls: {count} of {count} behaved")
+            if options["controls_only"]:
+                return 0
+            if options["base"] == "none":  # nothing is published yet: every commit up to the judged one is new
+                commit_range = git(["rev-parse", "--verify", "HEAD^{commit}"], repo, git_env(tmp)).strip()
+            else:
+                base = git(["rev-parse", "--verify", "--quiet", f"{options['base']}^{{commit}}"], caller,
+                           git_env(tmp)).strip()
+                commit_range = f"{base}..HEAD"
+            return run_tree(repo, entries, commit_range, body, tmp)
+    except Broken as error:
+        complain(f"ci-local: broken: {error}")
+        return 2
+    except KeyboardInterrupt:
+        complain("ci-local: broken: interrupted; every gate it started was stopped, and nothing was judged")
+        return 2
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+        complain(f"ci-local: broken: {type(error).__name__}: {error}")
+        return 2
+
+
+STOPPING = []
+
+
+def interrupted(_number, _frame):
+    """The first stop raises KeyboardInterrupt, which runs the cleanup; later stops change nothing."""
+    if STOPPING:
+        return
+    STOPPING.append(True)
+    raise KeyboardInterrupt
+
+
+if __name__ == "__main__":
+    keep_child_status()
+    for number in STOPS:
+        signal.signal(number, interrupted)  # Ctrl-C, a stop and a hang-up all run the same cleanup, once
+    sys.exit(main(sys.argv[1:]))

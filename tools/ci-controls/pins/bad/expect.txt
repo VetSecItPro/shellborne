@@ -1,0 +1,1 @@
+pins: refused fetch-outside-helper scripts/fetch.sh:2

@@ -2,7 +2,8 @@
 """key-reach-check: show the builder account cannot read or sign with the release keys.
 
 Usage:
-    key-reach-check --keychain <path> --names <file> --signer <path> [--timeout <seconds>]
+    key-reach-check [--plant | --probe-only | --remove] --keychain <path> --names <file> --signer <path>
+                    [--timeout <seconds>]
 
 Run on this Mac from the builder account, never in CI. --names is a TOML list of what to probe, and
 never key material:
@@ -10,6 +11,7 @@ never key material:
     [[item]]      a Keychain generic password, looked up by service and account only
     [[eddsa]]     an EdDSA key account, probed by a signing attempt
     [[path]]      a named key path, checked with access(R_OK) and lstat, never opened
+    [[identity]]  a codesigning identity to try by its 40-character SHA-1 hash, whatever its name
 
 Lookups run /usr/bin/security against the --keychain path, never with -w, -g, -X, -p, an export
 verb or dump-keychain, and keep only the exit status: 0 reachable, 44 unreachable, anything else
@@ -19,8 +21,11 @@ unreachable only when the control signed, and anything else (another code, a sig
 prompt that waits) is broken.
 
 Codesigning identities in --keychain are listed with `security find-identity -p codesigning <keychain>`,
-without -v, because codesign still signs with an identity that list would hide as untrusted. Each listed
-identity makes a real codesign attempt, with /usr/bin/codesign, on a copy of the fixture in a temp folder:
+without -v, because codesign still signs with an identity that list would hide as untrusted. Three kinds get a
+real codesign attempt: the control, anything named "Developer ID Application:" or "Developer ID Installer:" (the
+identities that sign builds other people run, so leaving one out of --names never hides it), and anything --names
+lists. A development identity, say, gets a "skipped identity" line and is never counted. Each attempt runs
+/usr/bin/codesign on a copy of the fixture in a temp folder:
 `codesign --keychain <keychain> -s <hash> -f <copy>`, its output discarded unread. An identity whose name
 starts with shellborne-keyreach-control- is the control, set up once by the owner in --keychain, and must
 sign, or the run is broken; any other identity that signs is reachable. This tool never creates, imports or
@@ -48,20 +53,41 @@ PATH cannot answer for them. The only stand-in is the module constants SECURITY 
 after loading this file as a module; no environment variable or argument moves them. A named key path whose
 folder the account cannot search (lstat fails with EACCES or EPERM) is unreachable. Once the first signal or the
 end of the probes is reached, SIGINT, SIGTERM and SIGHUP are ignored until every planted control is removed.
+
+Inside a session that is denied the keychain, the default run can only ever say broken: its own controls are out
+of reach there too. Three modes split the run for that case (P0.24.1); give at most one.
+  --plant       outside the session. Checks --keychain opens, clears anything an interrupted run left, adds the
+                two control items, confirms both answer, and exits 0 with them still there. If either stays silent
+                it takes them out again and exits 2.
+  --probe-only  inside the session, and outside it for comparison. Adds, deletes and locks nothing. It tries the
+                two control items, each name in --names and each codesigning identity in --keychain, the control
+                identity among them, and prints one line per success. Exit 0 when nothing answered, 1 when
+                anything did, 2 broken. A silent control is a finding here, not a fault, because the comparison
+                run outside must report both controls and the control identity. A --keychain this account is not
+                even allowed to stat is treated as out of reach; one that does not exist is broken.
+  --remove      outside the session. Checks --keychain opens, then deletes both control items; one already gone
+                counts as deleted.
+--plant and --remove take the same per-keychain lock and handle signals the same way as the default run.
 Plan-Step: P0.11.12
+Plan-Step: P0.24.1
 """
 import argparse
+import contextlib
 import errno
 import fcntl
 import hashlib
+import math
 import os
 import pathlib
 import re
+import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 CONTROL_PREFIX = "shellborne-keyreach-control-"
@@ -75,6 +101,7 @@ SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 FIXTURE = pathlib.Path(__file__).resolve().parent / "sign-probe-fixture.txt"
 NOT_FOUND = 44
 DEFAULT_TIMEOUT = 30.0
+MAX_TIMEOUT = 600.0  # a deadline has to be one: --timeout is finite and no longer than this
 MAX_NAMES_BYTES = 64 * 1024
 MAX_ENTRIES = 200
 MAX_FIELD = 512
@@ -83,7 +110,10 @@ MAX_IDENTITIES = 200
 IDENTITY_LINE = re.compile(r'^\s*\d+\) ([0-9A-F]{40}) "(.*)"(?: \(.*\))?$')
 COUNT_LINE = re.compile(r"^\s*(\d+) identities found$")
 CERTIFICATE_HASH_LINE = re.compile(r"^SHA-1 hash: ([0-9A-F]{40})$")
-FIELDS = {"item": ("service", "account"), "eddsa": ("account",), "path": ("path",)}
+FIELDS = {"item": ("service", "account"), "eddsa": ("account",), "path": ("path",), "identity": ("hash",)}
+HASH = re.compile(r"[0-9A-Fa-f]{40}")
+# Identities that can sign a build other people run: always tried, listed or not.
+RELEASE_PREFIXES = ("Developer ID Application:", "Developer ID Installer:")
 
 
 class Broken(Exception):
@@ -95,7 +125,13 @@ class Stopped(Exception):
 
 
 def say(line):
-    print(f"key-reach-check: {line}", flush=True)
+    """Every line this tool prints, as one line of printable ASCII: anything else (a control character, a newline,
+    non-ASCII text in an identity name the keychain returned) is shown as an escape, so no name can forge a line."""
+    shown = "".join(ch if 32 <= ord(ch) < 127 and ch != "\\" else
+                    ("\\\\" if ch == "\\" else f"\\x{ord(ch):02x}" if ord(ch) < 256 else
+                     f"\\u{ord(ch):04x}" if ord(ch) < 0x10000 else f"\\U{ord(ch):08x}")
+                    for ch in str(line))
+    print(f"key-reach-check: {shown}", flush=True)
 
 
 def ignore_signals():
@@ -110,7 +146,10 @@ def stop(signum, _frame):
 
 def read_names(path):
     try:
-        with open(path, "rb") as handle:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # a pipe or a link never holds the run
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise Broken("the names list is not a regular file")
             data = handle.read(MAX_NAMES_BYTES + 1)
     except OSError as error:
         raise Broken(f"cannot read the names list: {error.strerror}") from None
@@ -138,7 +177,10 @@ def read_names(path):
                     raise Broken(f"[[{kind}]] {field} must be a non-empty string under {MAX_FIELD} characters")
                 if value.startswith(CONTROL_PREFIX):
                     raise Broken(f"[[{kind}]] {field} uses the control prefix")
-            entries[kind].append(tuple(entry[field] for field in fields))
+                if kind == "identity" and not HASH.fullmatch(value):
+                    raise Broken("[[identity]] hash must be the identity's 40-character SHA-1 hash")
+            entries[kind].append(tuple(entry[field].upper() if kind == "identity" else entry[field]
+                                       for field in fields))
     total = sum(len(listed) for listed in entries.values())
     if total == 0:
         raise Broken("the names list is empty, so nothing would be probed")
@@ -157,45 +199,168 @@ def launch(argv, stdout):
         raise Broken(f"could not start {os.path.basename(argv[0])}: {error.strerror}") from None
 
 
+@contextlib.contextmanager
+def signals_held():
+    """Blocks the handled signals while a child's group is ended and the child reaped, so a stop cannot cut that
+    short; one that arrives meanwhile is delivered when the block ends."""
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
+
 def run_quiet(argv, timeout):
     """Runs argv with no input and its output discarded unread. Returns the exit status, or None on a timeout.
-    The whole process group is killed on a timeout, so nothing is left waiting at a prompt."""
-    process = launch(argv, subprocess.DEVNULL)
+    The exit is seen without reaping (leader_exited); then the process group is ended whether the probe finished or
+    ran out of time, so nothing it started outlives it, and the leader is reaped last, within a bound."""
+    held = start_held()
     try:
-        return process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None
+        process = launch(argv, subprocess.DEVNULL)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        raise
+    finished = False
+    collected = False
+    deadline = time.monotonic() + timeout
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)  # first thing inside: a stop now lands where cleanup runs
+        while True:
+            if leader_exited(process):
+                finished = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
     finally:
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                process.kill()
-            process.wait()
+        with signals_held():
+            end_group(process)
+            collected = reap_bounded(process, 5)
+    if not collected:
+        raise Broken(f"{os.path.basename(argv[0])} could not be collected after it was stopped")
+    if getattr(process, "lost", False):
+        raise Broken(f"{os.path.basename(argv[0])}'s exit status was lost (is SIGCHLD ignored?)")
+    return process.returncode if finished else None
 
 
 def run_listing(argv, timeout):
-    """Runs argv with no input and stderr discarded, reading at most MAX_INVENTORY_BYTES of stdout.
-    Returns (status, text). The status is None on a timeout or an over-cap listing."""
-    with tempfile.TemporaryFile() as out:
-        process = launch(argv, out)
-        try:
-            status = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            status = None
-        finally:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    process.kill()
-                process.wait()
-        out.seek(0)
-        data = out.read(MAX_INVENTORY_BYTES + 1)
-    if len(data) > MAX_INVENTORY_BYTES:
+    """Runs argv with no input and stderr discarded, reading its stdout from a pipe as it arrives and stopping its
+    process group once more than MAX_INVENTORY_BYTES has come, so a listing never runs on past the cap.
+    The listing's exit is seen without reaping it (leader_exited), its group is ended while it is still a zombie that
+    holds its id, and it is reaped last, so no signal can reach a reused group id; a leftover child holding the pipe
+    is ended at once. Returns (status, text). The status is None on a timeout or an over-cap listing."""
+    held = start_held()
+    try:
+        process = launch(argv, subprocess.PIPE)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        raise
+    data = bytearray()
+    over = False
+    timed_out = False
+    stopped = False
+    deadline = time.monotonic() + timeout
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)  # first thing inside: a stop now lands where cleanup runs
+        fd = process.stdout.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True  # the pipe is still open: a timeout, whatever the listing itself returned
+                break
+            if not stopped and leader_exited(process):
+                end_group(process)  # a child it left would keep the pipe open
+                stopped = True
+            ready, _, _ = select.select([fd], [], [], min(left, 0.25))
+            if not ready:
+                continue
+            chunk = os.read(fd, 64 * 1024)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_INVENTORY_BYTES:
+                over = True
+                break
+        if not (over or timed_out):
+            while not leader_exited(process):  # the pipe ended; wait for the exit itself, still without reaping
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(0.02)
+    finally:
+        with signals_held():
+            if not stopped:
+                end_group(process)  # alive or a zombie, the leader is unreaped: its group id is still its own
+            collected = reap_bounded(process, 5)  # reaped only after the last signal, and never waited on forever
+            process.stdout.close()
+    if not collected:
+        raise Broken("the identity listing could not be collected after it was stopped")
+    if getattr(process, "lost", False):
+        raise Broken("the identity listing's exit status was lost (is SIGCHLD ignored?)")
+    if over or timed_out:
         return None, ""
-    return status, data.decode("utf-8", errors="replace")
+    return process.returncode, bytes(data).decode("utf-8", errors="replace")
 
+
+def start_held():
+    """SIGCHLD back to its default (a launcher that ignores it lets the kernel reap children and free their ids),
+    then the handled signals blocked until the caller's cleanup block is in place. Returns the mask to restore."""
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    except ValueError:
+        pass  # not the main thread; leader_held still refuses to signal a group it does not hold
+    return signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+
+
+def leader_held(process):
+    """True while the process is still this one's child to collect, running or a zombie; only then are its ids
+    still its own. False once something else reaped it, and its group is then never signalled."""
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        process.lost = True
+        return False
+    return True
+
+
+def reap_bounded(process, seconds):
+    """Collects the leader once it has exited, waiting at most seconds; False when it cannot be collected, which the
+    caller turns into a broken run rather than a wait without end."""
+    end = time.monotonic() + seconds
+    while not leader_exited(process):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    if not leader_held(process):
+        return True  # something else collected it; the caller reports the lost status
+    process.wait()  # it has exited, so this returns at once
+    return True
+
+
+def end_group(process):
+    """SIGKILL to a child's process group, sent only while its leader is unreaped (alive or a zombie), so the group
+    id is still the child's own. A refusal for the group falls back to the leader alone. Signals held."""
+    with signals_held():
+        if not leader_held(process):
+            return  # something else reaped it, so its group id may already belong to someone else
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:  # macOS refuses a group whose only member is the zombie leader
+            try:
+                os.kill(process.pid, signal.SIGKILL)  # never Popen.kill, which polls and so reaps the leader
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def leader_exited(process):
+    """True once the process has exited, seen with waitid and WNOWAIT so it is not reaped and keeps its ids taken."""
+    try:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        process.lost = True  # reaped by something else: its status is gone and its group is never signalled
+        return True
 
 def parse_identities(text):
     """Reads the Matching identities section of find-identity output into (hash, name) pairs, one per hash.
@@ -243,6 +408,7 @@ class Probe:
         self.codesign = codesign
         self.timeout = timeout
         self.planted = []
+        self.skipped = []
 
     def security_status(self, *args):
         status = run_quiet([self.security, *args, self.keychain], self.timeout)
@@ -255,8 +421,8 @@ class Probe:
         written until security opens --keychain as one."""
         status = self.security_status("show-keychain-info")
         if status != 0:
-            raise Broken(f"security cannot open --keychain as a keychain (exit {status}), and a write would land in the "
-                         "default keychain")
+            raise Broken(f"security cannot open --keychain as a keychain (exit {status}), and a write would land "
+                         "in the default keychain")
 
     def clear(self, service, account):
         """Remove a control a killed run left: deleted, or already absent."""
@@ -361,13 +527,26 @@ def path_reachable(path):
     return os.access(path, os.R_OK)
 
 
-def check_identities(probe):
+def tried(probe, identities, listed_hashes):
+    """The identities worth a signing attempt: every release identity and every listed one. The rest are noted on
+    the probe's skipped lines and never count as reachable."""
+    chosen = []
+    for digest, name in identities:
+        if name.startswith(RELEASE_PREFIXES) or digest in listed_hashes:
+            chosen.append((digest, name))
+        else:
+            probe.skipped.append(f"skipped identity {digest} {name} (not a release identity and not listed)")
+    return chosen
+
+
+def check_identities(probe, listed_hashes=frozenset()):
     """Returns the reachable identity lines. Raises Broken when the codesign probe cannot be trusted."""
     listed = probe.identities()
     if probe.control_certificates() - {digest for digest, _name in listed}:
         raise Broken("a control certificate is in the keychain without a usable private key")
     controls = [(digest, name) for digest, name in listed if name.startswith(CONTROL_PREFIX)]
-    others = [(digest, name) for digest, name in listed if not name.startswith(CONTROL_PREFIX)]
+    others = tried(probe, [(digest, name) for digest, name in listed if not name.startswith(CONTROL_PREFIX)],
+                   listed_hashes)
     if not controls:
         raise Broken(f"no {CONTROL_PREFIX} identity is listed, so the codesign probe is blind; the owner sets up "
                      "the control identity once in this keychain")
@@ -399,7 +578,7 @@ def check(args, probe, entries):
         raise Broken("the control item read as unreachable, so the lookup is blind")
     if not probe.signs(control_eddsa):
         raise Broken("the control EdDSA account did not sign, so the signing probe is blind")
-    found = check_identities(probe)
+    found = check_identities(probe, {digest for (digest,) in entries["identity"]})
     for service, account in entries["item"]:
         if probe.item_reachable(service, account):
             found.append(f"reachable item service {service} account {account}")
@@ -410,6 +589,76 @@ def check(args, probe, entries):
         if path_reachable(path):
             found.append(f"reachable path {path}")
     return found
+
+
+def plant(probe):
+    """--plant: the two controls, planted and proven reachable. Raises Broken when either reads as unreachable."""
+    probe.require_keychain()
+    for service in (CONTROL_ITEM, CONTROL_EDDSA):
+        probe.clear(service, service)  # what a killed run left, before this run plants its own
+    probe.plant(CONTROL_ITEM, CONTROL_ITEM)
+    probe.plant(CONTROL_EDDSA, CONTROL_EDDSA)
+    if not probe.item_reachable(CONTROL_ITEM, CONTROL_ITEM):
+        raise Broken("the planted control item read as unreachable, so the lookup is blind")
+    if not probe.signs(CONTROL_EDDSA):
+        raise Broken("the planted control EdDSA account did not sign, so the signing probe is blind")
+
+
+def remove(probe):
+    """--remove: both controls deleted; absent counts as removed."""
+    probe.require_keychain()
+    for service in (CONTROL_ITEM, CONTROL_EDDSA):
+        probe.clear(service, service)
+
+
+def probe_only(probe, entries):
+    """--probe-only: every probe, nothing written. Returns the reachable lines."""
+    try:
+        os.stat(probe.keychain)
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM):  # gone, or some other fault: never read as out of reach
+            raise Broken(f"cannot look at --keychain: {error.strerror}") from None
+        # this account may not even look at it, which is the confined session's case
+    else:
+        probe.require_keychain()  # read-only; a file that is not a keychain would read as empty
+    found = []
+    if probe.item_reachable(CONTROL_ITEM, CONTROL_ITEM):
+        found.append(f"reachable item service {CONTROL_ITEM} account {CONTROL_ITEM}")
+    if probe.signs(CONTROL_EDDSA):
+        found.append(f"reachable eddsa account {CONTROL_EDDSA}")
+    listed_hashes = {digest for (digest,) in entries["identity"]}
+    identities = probe.identities()
+    chosen = [(d, n) for d, n in identities if n.startswith(CONTROL_PREFIX)]
+    chosen += tried(probe, [(d, n) for d, n in identities if not n.startswith(CONTROL_PREFIX)], listed_hashes)
+    for digest, name in chosen:
+        status = probe.codesigns(digest)
+        if status == 0:
+            found.append(f"reachable identity {digest} {name}")
+        elif status != 1:
+            raise Broken(f"codesign exited {status} for identity {digest}, neither signed nor refused")
+    for service, account in entries["item"]:
+        if probe.item_reachable(service, account):
+            found.append(f"reachable item service {service} account {account}")
+    for (account,) in entries["eddsa"]:
+        if probe.signs(account):
+            found.append(f"reachable eddsa account {account}")
+    for (path,) in entries["path"]:
+        if path_reachable(path):
+            found.append(f"reachable path {path}")
+    return found
+
+
+def keychain_present(keychain, mode):
+    """Whether --keychain may be used. The default run and the writing modes need a file. --probe-only also takes
+    one this account may not look at, since inside a confined session the keychain itself is what is out of reach;
+    a path that does not exist is broken in every mode, or a typo would read as unreachable."""
+    try:
+        details = os.stat(keychain)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        return mode == "probe-only" and error.errno in (errno.EACCES, errno.EPERM)
+    return stat.S_ISREG(details.st_mode)
 
 
 def main(argv):
@@ -429,13 +678,18 @@ def run(argv):
     parser.add_argument("--names", required=True)
     parser.add_argument("--signer", required=True)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--plant", dest="mode", action="store_const", const="plant")
+    modes.add_argument("--probe-only", dest="mode", action="store_const", const="probe-only")
+    modes.add_argument("--remove", dest="mode", action="store_const", const="remove")
     try:
         args = parser.parse_args(argv)
     except SystemExit:
-        say("broken: usage: key-reach-check --keychain <path> --names <file> --signer <path> [--timeout <seconds>]")
+        say("broken: usage: key-reach-check [--plant | --probe-only | --remove] --keychain <path> --names <file> "
+            "--signer <path> [--timeout <seconds>]")
         return 2
-    if not args.timeout > 0:
-        say("broken: --timeout must be a positive number of seconds")
+    if not (math.isfinite(args.timeout) and 0 < args.timeout <= MAX_TIMEOUT):
+        say(f"broken: --timeout must be a number of seconds above 0 and at most {MAX_TIMEOUT:g}")
         return 2
     try:
         entries = read_names(args.names)
@@ -451,21 +705,25 @@ def run(argv):
     if not os.access(CODESIGN, os.X_OK):
         say("broken: /usr/bin/codesign is not an executable file")
         return 2
-    if not os.path.isfile(args.keychain):
+    if not keychain_present(args.keychain, args.mode):
         say("broken: the --keychain path is not a file, and security would list it as empty")
         return 2
     if not FIXTURE.is_file():
         say("broken: the signing fixture is missing")
         return 2
-    try:
-        lock = hold_keychain(args.keychain)
-    except OSError:
-        say("broken: another key-reach-check run holds this keychain, and the fixed control names cannot be shared")
-        return 2
+    lock = None  # --probe-only writes nothing, so it takes no lock and leaves no lock file
+    if args.mode != "probe-only":
+        try:
+            lock = hold_keychain(args.keychain)
+        except OSError:
+            say("broken: another key-reach-check run holds this keychain, and the fixed control names cannot be "
+                "shared")
+            return 2
     probe = Probe(SECURITY, args.keychain, args.signer, CODESIGN, args.timeout)
     previous = {number: signal.getsignal(number) for number in SIGNALS}  # all noted before any is changed
     problems = []
     found = []
+    planted_and_proven = False
     held = None  # the launcher's mask, given back at the very end
     try:
         # Held while the handlers change, so none reaches a handler not yet replaced. Then unblocked for the run even
@@ -475,7 +733,15 @@ def run(argv):
             signal.signal(number, stop)
         # Only once every handler is in place; if one failed, the signals stay blocked until the cleanup.
         signal.pthread_sigmask(signal.SIG_SETMASK, set(held).difference(SIGNALS))
-        found = check(args, probe, entries)
+        if args.mode == "plant":
+            plant(probe)
+            planted_and_proven = True
+        elif args.mode == "remove":
+            remove(probe)
+        elif args.mode == "probe-only":
+            found = probe_only(probe, entries)
+        else:
+            found = check(args, probe, entries)
     except (Broken, Stopped) as error:
         problems.append(str(error))
     except OSError as error:
@@ -488,6 +754,8 @@ def run(argv):
         except Stopped as error:  # it landed before the line above took effect; stop ignored all three first
             problems.append(str(error))
             ignore_signals()
+        if planted_and_proven and not problems:
+            probe.planted = []  # proven, and nothing went wrong after: they stay for the session's probe
         problems += probe.remove_planted()
         # Every previous handler comes back under a block, then the launcher's mask in one call, so no handled signal
         # meets a half-restored table, and one the launcher had blocked keeps waiting for the launcher.
@@ -500,6 +768,8 @@ def run(argv):
         for problem in problems:
             say(f"broken: {problem}")
         return 2
+    for line in probe.skipped:
+        say(line)
     for line in found:
         say(line)
     return 1 if found else 0

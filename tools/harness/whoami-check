@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""whoami-check: is the dedicated macOS test account present and not an administrator?
+
+Usage: whoami-check [--guard] [--name-file <path>] [--dscl <path>] [--dseditgroup <path>]
+
+Destructive, soak and exhaustion suites run only under one standard macOS account, so a crash or a panic they cause
+costs that account, never the person's own. This reads the account's name from tools/harness/test-user (one line:
+a lowercase account name), looks the account up with `dscl . -read /Users/<name>` and its admin membership with
+`dseditgroup -o checkmember -m <name> admin`, and needs no password.
+
+Exit 0: the account exists and is not in the admin group. Exit 1: a named refusal (the account is missing, or it is
+an admin). Exit 2: broken (the name file is missing, unreadable or malformed, or a lookup answered in a way this
+tool does not know). The lookups' exit codes it knows: dscl 0 found, 56 not found; dseditgroup 0 member, 67 not a
+member. --dscl and --dseditgroup name stand-ins for tests.
+
+Without --guard this answers whether the account is ready, from any account, as setting it up needs. --guard, which
+every destructive, soak or exhaustion suite calls before it starts, also refuses (exit 1) unless the process runs as
+that account: the real and the effective uid must both be that account's, found in the user database.
+"""
+import argparse
+import os
+import pathlib
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+NAME = re.compile(r"[a-z_][a-z0-9_]{0,30}")
+DEFAULT_NAMES = pathlib.Path(__file__).resolve().parent / "test-user"
+
+
+def say(line):
+    print(f"whoami-check: {line}", flush=True)
+
+
+MAX_NAME_FILE = 64  # the longest name NAME allows is 31 characters, plus its newline
+
+
+def account_name(path):
+    """The one account name the file holds, read as at most MAX_NAME_FILE + 1 bytes, so a file that is longer, or a
+    pipe that never ends, is refused without reading the rest."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # a pipe or a link never holds the check
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ValueError(f"the name file {path} is not a regular file")
+            data = handle.read(MAX_NAME_FILE + 1)
+    except OSError as error:
+        raise ValueError(f"cannot read the name file {path}: {error.strerror}") from None
+    if len(data) > MAX_NAME_FILE:
+        raise ValueError(f"the name file {path} is longer than any account name")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"cannot read the name file {path}: {error}") from None
+    lines = text.split("\n")
+    if len(lines) != 2 or lines[1] != "" or not NAME.fullmatch(lines[0]):
+        raise ValueError(f"the name file {path} must hold one lowercase account name and a newline")
+    return lines[0]
+
+
+def run(argv):
+    """The exit status of a lookup; only the status is read, so its output goes to /dev/null."""
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=30).returncode
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="whoami-check")
+    parser.add_argument("--guard", action="store_true")
+    parser.add_argument("--name-file", default=str(DEFAULT_NAMES))
+    parser.add_argument("--dscl", default="/usr/bin/dscl")
+    parser.add_argument("--dseditgroup", default="/usr/sbin/dseditgroup")
+    args = parser.parse_args(argv)
+    try:
+        name = account_name(pathlib.Path(args.name_file))
+    except ValueError as error:
+        say(f"broken: {error}")
+        return 2
+    try:
+        found = run([args.dscl, ".", "-read", f"/Users/{name}", "UniqueID"])
+        if found == 56:
+            say(f"refused: the test account {name} does not exist")
+            return 1
+        if found != 0:
+            say(f"broken: dscl answered {found} for {name}")
+            return 2
+        member = run([args.dseditgroup, "-o", "checkmember", "-m", name, "admin"])
+    except (OSError, subprocess.TimeoutExpired) as error:
+        say(f"broken: a lookup could not run: {error}")
+        return 2
+    if member == 0:
+        say(f"refused: the test account {name} is an admin; destructive suites need a standard account")
+        return 1
+    if member != 67:
+        say(f"broken: dseditgroup answered {member} for {name}")
+        return 2
+    if args.guard:
+        try:
+            current = pwd.getpwuid(os.getuid()).pw_name
+            wanted = pwd.getpwnam(name).pw_uid
+        except KeyError:
+            say("broken: this process's uid, or the test account, has no entry in the user database")
+            return 2
+        if current != name:
+            say(f"refused: this runs as {current}, not the test account {name}")
+            return 1
+        if os.geteuid() != wanted:
+            say(f"refused: the effective uid {os.geteuid()} is not the test account's {wanted}; "
+                "elevated runs are refused")
+            return 1
+        say(f"{name} exists, is a standard account, and is the account running this")
+        return 0
+    say(f"{name} exists and is a standard account")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

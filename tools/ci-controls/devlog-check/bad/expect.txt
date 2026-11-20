@@ -1,0 +1,1 @@
+devlog-check: 2026-01-05-entry.md: missing description

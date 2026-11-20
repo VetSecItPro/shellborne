@@ -1,0 +1,21 @@
+[package]
+name = "sb-engine-vt"
+description = "The engine adapter: the only Rust code that touches libghostty-vt (layer 1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Cargo cannot override one inherited lint, so the FFI crate carries its own table: the workspace table with
+# unsafe code allowed, and every other lint the same (plan step P0.10.2).
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+disallowed_types = "deny"
+disallowed_methods = "deny"

@@ -1,0 +1,91 @@
+# Every gate the gates workflow runs, how tools/ci-local calls it, and (through tools/ci-controls/<gate>/good and
+# bad) the two cases that show it still tells good input from bad. tools/ci-local refuses to run when the workflow
+# calls a gate this file leaves out.
+
+[gates.leak-guard]
+args = ["commits", "{repo}", "{range}"]
+
+[gates.secrets]
+args = ["commits", "{repo}", "{range}"]
+
+[gates.workflows]
+args = ["{repo}"]
+
+[gates.legal-files]
+args = ["{repo}"]
+copy = ["LICENSE", "NOTICE", "SECURITY.md", "TRADEMARKS.md", "CONTRIBUTING.md"]
+
+[gates.codeowners]
+args = ["{repo}", "@VetSecItPro"]
+copy = [".github/CODEOWNERS"]
+
+[gates.devlog-check]
+args = ["{repo}"]
+
+[gates.unsafe-code]
+args = ["--rust", "{repo}"]
+copy = ["clippy.toml", "rust-toolchain.toml"]
+fixture = "rust-workspace"
+timeout = 1800
+
+[gates.who-frees]
+args = ["{repo}"]
+
+[gates.build-settings]
+args = ["{repo}"]
+copy = ["apple/Package.swift"]
+
+[gates.repo-rules]
+args = ["{repo}"]
+
+[gates.term-lint]
+args = ["{repo}"]
+copy = ["docs/intel-support-policy.md"]
+
+[gates.hidden-chars]
+args = ["{repo}"]
+
+[gates.copy-lint]
+args = ["{repo}"]
+
+[gates.pins]
+args = ["{repo}"]
+
+[gates.deny-calls]
+args = ["{repo}"]
+
+[gates.bypass-flags]
+args = ["{repo}"]
+
+[gates.boundaries]
+args = ["{repo}"]
+copy = ["clippy.toml", "rust-toolchain.toml", "tools/gates/allowed-deps.toml"]
+fixture = "rust-workspace"
+
+[gates.dco]
+args = ["{repo}", "{range}"]
+
+[gates.plan-step-format]
+args = []
+body = true
+
+[gates.pr-fields]
+args = ["--clone", "{repo}", "--range", "{range}"]
+body = true
+
+[gates.test-first]
+args = ["{repo}", "{range}"]
+body = true
+
+# Executables under tools/gates that ci-local does not run, each with where or when it runs instead. ci-local refuses
+# an executable there that is neither a gate above nor named here.
+[others]
+bundle-check = "checks a built app bundle; pull requests do not build one yet"
+codeql-results = "runs in the CodeQL workflow, on that workflow's own results"
+deps = "checks vendored dependencies; the gates workflow does not run it"
+entitlements = "checks a built app's entitlements; pull requests do not build one yet"
+link-check = "checks built binaries' links; pull requests do not build binaries yet"
+lipo = "checks universal binaries; pull requests do not build binaries yet"
+plan-attestation = "runs in the plan-attestation workflow"
+repo-settings = "reads the repository's settings from GitHub, with a token the gates workflow does not have"
+toolchain = "checks the pinned toolchain; the gates workflow does not run it"

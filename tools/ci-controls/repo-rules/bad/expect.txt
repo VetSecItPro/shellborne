@@ -1,0 +1,1 @@
+repo-rules: refused timer-or-watcher-outside-core: apple/Sources/FeatureClock/Tick.swift:3

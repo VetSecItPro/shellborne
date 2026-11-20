@@ -1,0 +1,10 @@
+[package]
+name = "sb-core"
+description = "The core model: session, workspace, agent adapter, event, setting and command (layer 3)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
