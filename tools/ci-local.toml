@@ -77,15 +77,16 @@ body = true
 args = ["{repo}", "{range}"]
 body = true
 
-# Executables under tools/gates that ci-local does not run, each with where or when it runs instead. ci-local refuses
-# an executable there that is neither a gate above nor named here.
+# Executables under tools/gates that ci-local does not run. Each names the workflow that runs it (runs_in, which
+# ci-local checks against that workflow's lines outside comments) or says why nothing runs it yet (not_run). ci-local
+# refuses an executable there that is neither a gate above nor named here, and any other form of entry.
 [others]
-bundle-check = "checks a built app bundle; pull requests do not build one yet"
-codeql-results = "runs in the CodeQL workflow, on that workflow's own results"
-deps = "checks vendored dependencies; the gates workflow does not run it"
-entitlements = "checks a built app's entitlements; pull requests do not build one yet"
-link-check = "checks built binaries' links; pull requests do not build binaries yet"
-lipo = "checks universal binaries; pull requests do not build binaries yet"
-plan-attestation = "runs in the plan-attestation workflow"
-repo-settings = "reads the repository's settings from GitHub, with a token the gates workflow does not have"
-toolchain = "checks the pinned toolchain; the gates workflow does not run it"
+bundle-check = { not_run = "judges a built app bundle; pull requests build none yet" }
+codeql-results = { runs_in = ".github/workflows/codeql.yml" }
+deps = { runs_in = ".github/workflows/macos.yml" }
+entitlements = { not_run = "judges a built app's entitlements; pull requests build none yet" }
+link-check = { not_run = "judges built binaries' links; pull requests build no binaries yet" }
+lipo = { not_run = "judges universal binaries; pull requests build no binaries yet" }
+plan-attestation = { runs_in = ".github/workflows/plan-attestation.yml" }
+repo-settings = { not_run = "reads the repository's settings from GitHub with a token no workflow is given" }
+toolchain = { runs_in = ".github/workflows/macos.yml" }
