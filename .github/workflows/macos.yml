@@ -1,5 +1,5 @@
 # Hosted macOS arm64 checks on every pull request and every push to main: the toolchain gate against the pinned
-# Xcode (chosen by path), Rust (as rust-toolchain.toml names it) and Zig (as tools/gates/toolchain.toml records it);
+# Xcode (its version read from tools/gates/toolchain.toml and chosen by path), Rust (as rust-toolchain.toml names it) and Zig (as tools/gates/toolchain.toml records it);
 # the dependency gate with the base commit's tables; and a locked build and test of the Rust workspace. Every tool
 # downloaded here comes through tools/fetch-pinned and its checksum.
 # Plan-Step: P0.13.3
@@ -23,13 +23,22 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Select the Xcode the toolchain record names
+        run: |
+          set -euo pipefail
+          version="$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["xcode"]["version"])' "$GITHUB_WORKSPACE/tools/gates/toolchain.toml")"
+          case "$version" in
+            ""|*[!0-9.]*) echo "the toolchain record's Xcode version is not plain digits and dots" >&2; exit 1 ;;
+          esac
+          developer="/Applications/Xcode_${version}.app/Contents/Developer"
+          test -d "$developer"
+          echo "DEVELOPER_DIR=$developer" >> "$GITHUB_ENV"
 
       - name: Install Zig from the toolchain record, and pinned cargo-audit and cargo-deny
         run: |
