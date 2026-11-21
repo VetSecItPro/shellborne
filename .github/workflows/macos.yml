@@ -49,6 +49,13 @@ jobs:
           tar -xzf cargo-audit.tgz --strip-components 1 -C "$bin" cargo-audit-aarch64-apple-darwin-v0.22.2/cargo-audit
           echo "$bin" >> "$GITHUB_PATH"
 
+      - name: Use rustup's own proxies, not Homebrew's wrapper scripts
+        run: |
+          set -euo pipefail
+          proxies="$(brew --prefix rustup)/libexec/bin"
+          test -L "$proxies/rustc"
+          echo "$proxies" >> "$GITHUB_PATH"
+
       - name: Install Rust exactly as rust-toolchain.toml names it
         run: |
           rustup toolchain install
