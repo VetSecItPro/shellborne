@@ -1,12 +1,8 @@
 # Contributing
 
-Thank you for your interest in Shellborne.
-
-## Before you start
-
-- Open an issue first for anything beyond a small fix, so the approach can be agreed before you build it.
-- Keep each pull request to one change.
-- Include tests for any change in behavior. A test should fail without your change and pass with it.
+Shellborne does not accept pull requests from outside the project. Only the maintainer and the project's own
+build account can open one, and the repository is set that way. Bug reports are welcome as issues; security reports
+go through SECURITY.md.
 
 ## Checks on your machine
 

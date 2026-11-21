@@ -7,11 +7,14 @@ Run from inside the repository: it builds the git top level of the current folde
 empty folder: a root that already holds anything is refused untouched (exit 2). Into it this writes:
   bin/  the app executable Shellborne and every other binary tools/gates/entitlements.toml lists, side by side:
         lipo merges the two architecture builds of each into one file, and codesign gives it a local (ad-hoc)
-        signature carrying the runtime-hardening option and the entitlements file the table names for it;
+        signature carrying the runtime-hardening option and the entitlements file the table names for it; the app's
+        executable is copied out of the signed bundle, so it is the bundle's own file;
   app/  Shellborne.app, holding an Info.plist and the same signed app executable, signed as a bundle.
 Rust builds with cargo build --release --locked for both Apple targets (CARGO_TARGET_DIR is honored); Swift
 builds the Shellborne product of apple/ for both architectures with swift build -c release. Intermediate files
-stay in cargo's and SwiftPM's own build folders; only the products land in the output root. The bundle's version
+stay in cargo's and SwiftPM's own build folders; only the products land in the output root. Each step runs in a
+session of its own with a time limit (BUILD_BUNDLE_STEP_SECONDS may lower it) and a cap on the bytes it prints; past
+either its whole process group is ended and the run is broken. The bundle's version
 is the one the built app prints for --self-test, so the version has one home. Exit 0 built, 2 broken; every
 failure names the step.
 """
@@ -19,15 +22,20 @@ import os
 import pathlib
 import plistlib
 import re
+import selectors
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import tomllib
 
 REPO = None  # set by main() to the git top level of the current folder
 TARGETS = {"aarch64-apple-darwin": "arm64", "x86_64-apple-darwin": "x86_64"}
 APP = "Shellborne"
 STEP_SECONDS = 1800
+OUTPUT_CAP = 4 * 1024 * 1024  # bytes a step may print before it is stopped as broken
+TAIL_BYTES = 4096  # bytes of a failed step's output shown, read from its end
 SELF_TEST = re.compile(r"\AShellborne (\d+\.\d+\.\d+)\n\Z")
 
 
@@ -35,16 +43,95 @@ class Broken(Exception):
     """A step that could not finish; the message names it."""
 
 
-def run(step, argv, **kwargs):
-    """Runs one build step with a time limit; its output is shown only when it fails."""
+def step_seconds():
+    """The per-step time limit: STEP_SECONDS, or BUILD_BUNDLE_STEP_SECONDS when it is a whole number from 1 to that."""
+    raw = os.environ.get("BUILD_BUNDLE_STEP_SECONDS")
+    if raw is None:
+        return STEP_SECONDS
+    if not raw.isdigit() or not 1 <= int(raw) <= STEP_SECONDS:
+        raise Broken(f"BUILD_BUNDLE_STEP_SECONDS must be a whole number from 1 to {STEP_SECONDS}")
+    return int(raw)
+
+
+def leader_exited(process):
+    """True once the step's leader has exited, asked without collecting it, so its group id stays its own until
+    end_group has signalled the group. A leader collected elsewhere leaves no status to trust: broken."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=STEP_SECONDS, **kwargs)
-    except (OSError, subprocess.TimeoutExpired) as error:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        raise Broken("a build step was collected by something else; its status is unknown") from None
+
+
+def end_group(process):
+    """Kills the step's whole group while its leader is still this process's to collect, then collects it within a
+    bounded wait; a group id is never signalled once its leader may have been reused."""
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)  # asks without collecting
+        held = True
+    except ChildProcessError:
+        held = False  # something else collected the leader, so its group id may already be someone else's
+    if held:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run(step, argv, cwd=None):
+    """Runs one build step in a session of its own, reading its output through a byte cap and its time through a
+    limit; past either, or on any error, its whole group is ended. Returns its standard output; its output is shown
+    (the last bytes only) when it fails."""
+    limit = step_seconds()
+    try:
+        process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as error:
         raise Broken(f"{step}: {error}") from None
-    if done.returncode != 0:
-        tail = "\n".join((done.stdout + done.stderr).strip().splitlines()[-20:])
-        raise Broken(f"{step}: exit {done.returncode}\n{tail}")
-    return done.stdout
+    out, tail, total = bytearray(), bytearray(), 0
+    deadline = time.monotonic() + limit
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ, "out")
+        selector.register(process.stderr, selectors.EVENT_READ, "err")
+        open_streams, exited = 2, False
+        while open_streams and not exited:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Broken(f"{step}: still running after {limit} seconds; its process group was ended")
+            exited = leader_exited(process)
+            # once the leader is gone, read only what is already waiting: a child it left may hold the pipes open
+            for key, _ in selector.select(timeout=0 if exited else min(remaining, 0.2)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    open_streams -= 1
+                    continue
+                total += len(chunk)
+                if total > OUTPUT_CAP:
+                    raise Broken(f"{step}: printed more than {OUTPUT_CAP} bytes; its process group was ended")
+                if key.data == "out":
+                    out += chunk
+                tail = (tail + chunk)[-TAIL_BYTES:]
+        while not leader_exited(process):
+            if time.monotonic() >= deadline:
+                raise Broken(f"{step}: still running after {limit} seconds; its process group was ended")
+            time.sleep(0.02)
+    finally:
+        selector.close()
+        end_group(process)  # also after a clean exit, so nothing the step started outlives it
+        process.stdout.close()
+        process.stderr.close()
+    code = process.returncode
+    if code is None:
+        raise Broken(f"{step}: its exit status could not be collected")
+    if code != 0:
+        shown = tail.decode("utf-8", errors="replace").strip()
+        raise Broken(f"{step}: exit {code}\n{shown}")
+    return out.decode("utf-8", errors="replace")
 
 
 def fresh_root(path):
@@ -70,8 +157,10 @@ def binaries():
 
 
 def cargo_target_dir():
+    """Where cargo writes, read as cargo reads it: a relative CARGO_TARGET_DIR is relative to the folder cargo runs
+    in, which is the repository."""
     configured = os.environ.get("CARGO_TARGET_DIR")
-    return pathlib.Path(configured) if configured else REPO / "target"
+    return REPO / configured if configured else REPO / "target"
 
 
 def build_rust(names, bin_dir):
@@ -87,7 +176,7 @@ def build_rust(names, bin_dir):
         run(f"lipo for {name}", ["lipo", "-create", *slices, "-output", str(bin_dir / name)])
 
 
-def build_swift(bin_dir):
+def build_swift():
     package = REPO / "apple"
     arches = [arg for arch in TARGETS.values() for arg in ("--arch", arch)]
     args = ["swift", "build", "-c", "release", "--package-path", str(package), *arches]
@@ -95,7 +184,7 @@ def build_swift(bin_dir):
     built = pathlib.Path(run("swift build --show-bin-path", [*args, "--show-bin-path"]).strip()) / APP
     if not built.is_file():
         raise Broken(f"swift build produced no {built}")
-    shutil.copy2(built, bin_dir / APP)
+    return built
 
 
 def sign(path, plist):
@@ -111,16 +200,19 @@ def version_of(app_binary):
     return found.group(1)
 
 
-def build_app(bin_dir, app_dir, plist):
+def build_app(built, bin_dir, app_dir, plist):
+    """Signs the app once, as a bundle, then copies its executable out to bin/, so the file the entitlements gate
+    judges is byte for byte the one the bundle carries."""
     bundle = app_dir / f"{APP}.app"
     (bundle / "Contents" / "MacOS").mkdir(parents=True)
-    version = version_of(bin_dir / APP)
+    version = version_of(built)
     info = {"CFBundleExecutable": APP, "CFBundleIdentifier": "dev.shellborne.Shellborne", "CFBundleName": APP,
             "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": version,
             "LSMinimumSystemVersion": "26.0"}
     (bundle / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
-    shutil.copy2(bin_dir / APP, bundle / "Contents" / "MacOS" / APP)
+    shutil.copy2(built, bundle / "Contents" / "MacOS" / APP)
     sign(bundle, plist)
+    shutil.copy2(bundle / "Contents" / "MacOS" / APP, bin_dir / APP)
 
 
 def main(argv):
@@ -136,10 +228,11 @@ def main(argv):
         bin_dir.mkdir()
         app_dir.mkdir()
         build_rust([name for name in listed if name != APP], bin_dir)
-        build_swift(bin_dir)
+        built = build_swift()
         for name, plist in listed.items():
-            sign(bin_dir / name, plist)
-        build_app(bin_dir, app_dir, listed[APP])
+            if name != APP:
+                sign(bin_dir / name, plist)
+        build_app(built, bin_dir, app_dir, listed[APP])
     except Broken as error:
         print(f"build-bundle: broken: {error}", file=sys.stderr)
         return 2
