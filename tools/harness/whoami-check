@@ -21,6 +21,7 @@ An interrupt, a termination request or a hangup while a lookup runs ends that lo
 limit does, and the check exits 2 naming the signal: a check that did not finish never answers 0 or 1.
 """
 import argparse
+import errno
 import os
 import pathlib
 import pwd
@@ -29,6 +30,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 NAME = re.compile(r"[a-z_][a-z0-9_]{0,30}")
 DEFAULT_NAMES = pathlib.Path(__file__).resolve().parent / "test-user"
@@ -85,6 +87,21 @@ def leader_held(process):
     return True
 
 
+def exited_held(process, seconds):
+    """Waits up to seconds for the lookup's leader to exit without collecting it, so its group id stays its own
+    until end() has signalled the group. A leader something else collected leaves no status to trust: broken."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return
+        except ChildProcessError:
+            raise OSError(errno.ECHILD, "the lookup was collected by something else; its status is unknown") from None
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, seconds)
+        time.sleep(0.02)
+
+
 def end(process):
     """Ends the lookup's whole group while its leader is held, then collects the leader, waiting at most 5 seconds."""
     if leader_held(process):
@@ -103,9 +120,10 @@ def end(process):
 
 def run(argv):
     """The exit status of a lookup; only the status is read, so its output goes to /dev/null. The lookup runs in a
-    session of its own. The stop signals are held from before it starts until the cleanup below is in place, and
-    held again during that cleanup, so when it passes its 30 seconds or a stop signal arrives the whole group is
-    ended, children it started included, while its leader is still uncollected; then it is collected."""
+    session of its own. The stop signals are held from before it starts; during the bounded wait they are unblocked
+    whatever mask this process was started with, and they are held again for the cleanup. On every path, a clean
+    exit included, the whole group is ended while its leader is still uncollected, children it left behind
+    included; then the leader is collected and its status returned."""
     before = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -114,15 +132,17 @@ def run(argv):
         signal.pthread_sigmask(signal.SIG_SETMASK, before)
         raise
     try:
-        signal.pthread_sigmask(signal.SIG_SETMASK, before)
-        return process.wait(timeout=30)
-    except BaseException:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
+        exited_held(process, 30)
+    finally:
         signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
         try:
             end(process)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, before)
-        raise
+    if process.returncode is None:
+        raise OSError(errno.ECHILD, "the lookup could not be collected")
+    return process.returncode
 
 
 def main(argv):

@@ -19,6 +19,8 @@ let package = Package(
         .target(name: "FeaturePlaceholder", dependencies: ["CoreClient", "DesignSystem"], swiftSettings: uiTargetSettings),
         .target(name: "PlatformShell", dependencies: ["TerminalView", "CoreClient", "DesignSystem", "FeaturePlaceholder"],
                 swiftSettings: uiTargetSettings),
+        .executableTarget(name: "Shellborne", dependencies: ["PlatformShell"], swiftSettings: uiTargetSettings),
+        .testTarget(name: "ShellborneTests", dependencies: ["PlatformShell"], swiftSettings: uiTargetSettings),
     ],
     swiftLanguageModes: [.v6]
 )
