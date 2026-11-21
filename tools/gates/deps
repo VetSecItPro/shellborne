@@ -25,13 +25,17 @@ Usage: deps [--tables-from <ref>] <repo>
         refused. BSD-2-Clause is not matched by a text that holds the BSD-3-Clause endorsement clause.
       * every tracked font file must sit in a vendored folder from the table, and every tracked file under
         third_party/ must sit in one too, except a PIN.toml, which is a pin record.
-    Every LGPL fails, whatever its kind and however it would be linked.
+      * every [[surface-package]] (a package the Stage 1 surface library links, for development builds only) must
+        have an allowed license, or an [[exception]] naming it by exact name and license, with its duty; an
+        exception covers that one package in that library and nothing else, and one naming no listed surface
+        package is refused.
+    Every LGPL fails, whatever its kind and however it would be linked, except a surface package an exception names.
   - unpinned-package: a Package.resolved pin without an exact 40-hex revision, or pinned to a branch.
 
 --tables-from <ref> reads deny.toml and licenses.toml from tools/gates/ at that commit of the repository with
 git cat-file, so in CI a pull request cannot widen its own allow-list. Tracked text is read through the repo-rules
 reader, with its caps: tracked regular files only, never through a link, 2 MiB each. A refusal names the rule and
-file:line, never the source. Accepted exceptions live in deny.toml with a written reason. Exit 0 clean, 1 refused,
+file:line, never the source. Accepted crate exceptions live in deny.toml with a written reason. Exit 0 clean, 1 refused,
 2 broken; a missing tool for a lockfile that exists, a missing or malformed table, or an unreadable file is
 broken, never a pass.
 """
@@ -136,9 +140,10 @@ def load_tables(repo, ref):
     allow = set(allow)
     if OFL in allow or any("GPL" in item.upper() for item in allow):
         raise Broken("deny.toml allows OFL-1.1 or a GPL license, which no crate may carry")
-    unknown = set(table) - {"pin", "vendored"}
+    unknown = set(table) - {"pin", "vendored", "surface-package", "exception"}
     if unknown:
-        raise Broken("licenses.toml has a section other than [[pin]] and [[vendored]]")
+        raise Broken("licenses.toml has a section other than [[pin]], [[vendored]], [[surface-package]] and "
+                     "[[exception]]")
     pins, vendored = table.get("pin", []), table.get("vendored", [])
     if not isinstance(pins, list) or not isinstance(vendored, list):
         raise Broken("licenses.toml: [[pin]] and [[vendored]] must be arrays of tables")
@@ -152,7 +157,31 @@ def load_tables(repo, ref):
         if (not isinstance(entry, dict) or set(entry) != {"path", "license", "license-file"}
                 or not all(isinstance(value, str) and value for value in entry.values())):
             raise Broken("licenses.toml: each [[vendored]] needs exactly path, license and license-file")
-    return allow, deny_text, pins, vendored
+    surface, exceptions = table.get("surface-package", []), table.get("exception", [])
+    for entries, keys, label in ((surface, {"name", "license"}, "[[surface-package]] needs exactly name and license"),
+                                 (exceptions, {"name", "license", "duty"},
+                                  "[[exception]] needs exactly name, license and duty")):
+        if not isinstance(entries, list) or not all(
+                isinstance(entry, dict) and set(entry) == keys
+                and all(isinstance(value, str) and value.strip() for value in entry.values()) for entry in entries):
+            raise Broken(f"licenses.toml: each {label}")
+    return allow, deny_text, pins, vendored, surface, exceptions
+
+
+def check_surface(surface, exceptions, allow, findings):
+    """A package the Stage 1 surface library links passes when its license is on the allow-list, or when an
+    [[exception]] names it with exactly that license; an exception names one package in that library only and never
+    widens the allow-list. An exception that names no listed surface package is refused, so the list cannot go stale."""
+    named = {(entry["name"], entry["license"]) for entry in exceptions}
+    listed = {(entry["name"], entry["license"]) for entry in surface}
+    for entry in surface:
+        if not allowed(entry["license"], allow) and (entry["name"], entry["license"]) not in named:
+            findings.append(("license", f"licenses.toml surface package {entry['name']} ({entry['license']} is not on "
+                                        "the allow-list and no exception names it)"))
+    for entry in exceptions:
+        if (entry["name"], entry["license"]) not in listed:
+            findings.append(("license", f"licenses.toml exception {entry['name']} (names no surface package with "
+                                        "that license)"))
 
 
 def allowed(license, allow):
@@ -453,13 +482,14 @@ def main(argv):
         print(f"deps: broken: cannot load the repo-rules reader: {type(error).__name__}", file=sys.stderr)
         return 2
     try:
-        allow, deny_text, pins, vendored = load_tables(repo, ref)
+        allow, deny_text, pins, vendored, surface, exceptions = load_tables(repo, ref)
         names = rr.tracked(repo)
         check_rust(rr, repo, names, deny_text, findings)
         check_swift(rr, repo, names, pins, allow, findings)
         check_zig(rr, repo, names, pins, allow, findings)
         check_ghostty(rr, repo, names, pins, allow, findings)
         check_vendored(rr, repo, names, vendored, allow, findings)
+        check_surface(surface, exceptions, allow, findings)
     except (Broken, rr.Broken) as error:
         print(f"deps: broken: {error}", file=sys.stderr)
         return 2
@@ -470,8 +500,11 @@ def main(argv):
     if findings:
         return 1
     locks = sum(1 for name in names if name == "Cargo.lock" or name.endswith("/Cargo.lock"))
+    named = {(entry["name"], entry["license"]) for entry in exceptions}
+    excepted = sum(1 for entry in surface if (entry["name"], entry["license"]) in named)
     print(f"deps: clean: {locks} Cargo.lock audited and license-checked, {len(pins)} pins and {len(vendored)} "
-          "vendored folders in the license table")  # so a clean run never reads like one that checked nothing
+          f"vendored folders in the license table, {len(surface)} surface packages, {excepted} under a named "
+          "exception")  # so a clean run never reads like one that checked nothing
     return 0
 
 
