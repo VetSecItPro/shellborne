@@ -1,0 +1,6 @@
+{
+ "about": "One results row, public-safe on its own: what ran, where, on which build and commit, how it ended, under what load, and the hash of its raw log (plan steps P0.15.1, P0.15.6). Written by tools/harness/record-result, judged by tools/harness/ledger-check.",
+ "recorder": "record-result 1",
+ "required": ["machine", "build", "commit", "test", "result", "refresh_rate_hz", "concurrent_load", "log_path", "log_sha256", "recorded_at", "recorder"],
+ "result_values": ["pass", "fail"]
+}

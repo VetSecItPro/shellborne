@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""run-suite: the only way a kill, soak or exhaustion suite starts (plan step P0.14.2).
+
+Usage: run-suite --kind kill|soak|exhaustion -- <command> [args...]
+
+Runs whoami-check --guard beside this file first. Only when the process runs as the dedicated test account (exit 0)
+does it replace itself with the command; otherwise it relays whoami-check's refusal, naming the account it runs as,
+and exits 1 (or 2 when the check itself is broken). Destructive suites therefore never start from the owner's account.
+"""
+import os
+import pathlib
+import subprocess
+import sys
+
+KINDS = ("kill", "soak", "exhaustion")
+GUARD = pathlib.Path(__file__).resolve().parent / "whoami-check"
+
+
+def main(argv):
+    if len(argv) < 4 or argv[0] != "--kind" or argv[2] != "--":
+        print("usage: run-suite --kind kill|soak|exhaustion -- <command> [args...]", file=sys.stderr)
+        return 2
+    kind, command = argv[1], argv[3:]
+    if kind not in KINDS:
+        print(f"run-suite: broken: unknown kind {kind!r}; destructive suites are {', '.join(KINDS)}", file=sys.stderr)
+        return 2
+    try:
+        guard = subprocess.run([sys.executable, "-I", str(GUARD), "--guard"], capture_output=True, text=True,
+                               timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"run-suite: broken: the account guard could not run: {error}", file=sys.stderr)
+        return 2
+    said = (guard.stdout + guard.stderr).strip()
+    if guard.returncode == 1:
+        print(f"run-suite: refused: the {kind} suite starts only as the test account. {said}")
+        return 1
+    if guard.returncode != 0:
+        print(f"run-suite: broken: the account guard answered {guard.returncode}: {said}", file=sys.stderr)
+        return 2
+    try:
+        os.execvp(command[0], command)
+    except OSError as error:
+        print(f"run-suite: broken: the suite could not start: {error.strerror}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
