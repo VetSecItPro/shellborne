@@ -25,6 +25,9 @@ COMMIT = re.compile(r"^[0-9a-f]{40}$")
 REQUIRED = frozenset({"machine", "build", "commit", "test", "result", "refresh_rate_hz", "concurrent_load", "log_path",
                       "log_sha256", "recorded_at", "recorder"})
 RESULTS = frozenset({"pass", "fail"})
+# The commit check decides a verdict, so it runs the system git in a minimal environment, never one first on PATH.
+GIT = "/usr/bin/git"
+GIT_ENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
 
 
 class Unusable(Exception):
@@ -130,8 +133,8 @@ def commit_problem(repo, commit):
     if not isinstance(commit, str) or not COMMIT.match(commit):
         return f"commit {commit} is not a 40-hex commit id"
     try:
-        done = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"], capture_output=True,
-                              stdin=subprocess.DEVNULL, timeout=30)
+        done = subprocess.run([GIT, "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"], capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=30, env=GIT_ENV)
     except (OSError, subprocess.TimeoutExpired):
         return f"commit {commit} could not be checked: git did not answer"
     return None if done.returncode == 0 else f"commit {commit} does not exist in {repo}"

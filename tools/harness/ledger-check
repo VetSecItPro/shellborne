@@ -5,7 +5,7 @@ Usage: ledger-check --ledger <ledger.jsonl> [--repo <repo>]
 
 Each row must carry every field tools/harness/results-schema.json requires (the concurrent-load field included),
 the recorder name the schema names, a result the schema allows, a refresh rate that is a finite positive number, a
-commit that exists in --repo, and a log_path inside the ledger's folder naming a regular file (never through a link)
+commit that /usr/bin/git finds in --repo, and a log_path inside the ledger's folder naming a regular file (never through a link)
 whose SHA-256 equals the row's log_sha256. Refuses (exit 1) naming each row by its line and reason; exit 0 every row
 holds, 2 broken (a ledger that is missing, not a regular file, reached through a link, past its size cap, not
 UTF-8 or not JSON,

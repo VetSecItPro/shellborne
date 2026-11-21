@@ -28,7 +28,8 @@ Usage: deps [--tables-from <ref>] <repo>
       * every [[surface-package]] (a package the Stage 1 surface library links, for development builds only) must
         have an allowed license, or an [[exception]] naming it by exact name and license, with its duty; an
         exception covers that one package in that library and nothing else, one naming no listed surface
-        package is refused, and none may name AGPL or a GPL without a WITH exception.
+        package is refused, and none may name AGPL, or a GPL other than one
+        carrying the Bison parser exception.
     Every LGPL fails, whatever its kind and however it would be linked, except a surface package an exception names.
   - unpinned-package: a Package.resolved pin without an exact 40-hex revision, or pinned to a branch.
 
@@ -168,13 +169,21 @@ def load_tables(repo, ref):
     return allow, deny_text, pins, vendored, surface, exceptions
 
 
+# The only exception clause that lets a GPL term be named: the Bison parser skeleton's, which lets the generated
+# parser be shipped under other terms. Any other GPL, with or without a WITH clause, stays refused.
+GPL_OUTPUT_EXCEPTIONS = frozenset({"BISON-EXCEPTION-2.2"})
+
+
 def exception_admissible(license):
-    """No exception may name AGPL, or a GPL term without a WITH exception: GPL and AGPL stay refused, and only a
-    GPL whose own exception lets its output be used under other terms (the Bison case) can be named."""
+    """No exception may name AGPL, or a GPL term unless its WITH clause is one of GPL_OUTPUT_EXCEPTIONS."""
     for term in re.split(r"\s+(?:OR|AND)\s+", license.strip()):
         term = term.strip("() ").upper()
-        if "AGPL" in term or (term.startswith("GPL-") and " WITH " not in term):
+        if "AGPL" in term:
             return False
+        if term.startswith("GPL-"):
+            parts = term.split(" WITH ")
+            if len(parts) != 2 or parts[1].strip() not in GPL_OUTPUT_EXCEPTIONS:
+                return False
     return True
 
 
@@ -185,7 +194,7 @@ def check_surface(surface, exceptions, allow, findings):
     for entry in exceptions:
         if not exception_admissible(entry["license"]):
             findings.append(("license", f"licenses.toml exception {entry['name']} ({entry['license']}: no exception "
-                                        "may admit AGPL, or a GPL without a WITH exception)"))
+                                        "may admit AGPL, or a GPL other than one with the Bison exception)"))
     named = {(entry["name"], entry["license"]) for entry in exceptions if exception_admissible(entry["license"])}
     listed = {(entry["name"], entry["license"]) for entry in surface}
     for entry in surface:
