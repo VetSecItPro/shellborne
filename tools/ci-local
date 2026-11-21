@@ -350,26 +350,11 @@ def load_others(repo, workflows):
 
 
 def live_text(text):
-    """The workflow without its comments. A line's comment begins at its first unquoted #, provided that # opens the
-    line or follows whitespace; quotes are tracked within the line. So `echo "x # note"; tools/gates/x .` keeps its
-    gate, and a trailing `# tools/gates/x` does not count as a run. A quote left open ends with its line. This reads
-    text, not YAML or shell: an apostrophe inside a word opens a quote here too, so a comment after one is read as
-    live."""
-    kept = []
-    for line in text.split("\n"):
-        quote = None
-        end = len(line)
-        for at, char in enumerate(line):
-            if quote:
-                if char == quote:
-                    quote = None
-            elif char in "'\"":
-                quote = char
-            elif char == "#" and (at == 0 or line[at - 1].isspace()):
-                end = at
-                break
-        kept.append(line[:end])
-    return "\n".join(kept)
+    """What a workflow line says before its first #, line by line. Only this part can back a runs_in entry, so
+    nothing written after a # (a comment, or a quoted # that only looks like one) is ever taken for a real run.
+    The cost is on the safe side: a step whose command has a # ahead of the gate's name is refused, never accepted;
+    write the gate first or move the # to its own line."""
+    return "\n".join(line.split("#", 1)[0] for line in text.split("\n"))
 
 
 def tracked_workflows(repo, tracked):
