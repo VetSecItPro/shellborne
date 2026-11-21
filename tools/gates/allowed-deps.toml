@@ -77,3 +77,11 @@ deps = ["CoreClient", "DesignSystem"]
 layer = 5
 deps = ["TerminalView", "CoreClient", "DesignSystem", "FeaturePlaceholder"]
 frameworks = ["AppKit"]
+
+[swift.Shellborne]
+layer = 5
+deps = ["PlatformShell"]
+
+[swift.ShellborneTests]
+layer = 5
+deps = ["PlatformShell"]

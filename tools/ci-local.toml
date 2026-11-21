@@ -81,12 +81,12 @@ body = true
 # ci-local checks against that workflow's lines outside comments) or says why nothing runs it yet (not_run). ci-local
 # refuses an executable there that is neither a gate above nor named here, and any other form of entry.
 [others]
-bundle-check = { not_run = "judges a built app bundle; pull requests build none yet" }
+bundle-check = { runs_in = ".github/workflows/macos.yml" }
 codeql-results = { runs_in = ".github/workflows/codeql.yml" }
 deps = { runs_in = ".github/workflows/macos.yml" }
-entitlements = { not_run = "judges a built app's entitlements; pull requests build none yet" }
-link-check = { not_run = "judges built binaries' links; pull requests build no binaries yet" }
-lipo = { not_run = "judges universal binaries; pull requests build no binaries yet" }
+entitlements = { runs_in = ".github/workflows/macos.yml" }
+link-check = { runs_in = ".github/workflows/macos.yml" }
+lipo = { runs_in = ".github/workflows/macos.yml" }
 plan-attestation = { runs_in = ".github/workflows/plan-attestation.yml" }
 repo-settings = { not_run = "reads the repository's settings from GitHub with a token no workflow is given" }
 toolchain = { runs_in = ".github/workflows/macos.yml" }

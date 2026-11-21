@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""build-bundle: build the universal stub bundle the binary gates judge (plan steps P0.13.3, P0.13.5).
+
+Usage: build-bundle <output root>
+
+Run from inside the repository: it builds the git top level of the current folder. The output root must not exist yet or must be an
+empty folder: a root that already holds anything is refused untouched (exit 2). Into it this writes:
+  bin/  the app executable Shellborne and every other binary tools/gates/entitlements.toml lists, side by side:
+        lipo merges the two architecture builds of each into one file, and codesign gives it a local (ad-hoc)
+        signature carrying the runtime-hardening option and the entitlements file the table names for it;
+  app/  Shellborne.app, holding an Info.plist and the same signed app executable, signed as a bundle.
+Rust builds with cargo build --release --locked for both Apple targets (CARGO_TARGET_DIR is honored); Swift
+builds the Shellborne product of apple/ for both architectures with swift build -c release. Intermediate files
+stay in cargo's and SwiftPM's own build folders; only the products land in the output root. The bundle's version
+is the one the built app prints for --self-test, so the version has one home. Exit 0 built, 2 broken; every
+failure names the step.
+"""
+import os
+import pathlib
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+
+REPO = None  # set by main() to the git top level of the current folder
+TARGETS = {"aarch64-apple-darwin": "arm64", "x86_64-apple-darwin": "x86_64"}
+APP = "Shellborne"
+STEP_SECONDS = 1800
+SELF_TEST = re.compile(r"\AShellborne (\d+\.\d+\.\d+)\n\Z")
+
+
+class Broken(Exception):
+    """A step that could not finish; the message names it."""
+
+
+def run(step, argv, **kwargs):
+    """Runs one build step with a time limit; its output is shown only when it fails."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=STEP_SECONDS, **kwargs)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Broken(f"{step}: {error}") from None
+    if done.returncode != 0:
+        tail = "\n".join((done.stdout + done.stderr).strip().splitlines()[-20:])
+        raise Broken(f"{step}: exit {done.returncode}\n{tail}")
+    return done.stdout
+
+
+def fresh_root(path):
+    """The output root, created empty; a root that exists and is not an empty real folder is refused."""
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise Broken(f"the output root {path} exists and is not a folder")
+    if path.is_dir() and any(path.iterdir()):
+        raise Broken(f"the output root {path} already holds files; give an empty or new folder")
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
+
+
+def binaries():
+    """{binary name: committed plist path} from the entitlements table, the one list of what ships."""
+    table = tomllib.loads((REPO / "tools" / "gates" / "entitlements.toml").read_text())
+    listed = {entry["path"]: REPO / entry["plist"] for entry in table.get("binary", [])}
+    if APP not in listed:
+        raise Broken(f"tools/gates/entitlements.toml lists no {APP} binary")
+    for name, plist in listed.items():
+        if "/" in name or not plist.is_file():
+            raise Broken(f"the entitlements table's entry for {name} names no flat binary or no committed plist")
+    return listed
+
+
+def cargo_target_dir():
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    return pathlib.Path(configured) if configured else REPO / "target"
+
+
+def build_rust(names, bin_dir):
+    target_dir = cargo_target_dir()
+    for triple in TARGETS:
+        run(f"cargo build for {triple}", ["cargo", "build", "--release", "--locked", "--workspace", "--bins",
+                                          "--target", triple], cwd=REPO)
+    for name in names:
+        slices = [str(target_dir / triple / "release" / name) for triple in TARGETS]
+        for path in slices:
+            if not os.path.isfile(path):
+                raise Broken(f"cargo build produced no {path}")
+        run(f"lipo for {name}", ["lipo", "-create", *slices, "-output", str(bin_dir / name)])
+
+
+def build_swift(bin_dir):
+    package = REPO / "apple"
+    arches = [arg for arch in TARGETS.values() for arg in ("--arch", arch)]
+    args = ["swift", "build", "-c", "release", "--package-path", str(package), *arches]
+    run("swift build", [*args, "--product", APP])
+    built = pathlib.Path(run("swift build --show-bin-path", [*args, "--show-bin-path"]).strip()) / APP
+    if not built.is_file():
+        raise Broken(f"swift build produced no {built}")
+    shutil.copy2(built, bin_dir / APP)
+
+
+def sign(path, plist):
+    run(f"codesign {path.name}", ["codesign", "--force", "--sign", "-", "--options", "runtime", "--entitlements",
+                                  str(plist), "--timestamp=none", str(path)])
+
+
+def version_of(app_binary):
+    printed = run("the app's self-test", [str(app_binary), "--self-test"])
+    found = SELF_TEST.match(printed)
+    if found is None:
+        raise Broken(f"the app's self-test printed {printed!r}, not its name and version")
+    return found.group(1)
+
+
+def build_app(bin_dir, app_dir, plist):
+    bundle = app_dir / f"{APP}.app"
+    (bundle / "Contents" / "MacOS").mkdir(parents=True)
+    version = version_of(bin_dir / APP)
+    info = {"CFBundleExecutable": APP, "CFBundleIdentifier": "dev.shellborne.Shellborne", "CFBundleName": APP,
+            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": version,
+            "LSMinimumSystemVersion": "26.0"}
+    (bundle / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+    shutil.copy2(bin_dir / APP, bundle / "Contents" / "MacOS" / APP)
+    sign(bundle, plist)
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1].startswith("-"):
+        print("usage: build-bundle <output root>", file=sys.stderr)
+        return 2
+    global REPO
+    try:
+        REPO = pathlib.Path(run("finding the repository", ["git", "rev-parse", "--show-toplevel"]).strip())
+        root = fresh_root(pathlib.Path(argv[1]))
+        listed = binaries()
+        bin_dir, app_dir = root / "bin", root / "app"
+        bin_dir.mkdir()
+        app_dir.mkdir()
+        build_rust([name for name in listed if name != APP], bin_dir)
+        build_swift(bin_dir)
+        for name, plist in listed.items():
+            sign(bin_dir / name, plist)
+        build_app(bin_dir, app_dir, listed[APP])
+    except Broken as error:
+        print(f"build-bundle: broken: {error}", file=sys.stderr)
+        return 2
+    print(f"build-bundle: built {len(listed)} universal binaries in {bin_dir} and {APP}.app in {app_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
