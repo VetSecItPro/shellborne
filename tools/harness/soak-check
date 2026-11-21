@@ -66,7 +66,9 @@ def end(process):
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        pass
+        raise Broken("the command could not be collected within 5 seconds of being killed; no verdict") from None
+    if process.returncode is None:
+        raise Broken("the command's exit status could not be collected; no verdict")
 
 
 def arguments(argv):
@@ -106,6 +108,8 @@ def soak(args, command):
                 over = True  # stop at once: a fast leak must not run on until the soak's end
                 break
             time.sleep(args.interval)
+        if exited_at is None and not over and leader_exited(process):
+            exited_at = time.monotonic() - started  # it exited during the last interval, before the soak ended
     finally:
         end(process)  # ends the whole group, children included, before the leader is collected
     if exited_at is not None:
