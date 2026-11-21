@@ -53,6 +53,15 @@ def step_seconds():
     return int(raw)
 
 
+def leader_exited(process):
+    """True once the step's leader has exited, asked without collecting it, so its group id stays its own until
+    end_group has signalled the group. A leader collected elsewhere leaves no status to trust: broken."""
+    try:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        raise Broken("a build step was collected by something else; its status is unknown") from None
+
+
 def end_group(process):
     """Kills the step's whole group while its leader is still this process's to collect, then collects it within a
     bounded wait; a group id is never signalled once its leader may have been reused."""
@@ -88,12 +97,14 @@ def run(step, argv, cwd=None):
     try:
         selector.register(process.stdout, selectors.EVENT_READ, "out")
         selector.register(process.stderr, selectors.EVENT_READ, "err")
-        open_streams = 2
-        while open_streams:
+        open_streams, exited = 2, False
+        while open_streams and not exited:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise Broken(f"{step}: still running after {limit} seconds; its process group was ended")
-            for key, _ in selector.select(timeout=min(remaining, 1.0)):
+            exited = leader_exited(process)
+            # once the leader is gone, read only what is already waiting: a child it left may hold the pipes open
+            for key, _ in selector.select(timeout=0 if exited else min(remaining, 0.2)):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -105,15 +116,18 @@ def run(step, argv, cwd=None):
                 if key.data == "out":
                     out += chunk
                 tail = (tail + chunk)[-TAIL_BYTES:]
-        try:
-            code = process.wait(timeout=max(deadline - time.monotonic(), 0.1))
-        except subprocess.TimeoutExpired:
-            raise Broken(f"{step}: still running after {limit} seconds; its process group was ended") from None
+        while not leader_exited(process):
+            if time.monotonic() >= deadline:
+                raise Broken(f"{step}: still running after {limit} seconds; its process group was ended")
+            time.sleep(0.02)
     finally:
         selector.close()
-        end_group(process)
+        end_group(process)  # also after a clean exit, so nothing the step started outlives it
         process.stdout.close()
         process.stderr.close()
+    code = process.returncode
+    if code is None:
+        raise Broken(f"{step}: its exit status could not be collected")
     if code != 0:
         shown = tail.decode("utf-8", errors="replace").strip()
         raise Broken(f"{step}: exit {code}\n{shown}")

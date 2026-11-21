@@ -4,12 +4,14 @@
 Usage: soak-check --seconds <s> --interval <s> --max-growth-mb <mb> -- <command> [args...]
 
 Starts the command in a session of its own with no input and its output discarded, samples its resident memory
-(ps -o rss) every interval for the given seconds, then ends its whole process group. Growth is the highest sample in
+(ps -o rss) every interval for the given seconds, then ends its whole process group. The run stops at once, refused,
+when memory climbs past the limit over its first sample, so a fast leak cannot run on to the end of a long soak. Growth is the highest sample in
 the last quarter of the run minus the lowest in the first quarter. Exit 0 flat (growth within the limit), 1 refused
 (growth past it, with the figures), 2 broken: bad arguments, a command that cannot start or exits before the time is
 up, or a sample that cannot be read. Stated limit: only the command's own process is measured, not its children.
 """
 import argparse
+import math
 import os
 import signal
 import subprocess
@@ -39,6 +41,14 @@ def rss_kb(pid):
     if done.returncode != 0 or not text.isdigit():
         raise Broken("could not read the command's memory")
     return int(text)
+
+
+def leader_exited(process):
+    """True once the command has exited, asked without collecting it; a command collected elsewhere is broken."""
+    try:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        raise Broken("the command was collected by something else; its status is unknown") from None
 
 
 def end(process):
@@ -73,8 +83,8 @@ def arguments(argv):
         raise Broken(f"--seconds must be above 0 and at most {MAX_SECONDS}, --interval from {MIN_INTERVAL} to it")
     if args.seconds / args.interval > MAX_SAMPLES:
         raise Broken(f"that run would take more than {MAX_SAMPLES} samples")
-    if not args.max_growth_mb > 0:
-        raise Broken("--max-growth-mb must be above 0")
+    if not (math.isfinite(args.max_growth_mb) and args.max_growth_mb > 0):
+        raise Broken("--max-growth-mb must be a finite number above 0")
     return args, command
 
 
@@ -84,16 +94,24 @@ def soak(args, command):
                                    stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as error:
         raise Broken(f"the command could not start: {error.strerror}") from None
-    samples, started = [], time.monotonic()
+    samples, started, exited_at, over = [], time.monotonic(), None, False
+    limit_kb = args.max_growth_mb * 1024
     try:
         while time.monotonic() - started < args.seconds:
-            if process.poll() is not None:
-                raise Broken(f"the command exited (status {process.returncode}) after "
-                             f"{time.monotonic() - started:.1f} s, before the soak ended")
+            if leader_exited(process):
+                exited_at = time.monotonic() - started
+                break
             samples.append(rss_kb(process.pid))
+            if samples[-1] - samples[0] > limit_kb:
+                over = True  # stop at once: a fast leak must not run on until the soak's end
+                break
             time.sleep(args.interval)
     finally:
-        end(process)
+        end(process)  # ends the whole group, children included, before the leader is collected
+    if exited_at is not None:
+        raise Broken(f"the command exited (status {process.returncode}) after {exited_at:.1f} s, before the soak ended")
+    if over:
+        return (samples[-1] - samples[0]) / 1024, len(samples)
     if len(samples) < 4:
         raise Broken("too few samples to judge; lengthen --seconds or shorten --interval")
     quarter = max(1, len(samples) // 4)
