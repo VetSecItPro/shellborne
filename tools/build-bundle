@@ -34,6 +34,7 @@ REPO = None  # set by main() to the git top level of the current folder
 TARGETS = {"aarch64-apple-darwin": "arm64", "x86_64-apple-darwin": "x86_64"}
 APP = "Shellborne"
 STEP_SECONDS = 1800
+DRAIN_SECONDS = 5  # how long the pipes may stay open after the step's group is ended
 OUTPUT_CAP = 4 * 1024 * 1024  # bytes a step may print before it is stopped as broken
 TAIL_BYTES = 4096  # bytes of a failed step's output shown, read from its end
 SELF_TEST = re.compile(r"\AShellborne (\d+\.\d+\.\d+)\n\Z")
@@ -41,6 +42,25 @@ SELF_TEST = re.compile(r"\AShellborne (\d+\.\d+\.\d+)\n\Z")
 
 class Broken(Exception):
     """A step that could not finish; the message names it."""
+
+
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+class Interrupted(Exception):
+    """A stop signal arrived before the run finished."""
+
+
+def on_stop(signum, _frame):
+    raise Interrupted(signal.Signals(signum).name)
+
+
+def hold_stops():
+    """Raise Interrupted on a stop signal instead of dying at once, and keep SIGCHLD at its default, so a stop always
+    passes through the cleanup that ends the child's whole group."""
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    for signum in STOPS:
+        signal.signal(signum, on_stop)
 
 
 def step_seconds():
@@ -86,18 +106,40 @@ def run(step, argv, cwd=None):
     limit; past either, or on any error, its whole group is ended. Returns its standard output; its output is shown
     (the last bytes only) when it fails."""
     limit = step_seconds()
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)  # no stop lands between the spawn and the cleanup
     try:
         process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
     except OSError as error:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
         raise Broken(f"{step}: {error}") from None
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
+        raise
     out, tail, total = bytearray(), bytearray(), 0
     deadline = time.monotonic() + limit
     selector = selectors.DefaultSelector()
     try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)  # a stop may arrive only while the step is waited on
         selector.register(process.stdout, selectors.EVENT_READ, "out")
         selector.register(process.stderr, selectors.EVENT_READ, "err")
         open_streams, exited = 2, False
+
+        def take(key):
+            """Read one chunk: count it against the cap, keep stdout and the tail, and note an end of file."""
+            nonlocal open_streams, total, out, tail
+            chunk = os.read(key.fileobj.fileno(), 65536)
+            if not chunk:
+                selector.unregister(key.fileobj)
+                open_streams -= 1
+                return
+            total += len(chunk)
+            if total > OUTPUT_CAP:
+                raise Broken(f"{step}: printed more than {OUTPUT_CAP} bytes; its process group was ended")
+            if key.data == "out":
+                out += chunk
+            tail = (tail + chunk)[-TAIL_BYTES:]
+
         while open_streams and not exited:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -105,26 +147,35 @@ def run(step, argv, cwd=None):
             exited = leader_exited(process)
             # once the leader is gone, read only what is already waiting: a child it left may hold the pipes open
             for key, _ in selector.select(timeout=0 if exited else min(remaining, 0.2)):
-                chunk = os.read(key.fileobj.fileno(), 65536)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    open_streams -= 1
-                    continue
-                total += len(chunk)
-                if total > OUTPUT_CAP:
-                    raise Broken(f"{step}: printed more than {OUTPUT_CAP} bytes; its process group was ended")
-                if key.data == "out":
-                    out += chunk
-                tail = (tail + chunk)[-TAIL_BYTES:]
+                take(key)
         while not leader_exited(process):
             if time.monotonic() >= deadline:
                 raise Broken(f"{step}: still running after {limit} seconds; its process group was ended")
             time.sleep(0.02)
+        # End what the leader left behind, then read the pipes to their end under the same cap, so no
+        # output is dropped; a pipe still open after that is held by a process outside the group, which is refused
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+        try:
+            end_group(process)
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
+        until = min(deadline, time.monotonic() + DRAIN_SECONDS)
+        while open_streams:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise Broken(f"{step}: its output is still held open by a process outside its process group, "
+                             "which build-bundle cannot end; find and stop it")
+            for key, _ in selector.select(timeout=min(remaining, 0.2)):
+                take(key)
     finally:
-        selector.close()
-        end_group(process)  # also after a clean exit, so nothing the step started outlives it
-        process.stdout.close()
-        process.stderr.close()
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)  # the cleanup itself is never cut short by a stop
+        try:
+            selector.close()
+            end_group(process)  # also after a clean exit or a stop, so nothing the step started outlives it
+            process.stdout.close()
+            process.stderr.close()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, before)
     code = process.returncode
     if code is None:
         raise Broken(f"{step}: its exit status could not be collected")
@@ -220,6 +271,7 @@ def main(argv):
         print("usage: build-bundle <output root>", file=sys.stderr)
         return 2
     global REPO
+    hold_stops()
     try:
         REPO = pathlib.Path(run("finding the repository", ["git", "rev-parse", "--show-toplevel"]).strip())
         root = fresh_root(pathlib.Path(argv[1]))
@@ -235,6 +287,9 @@ def main(argv):
         build_app(built, bin_dir, app_dir, listed[APP])
     except Broken as error:
         print(f"build-bundle: broken: {error}", file=sys.stderr)
+        return 2
+    except Interrupted as stop:
+        print(f"build-bundle: broken: stopped by {stop}; the running step's process group was ended", file=sys.stderr)
         return 2
     print(f"build-bundle: built {len(listed)} universal binaries in {bin_dir} and {APP}.app in {app_dir}")
     return 0

@@ -1,0 +1,94 @@
+"""Bounded reads shared by the gates. Not a gate: it is not executable, so the gate manifest does not
+count it, and each gate loads it from the file beside it.
+
+A gate reads files it does not control: a path its caller names, or a file inside the repository it judges. Each is
+opened without following a symbolic link and without blocking, must be a regular file, and is read through a byte
+cap, so a FIFO cannot hang a gate, a link cannot point it at /dev/zero or another file, and a huge file cannot make
+it read without limit. Anything else raises Unreadable, which each gate reports as broken, never as a pass or a
+refusal. run_capped does the same for a command's output.
+"""
+import os
+import selectors
+import signal
+import stat
+import subprocess
+import time
+
+CHUNK = 1024 * 1024
+
+
+class Unreadable(Exception):
+    """A gate input that cannot be read within the rules above."""
+
+
+def read_bytes(path, cap):
+    """The whole of a regular file, opened no-follow and non-blocking, of at most cap bytes."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise Unreadable(f"{path} cannot be opened: {error.strerror}") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Unreadable(f"{path} is not a regular file")
+        if info.st_size > cap:
+            raise Unreadable(f"{path} is larger than {cap} bytes")
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, min(CHUNK, cap + 1 - len(data)))
+            if not chunk:
+                return bytes(data)
+            data += chunk
+            if len(data) > cap:
+                raise Unreadable(f"{path} grew past {cap} bytes while it was read")
+    except OSError as error:
+        raise Unreadable(f"{path} cannot be read: {error.strerror}") from None
+    finally:
+        os.close(fd)
+
+
+def read_text(path, cap):
+    """The file as UTF-8, strictly: an invalid byte is never replaced and judged, it is Unreadable."""
+    try:
+        return read_bytes(path, cap).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Unreadable(f"{path} is not UTF-8 (byte {error.start})") from None
+
+
+def run_capped(argv, cap, timeout):
+    """(exit status, standard output) of a command run in a session of its own, with its output read through cap
+    bytes and its time through timeout seconds; past either, its whole group is ended and Unreadable is raised."""
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+    except OSError as error:
+        raise Unreadable(f"{argv[0]} could not run: {error.strerror}") from None
+    out, deadline = bytearray(), time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(timeout=remaining):
+                    raise Unreadable(f"{argv[0]} did not finish within {timeout} seconds")
+                chunk = os.read(process.stdout.fileno(), CHUNK)
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > cap:
+                    raise Unreadable(f"{argv[0]} printed more than {cap} bytes")
+        process.wait(timeout=max(deadline - time.monotonic(), 1))
+    except subprocess.TimeoutExpired:
+        raise Unreadable(f"{argv[0]} did not finish within {timeout} seconds") from None
+    finally:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)  # the leader is still uncollected, so its group is its own
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        process.stdout.close()
+    return process.returncode, bytes(out)

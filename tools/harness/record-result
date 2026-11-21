@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""record-result: append one results row, written the way tools/harness/ledger-check expects (plan step P0.15.6).
+
+Usage: record-result --ledger <ledger.jsonl> --log <raw log> --test <name> --result pass|fail --build <build>
+                     --commit <40-hex> --refresh-rate-hz <number> --concurrent-load <description> [--repo <repo>]
+
+The log must sit inside the ledger's folder; the row stores its path relative to that folder and its SHA-256, the
+machine (model from /usr/sbin/sysctl and macOS version from /usr/bin/sw_vers), the time in Central time, and the
+recorder name the schema names. The size check and the append run under an exclusive lock on the ledger.
+The commit must exist in --repo (default: the current folder's repository). The
+ledger and the log are opened without following a link and without blocking, and must be regular files. Refuses
+(exit 1) a row it cannot fill truthfully, a refresh rate that is not a finite positive number among them; exit 0
+written, 2 broken (a schema that cannot load, or a row the ledger did not take whole).
+"""
+import argparse
+import datetime
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import zoneinfo
+
+INSTRUMENT_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+LOCK_SECONDS = 5
+
+
+def common():
+    path = pathlib.Path(__file__).resolve().parent / "results-common"
+    loader = importlib.machinery.SourceFileLoader("results_common", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def locked(fd):
+    """An exclusive lock on the ledger, held until the descriptor closes, so the size check and the append happen
+    with no other recorder between them. Tries for LOCK_SECONDS, then gives up rather than wait without limit."""
+    deadline = time.monotonic() + LOCK_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
+
+def instrument(argv):
+    """The output of one fixed instrument, or "" when it fails."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=INSTRUMENT_ENV,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def main(argv):
+    try:
+        rc = common()
+        schema = rc.load_schema()
+    except Exception as error:  # a helper or schema that cannot load is broken, never a refusal or a traceback
+        print(f"record-result: broken: {error}", file=sys.stderr)
+        return 2
+    parser = argparse.ArgumentParser(prog="record-result")
+    for flag in ("--ledger", "--log", "--test", "--result", "--build", "--commit", "--refresh-rate-hz",
+                 "--concurrent-load"):
+        parser.add_argument(flag, required=True)
+    parser.add_argument("--repo", default=".")
+    args = parser.parse_args(argv)
+    ledger = pathlib.Path(os.path.abspath(args.ledger))
+    folder = ledger.parent.resolve()
+    ledger = folder / ledger.name
+    log_abs = pathlib.Path(os.path.abspath(args.log))
+    log = log_abs.parent.resolve() / log_abs.name
+    problems = []
+    if args.result not in schema["result_values"]:
+        problems.append(f"result must be one of {schema['result_values']}")
+    missing = rc.commit_problem(args.repo, args.commit)
+    if missing:
+        problems.append(missing)
+    digest = None
+    if not log.is_relative_to(folder):
+        problems.append("the log must be a file inside the ledger's folder")
+    else:
+        try:
+            digest = rc.sha256_of(log)
+        except rc.Unusable as error:
+            problems.append(f"the log cannot be used: {error}")
+    if not args.concurrent_load.strip():
+        problems.append("concurrent-load must say what else was running")
+    try:
+        rate = float(args.refresh_rate_hz)
+    except ValueError:
+        rate = 0.0
+    if not rc.finite_rate(rate):
+        problems.append("refresh-rate-hz must be a finite positive number")
+    model = instrument(["/usr/sbin/sysctl", "-n", "hw.model"])
+    version = instrument(["/usr/bin/sw_vers", "-productVersion"])
+    if not model or not version:
+        problems.append("the machine model or macOS version could not be read")
+    if problems:
+        for line in problems:
+            print(f"record-result: refused: {line}")
+        return 1
+    row = {"machine": f"{model} macOS {version}", "build": args.build, "commit": args.commit, "test": args.test,
+           "result": args.result, "refresh_rate_hz": rate, "concurrent_load": args.concurrent_load.strip(),
+           "log_path": log.relative_to(folder).as_posix(), "log_sha256": digest,
+           "recorded_at": datetime.datetime.now(zoneinfo.ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M CT"),
+           "recorder": schema["recorder"]}
+    try:
+        fd = rc.open_plain(ledger, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    except rc.Unusable as error:
+        print(f"record-result: refused: the ledger cannot be used: {error}")
+        return 1
+    line = (json.dumps(row, sort_keys=True) + "\n").encode()
+    try:
+        if not locked(fd):
+            print(f"record-result: refused: the ledger is busy; another recorder held it for {LOCK_SECONDS} seconds")
+            return 1
+        if os.fstat(fd).st_size + len(line) > rc.MAX_LEDGER:
+            print(f"record-result: refused: this row would take the ledger past {rc.MAX_LEDGER} bytes; start a new one")
+            return 1
+        view = memoryview(line)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(0, "the ledger accepted no bytes")
+            view = view[written:]
+    except OSError as error:
+        print(f"record-result: broken: the row could not be written whole: {error.strerror or error}", file=sys.stderr)
+        return 2
+    finally:
+        os.close(fd)
+    print(f"record-result: wrote {args.test} ({args.result}) to {ledger.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

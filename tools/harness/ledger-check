@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""ledger-check: every results row is one the recorder wrote and its evidence still matches (plan step P0.15.6).
+
+Usage: ledger-check --ledger <ledger.jsonl> [--repo <repo>]
+
+Each row must carry every field tools/harness/results-schema.json requires (the concurrent-load field included),
+the recorder name the schema names, a result the schema allows, a refresh rate that is a finite positive number, a
+commit that /usr/bin/git finds in --repo, and a log_path inside the ledger's folder naming a regular file (never through a link)
+whose SHA-256 equals the row's log_sha256. Refuses (exit 1) naming each row by its line and reason; exit 0 every row
+holds, 2 broken (a ledger that is missing, not a regular file, reached through a link, past its size cap, not
+UTF-8 or not JSON,
+or a schema that cannot load).
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+
+
+
+def common():
+    path = pathlib.Path(__file__).resolve().parent / "results-common"
+    loader = importlib.machinery.SourceFileLoader("results_common", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def row_problems(rc, schema, row, folder, repo):
+    problems = [f"no {field}" for field in schema["required"]
+                if field not in row or row[field] in (None, "") or (isinstance(row[field], str) and not row[field].strip())]
+    if problems:
+        return problems
+    if row["recorder"] != schema["recorder"]:
+        problems.append(f"not written by {schema['recorder']}")
+    if row["result"] not in schema["result_values"]:
+        problems.append(f"result {row['result']!r} is not one of {schema['result_values']}")
+    if not rc.finite_rate(row["refresh_rate_hz"]):
+        problems.append("refresh_rate_hz is not a finite positive number")
+    missing = rc.commit_problem(repo, row["commit"])
+    if missing:
+        problems.append(missing)
+    if not rc.is_sha256(row["log_sha256"]):
+        problems.append("log_sha256 is not a SHA-256")
+        return problems
+    log = rc.inside(folder, row["log_path"]) if isinstance(row["log_path"], str) else None
+    if log is None:
+        problems.append("log_path leaves the ledger's folder")
+        return problems
+    try:
+        if rc.sha256_of(log) != row["log_sha256"]:
+            problems.append(f"log {row['log_path']} no longer matches its hash")
+    except rc.Unusable as error:
+        problems.append(f"log {row['log_path']} cannot be used: {error}")
+    return problems
+
+
+def main(argv):
+    try:
+        rc = common()
+        schema = rc.load_schema()
+    except Exception as error:  # a helper or schema that cannot load is broken, never a refusal or a traceback
+        print(f"ledger-check: broken: {error}", file=sys.stderr)
+        return 2
+    parser = argparse.ArgumentParser(prog="ledger-check")
+    parser.add_argument("--ledger", required=True)
+    parser.add_argument("--repo", default=".")
+    args = parser.parse_args(argv)
+    ledger = pathlib.Path(os.path.abspath(args.ledger))
+    folder = ledger.parent.resolve()
+    try:
+        lines = rc.read_bytes(folder / ledger.name, rc.MAX_LEDGER).decode("utf-8").splitlines()
+        rows = [(number, json.loads(line)) for number, line in enumerate(lines, 1) if line.strip()]
+    except (rc.Unusable, ValueError) as error:
+        print(f"ledger-check: broken: {error}", file=sys.stderr)
+        return 2
+    refused = 0
+    for number, row in rows:
+        for problem in row_problems(rc, schema, row, folder, args.repo) if isinstance(row, dict) else ["not an object"]:
+            print(f"ledger-check: refused: line {number}: {problem}")
+            refused += 1
+    if refused:
+        return 1
+    print(f"ledger-check: {len(rows)} rows hold")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

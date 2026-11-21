@@ -20,6 +20,24 @@ import subprocess
 import sys
 import tomllib
 
+def bounded_reader():
+    """The shared bounded reader, loaded from the file beside this one without writing bytecode."""
+    import importlib.machinery
+    import importlib.util
+    sys.dont_write_bytecode = True
+    path = pathlib.Path(__file__).resolve().parent / "bounded-read"
+    try:
+        loader = importlib.machinery.SourceFileLoader("bounded_read", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"boundaries: broken: cannot load bounded-read: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+BR = bounded_reader()
+
 UI_FRAMEWORKS = {"AppKit", "Cocoa", "SwiftUI", "UIKit"}
 FEATURE_LAYER = 4
 IMPORT = re.compile(r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*import\s+(?:(?:typealias|struct|class|enum|protocol|let|var|func)\s+)?"
@@ -66,11 +84,15 @@ def swift_graph(repo):
     return graph
 
 
+MAX_SOURCE = 4 * 1024 * 1024
+MAX_TABLE = 256 * 1024
+
+
 def swift_imports(repo, target):
     folder = repo / "apple" / "Sources" / target
     found = set()
     for path in sorted(folder.rglob("*.swift")) if folder.is_dir() else []:
-        found.update(IMPORT.findall(path.read_text(errors="replace")))
+        found.update(IMPORT.findall(BR.read_text(path, MAX_SOURCE)))
     return found
 
 
@@ -145,16 +167,17 @@ def main(argv):
             if not (repo / "Cargo.toml").is_file() and not (repo / "apple" / "Package.swift").is_file():
                 return 0  # no workspace and no list: nothing to check
             raise Broken("tools/gates/allowed-deps.toml is missing")
-        allowed = tomllib.loads(listing.read_text())
+        allowed = tomllib.loads(BR.read_text(listing, MAX_TABLE))
         rust_allowed, swift_allowed = allowed.get("rust", {}), allowed.get("swift", {})
         rust, swift = rust_graph(repo), swift_graph(repo)
-        base = tomllib.loads(base_list.read_text()) if base_list else None
-    except (Broken, tomllib.TOMLDecodeError, OSError, ValueError, KeyError) as error:
+        base = tomllib.loads(BR.read_text(base_list, MAX_TABLE)) if base_list else None
+        imports = import_findings(repo, swift, swift_allowed)
+    except (Broken, BR.Unreadable, tomllib.TOMLDecodeError, OSError, ValueError, KeyError) as error:
         print(f"boundaries: broken: {error}", file=sys.stderr)
         return 2
     found = list_findings("rust", rust_allowed) + list_findings("swift", swift_allowed)
     found += graph_findings("rust", rust, rust_allowed) + graph_findings("swift", swift, swift_allowed)
-    found += import_findings(repo, swift, swift_allowed)
+    found += imports
     if base is not None:
         found += layer_change_findings(base, allowed, os.environ.get("PR_BODY", ""))
     for line in found:

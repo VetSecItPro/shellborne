@@ -1,0 +1,140 @@
+"""Shared by record-result and ledger-check. Not a tool: it is not executable, and each tool loads it from the file
+beside it.
+
+The ledger and every log are opened without following a symbolic link and without blocking, must be regular files,
+and are read through a cap, so a FIFO cannot hang a tool, a link cannot point it at another file, and a huge file
+cannot make it read without limit. Anything else raises Unusable, which each tool reports by its own rule.
+"""
+import hashlib
+import json
+import math
+import os
+import pathlib
+import re
+import stat
+import subprocess
+
+HERE = pathlib.Path(__file__).resolve().parent
+CHUNK = 1024 * 1024
+MAX_SCHEMA = 64 * 1024
+MAX_LEDGER = 64 * 1024 * 1024
+MAX_LOG = 1024 * 1024 * 1024
+SHA256 = frozenset("0123456789abcdef")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+# What the plan's steps require of every row, pinned here so a weakened schema file cannot drop it (P0.15.1).
+REQUIRED = frozenset({"machine", "build", "commit", "test", "result", "refresh_rate_hz", "concurrent_load", "log_path",
+                      "log_sha256", "recorded_at", "recorder"})
+RESULTS = frozenset({"pass", "fail"})
+# The commit check decides a verdict, so it runs the system git in a minimal environment, never one first on PATH.
+GIT = "/usr/bin/git"
+GIT_ENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+
+class Unusable(Exception):
+    """A file the results tools cannot read within the rules above."""
+
+
+def open_plain(path, flags=os.O_RDONLY, mode=0o644):
+    """A descriptor for path, opened no-follow and non-blocking, that names a regular file."""
+    try:
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
+    except OSError as error:
+        raise Unusable(f"{path} cannot be opened: {error.strerror}") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Unusable(f"{path} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_bytes(path, cap):
+    """The whole of a regular file of at most cap bytes."""
+    fd = open_plain(path)
+    try:
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, min(CHUNK, cap + 1 - len(data)))
+            if not chunk:
+                return bytes(data)
+            data += chunk
+            if len(data) > cap:
+                raise Unusable(f"{path} is larger than {cap} bytes")
+    except OSError as error:
+        raise Unusable(f"{path} cannot be read: {error.strerror}") from None
+    finally:
+        os.close(fd)
+
+
+def sha256_of(path, cap=MAX_LOG):
+    """The SHA-256 of a regular file of at most cap bytes, read in chunks."""
+    fd = open_plain(path)
+    digest, size = hashlib.sha256(), 0
+    try:
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                return digest.hexdigest()
+            size += len(chunk)
+            if size > cap:
+                raise Unusable(f"{path} is larger than {cap} bytes")
+            digest.update(chunk)
+    except OSError as error:
+        raise Unusable(f"{path} cannot be read: {error.strerror}") from None
+    finally:
+        os.close(fd)
+
+
+def load_schema():
+    """The results schema beside this file, checked for the fields both tools rely on."""
+    try:
+        schema = json.loads(read_bytes(HERE / "results-schema.json", MAX_SCHEMA))
+    except ValueError as error:
+        raise Unusable(f"results-schema.json is not JSON: {error}") from None
+    if (not isinstance(schema, dict) or not isinstance(schema.get("recorder"), str)
+            or not isinstance(schema.get("required"), list) or not isinstance(schema.get("result_values"), list)):
+        raise Unusable("results-schema.json lacks recorder, required or result_values")
+    missing = REQUIRED - set(schema["required"])
+    if missing or not schema["recorder"].strip() or set(schema["result_values"]) != RESULTS:
+        raise Unusable("results-schema.json drops a field every row needs or changes the result values: "
+                       + ", ".join(sorted(missing)) if missing else "results-schema.json changes the recorder or "
+                       "the result values")
+    return schema
+
+
+def inside(folder, relative):
+    """folder / relative, where relative is a plain relative path with no .. part and every folder on the way
+    resolves inside folder; None otherwise. The last part is not resolved, so a link there is caught on open."""
+    if not isinstance(relative, str) or not relative or "\0" in relative:
+        return None
+    parts = pathlib.PurePosixPath(relative)
+    if parts.is_absolute() or ".." in parts.parts:
+        return None
+    candidate = folder / parts
+    if not candidate.parent.resolve().is_relative_to(folder):
+        return None
+    return candidate.parent.resolve() / candidate.name
+
+
+def finite_rate(value):
+    """A refresh rate: a real number (never a bool or a string), finite and above zero."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            and value > 0)
+
+
+def is_sha256(value):
+    return isinstance(value, str) and len(value) == 64 and set(value) <= SHA256
+
+
+def commit_problem(repo, commit):
+    """None when commit is a 40-hex id of a commit in repo; otherwise why not. A git that cannot run or does not
+    answer in time is a problem too, so a row is never accepted on a check that did not happen."""
+    if not isinstance(commit, str) or not COMMIT.match(commit):
+        return f"commit {commit} is not a 40-hex commit id"
+    try:
+        done = subprocess.run([GIT, "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"], capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=30, env=GIT_ENV)
+    except (OSError, subprocess.TimeoutExpired):
+        return f"commit {commit} could not be checked: git did not answer"
+    return None if done.returncode == 0 else f"commit {commit} does not exist in {repo}"

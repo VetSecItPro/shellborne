@@ -19,13 +19,33 @@ runs this same verification path on fixed inputs: a known-good example must pass
 must fail, or no result is reported. Exit 0 clean, 1 refused, 2 broken.
 """
 import base64
+import errno
 import hashlib
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import tempfile
+
+def read_capped(path, cap):
+    """The whole of a regular file, opened no-follow and non-blocking, of at most cap bytes. Inline rather than the
+    shared bounded-read helper: CI runs this gate as one file extracted from the base commit, with nothing beside
+    it."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, f"{path} is not a regular file")
+        data = bytearray()
+        while len(data) <= cap:
+            chunk = os.read(fd, cap + 1 - len(data))
+            if not chunk:
+                return bytes(data)
+            data += chunk
+        raise OSError(errno.EFBIG, f"{path} is larger than {cap} bytes")
+    finally:
+        os.close(fd)
 
 LINE = re.compile(r"Plan-Attestation: v2 ([0-9a-f]{40}) ([A-Za-z0-9+/]+={0,2})")
 STEP = re.compile(r"^Plan-Step: (\S+)$", re.MULTILINE)
@@ -39,6 +59,10 @@ CONTROL = {
     "body": "Plan-Step: P0.1.1\n\nA control body.\n",
     "signature": "LS0tLS1CRUdJTiBTU0ggU0lHTkFUVVJFLS0tLS0KVTFOSVUwbEhBQUFBQVFBQUFETUFBQUFMYzNOb0xXVmtNalUxTVRrQUFBQWdEY21UZ2NaWlIxZDc0NWNjT25mR3dYdEhJZQpNS1VpTm56REJ3ckh4QjdERUFBQUFQYzJobGJHeGliM0p1WlMxd2JHRnVBQUFBQUFBQUFBWnphR0UxTVRJQUFBQlRBQUFBCkMzTnphQzFsWkRJMU5URTVBQUFBUUhXUGVibXJzZFZZRGFqU3Jhc1hPdUFDM2xZOVlueEZWWSs0SjQ2cEZpUEl5RFc1aksKQlVHcHpha1grdWRBWVJIZ3E5cFFaVlg2Z3AzaXk5N0M1clBRYz0KLS0tLS1FTkQgU1NIIFNJR05BVFVSRS0tLS0tCg==",
 }
+
+
+MAX_KEY = 16 * 1024  # one public key line
+SSH_KEYGEN = "/usr/bin/ssh-keygen"  # the same path on macOS and on the Ubuntu runner
 
 
 def body_digest(body):
@@ -64,8 +88,10 @@ def verified(public_key, text, signature):
         allowed.write_text(f'plan-attest namespaces="{NAMESPACE}" {public_key}\n')
         sig = pathlib.Path(folder) / "sig"
         sig.write_bytes(signature)
-        command = ["ssh-keygen", "-Y", "verify", "-n", NAMESPACE, "-I", "plan-attest", "-s", str(sig), "-f", str(allowed)]
-        result = subprocess.run(command, input=text.encode(), capture_output=True, timeout=30)
+        # by its absolute path in a minimal environment: an ssh-keygen earlier on PATH must not decide
+        command = [SSH_KEYGEN, "-Y", "verify", "-n", NAMESPACE, "-I", "plan-attest", "-s", str(sig), "-f", str(allowed)]
+        result = subprocess.run(command, input=text.encode(), capture_output=True, timeout=30,
+                                env={"PATH": "/usr/bin:/bin"})
         return result.returncode == 0
 
 
@@ -118,7 +144,11 @@ def main(argv):
     if not key_file.is_file() or not base or not tree:
         print("plan-attestation: broken: the key, the head or the merge base cannot be read", file=sys.stderr)
         return 2
-    public_key = " ".join(key_file.read_text().split()[:2])
+    try:
+        public_key = " ".join(read_capped(key_file, MAX_KEY).decode("utf-8", errors="replace").split()[:2])
+    except OSError as error:
+        print(f"plan-attestation: broken: the key cannot be read: {error.strerror or error}", file=sys.stderr)
+        return 2
     problems = judge(os.environ["PR_BODY"], public_key, os.environ["PR_REPO"], base, head, tree)
     for problem in problems:
         print(f"plan-attestation: refused: {problem}")
