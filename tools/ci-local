@@ -87,7 +87,6 @@ WORKFLOWS = pathlib.Path(".github/workflows")
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 MAX_WORKFLOWS = 64
 OTHER_KINDS = ("runs_in", "not_run")
-COMMENT = re.compile(r"(?:^|(?<=\s))#.*$", re.MULTILINE)
 MANIFEST = pathlib.Path("tools/ci-local.toml")
 CONTROLS = pathlib.Path("tools/ci-controls")
 FIXTURES = CONTROLS / "fixtures"
@@ -351,8 +350,26 @@ def load_others(repo, workflows):
 
 
 def live_text(text):
-    """The workflow with each comment removed, a comment being a # that opens a line or follows whitespace."""
-    return COMMENT.sub("", text)
+    """The workflow without its comments. A line's comment begins at its first unquoted #, provided that # opens the
+    line or follows whitespace; quotes are tracked within the line. So `echo "x # note"; tools/gates/x .` keeps its
+    gate, and a trailing `# tools/gates/x` does not count as a run. A quote left open ends with its line. This reads
+    text, not YAML or shell: an apostrophe inside a word opens a quote here too, so a comment after one is read as
+    live."""
+    kept = []
+    for line in text.split("\n"):
+        quote = None
+        end = len(line)
+        for at, char in enumerate(line):
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char in "'\"":
+                quote = char
+            elif char == "#" and (at == 0 or line[at - 1].isspace()):
+                end = at
+                break
+        kept.append(line[:end])
+    return "\n".join(kept)
 
 
 def tracked_workflows(repo, tracked):

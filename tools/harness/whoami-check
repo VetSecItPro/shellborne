@@ -73,8 +73,11 @@ def run(argv):
         try:  # the leader has not been collected, so this group id cannot belong to anyone else yet
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
-            process.kill()
-        process.wait()
+            process.kill()  # the group could not be signalled; the leader alone is better than nothing
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # the check is already broken; the timeout below says so
         raise
 
 
