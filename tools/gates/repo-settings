@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Repo-settings gate: squash-only merges that carry the pull request text, and a protected main.
 
-Usage: repo-settings --repo <repo.json> --protection <protection.json>
-       repo-settings --live <owner/name>     fetch both with the gh command-line tool (needs admin access)
+Usage: repo-settings --repo <repo.json> --protection <protection.json> --fork-approval <approval.json>
+       repo-settings --live <owner/name>     fetch all three with the gh command-line tool (needs admin access)
+
+Outside contributions are closed: only collaborators may open a pull request (pull_request_creation_policy), and
+every outside contributor's fork run waits for approval (the fork-PR approval policy).
 
 GitHub serves branch protection only to an admin, so public CI cannot read it; the live mode runs on
 the maintainer's Mac in the local CI step. Exit 0 clean, 1 refused, 2 broken.
@@ -14,7 +17,8 @@ import sys
 
 REPO_RULES = {"allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
               "squash_merge_commit_title": "PR_TITLE", "squash_merge_commit_message": "PR_BODY",
-              "delete_branch_on_merge": True}
+              "delete_branch_on_merge": True, "pull_request_creation_policy": "collaborators_only"}
+FORK_APPROVAL = "all_external_contributors"
 # The gates workflow, both CodeQL analyses (review F12) and the plan attestation (P0.5.14) must pass before a merge.
 REQUIRED_CHECKS = ("gates", "analyze (actions)", "analyze (rust)", "attestation")
 # Each required check must come from GitHub Actions itself, so a same-named status from another app or
@@ -47,26 +51,30 @@ def protection_findings(p):
 def load(args):
     if args[:1] == ["--live"] and len(args) == 2:
         out = []
-        for path in (f"repos/{args[1]}", f"repos/{args[1]}/branches/main/protection"):
+        for path in (f"repos/{args[1]}", f"repos/{args[1]}/branches/main/protection",
+                     f"repos/{args[1]}/actions/permissions/fork-pr-contributor-approval"):
             got = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
             if got.returncode != 0:
                 raise ValueError(f"gh api {path} failed: {got.stderr.strip()[:200]}")
             out.append(json.loads(got.stdout))
         return out
-    if len(args) == 4 and args[0] == "--repo" and args[2] == "--protection":
-        with open(args[1]) as repo, open(args[3]) as protection:
-            return json.load(repo), json.load(protection)
-    raise ValueError("usage: repo-settings --repo <file> --protection <file> | --live <owner/name>")
+    if len(args) == 6 and args[0] == "--repo" and args[2] == "--protection" and args[4] == "--fork-approval":
+        with open(args[1]) as repo, open(args[3]) as protection, open(args[5]) as approval:
+            return json.load(repo), json.load(protection), json.load(approval)
+    raise ValueError("usage: repo-settings --repo <file> --protection <file> --fork-approval <file> | --live <owner/name>")
 
 
 def main(argv):
     try:
-        repo, protection = load(argv[1:])
+        repo, protection, approval = load(argv[1:])
     except (OSError, ValueError) as error:
         print(f"repo-settings: broken: {error}", file=sys.stderr)
         return 2
     found = [f"{key} is {repo.get(key)!r}, expected {want!r}" for key, want in REPO_RULES.items() if repo.get(key) != want]
     found += protection_findings(protection)
+    policy = approval.get("approval_policy") if isinstance(approval, dict) else None
+    if policy != FORK_APPROVAL:
+        found.append(f"approval_policy is {policy!r}, expected {FORK_APPROVAL!r}")
     for line in found:
         print(f"repo-settings: {line}")
     return 1 if found else 0
