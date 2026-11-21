@@ -12,7 +12,9 @@ is path, canary, plan-id, commit-message, instruction-file, a personal detail (i
 hostname, private-ip, email) or oversized-text, and where is a file (and line, for text) or a commit.
 The matched text is never printed: CI logs are public. This file holds only shapes, never real values.
 """
+import os
 import re
+import stat
 import struct
 import subprocess
 import sys
@@ -347,12 +349,36 @@ def commits(repo, revision_range):
     return report.finish()
 
 
-def message(path):
-    report = Report()
+MAX_MESSAGE = 1024 * 1024
+
+
+def read_message(path):
+    """The message file, opened no-follow and non-blocking, regular, at most MAX_MESSAGE bytes. Inline,
+    not the shared bounded-read helper: this guard also runs from the private tree, where that helper is not beside
+    it."""
     try:
-        text = open(path, encoding="utf-8", errors="replace").read()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
         raise Broken(f"cannot read the message file: {error.strerror}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Broken("the message file is not a regular file")
+        data = bytearray()
+        while len(data) <= MAX_MESSAGE:
+            chunk = os.read(fd, MAX_MESSAGE + 1 - len(data))
+            if not chunk:
+                return data.decode("utf-8", errors="replace")
+            data += chunk
+        raise Broken(f"the message file is larger than {MAX_MESSAGE} bytes")
+    except OSError as error:
+        raise Broken(f"cannot read the message file: {error.strerror}")
+    finally:
+        os.close(fd)
+
+
+def message(path):
+    report = Report()
+    text = read_message(path)
     if check_text(None, text, report, plan_step_lines_ok=True):
         report.refuse("commit-message", "in the message being committed")
     return report.finish()

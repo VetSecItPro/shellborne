@@ -13,6 +13,24 @@ import json
 import pathlib
 import sys
 
+def bounded_reader():
+    """The shared bounded reader, loaded from the file beside this one without writing bytecode."""
+    import importlib.machinery
+    import importlib.util
+    sys.dont_write_bytecode = True
+    path = pathlib.Path(__file__).resolve().parent / "bounded-read"
+    try:
+        loader = importlib.machinery.SourceFileLoader("bounded_read", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"codeql-results: broken: cannot load bounded-read: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+BR = bounded_reader()
+
 
 def findings(run):
     for result in run.get("results", []):
@@ -27,6 +45,9 @@ def findings(run):
         yield f"{rule} {where}"
 
 
+MAX_SARIF = 64 * 1024 * 1024
+
+
 def main(argv):
     if len(argv) != 2:
         print("usage: codeql-results <folder>", file=sys.stderr)
@@ -38,8 +59,8 @@ def main(argv):
     found = []
     for path in files:
         try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError) as error:
+            data = json.loads(BR.read_text(path, MAX_SARIF))
+        except (OSError, ValueError, BR.Unreadable) as error:
             print(f"codeql-results: broken: cannot read {path.name}: {error}", file=sys.stderr)
             return 2
         runs = data.get("runs") if isinstance(data, dict) else None

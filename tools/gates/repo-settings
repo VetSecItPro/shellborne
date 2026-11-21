@@ -13,7 +13,26 @@ Plan-Step: P0.5.11
 """
 import json
 import subprocess
+import pathlib
 import sys
+
+def bounded_reader():
+    """The shared bounded reader, loaded from the file beside this one without writing bytecode."""
+    import importlib.machinery
+    import importlib.util
+    sys.dont_write_bytecode = True
+    path = pathlib.Path(__file__).resolve().parent / "bounded-read"
+    try:
+        loader = importlib.machinery.SourceFileLoader("bounded_read", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"repo-settings: broken: cannot load bounded-read: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+BR = bounded_reader()
 
 REPO_RULES = {"allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
               "squash_merge_commit_title": "PR_TITLE", "squash_merge_commit_message": "PR_BODY",
@@ -48,26 +67,28 @@ def protection_findings(p):
     return found
 
 
+MAX_INPUT = 1024 * 1024  # a settings document is a few kilobytes
+
+
 def load(args):
     if args[:1] == ["--live"] and len(args) == 2:
         out = []
         for path in (f"repos/{args[1]}", f"repos/{args[1]}/branches/main/protection",
                      f"repos/{args[1]}/actions/permissions/fork-pr-contributor-approval"):
-            got = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
-            if got.returncode != 0:
-                raise ValueError(f"gh api {path} failed: {got.stderr.strip()[:200]}")
-            out.append(json.loads(got.stdout))
+            code, data = BR.run_capped(["gh", "api", path], MAX_INPUT, 60)
+            if code != 0:
+                raise ValueError(f"gh api {path} failed with exit {code}")
+            out.append(json.loads(data))
         return out
     if len(args) == 6 and args[0] == "--repo" and args[2] == "--protection" and args[4] == "--fork-approval":
-        with open(args[1]) as repo, open(args[3]) as protection, open(args[5]) as approval:
-            return json.load(repo), json.load(protection), json.load(approval)
+        return [json.loads(BR.read_text(args[i], MAX_INPUT)) for i in (1, 3, 5)]
     raise ValueError("usage: repo-settings --repo <file> --protection <file> --fork-approval <file> | --live <owner/name>")
 
 
 def main(argv):
     try:
         repo, protection, approval = load(argv[1:])
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, BR.Unreadable) as error:
         print(f"repo-settings: broken: {error}", file=sys.stderr)
         return 2
     found = [f"{key} is {repo.get(key)!r}, expected {want!r}" for key, want in REPO_RULES.items() if repo.get(key) != want]

@@ -20,6 +20,20 @@ THIN = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xf
 UNIVERSAL = {b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}  # 32 and 64-bit
 
 
+# The instruments the binary gates read, by absolute path: a lookup through PATH would let a program of
+# the same name decide the verdict. The /usr/bin entries are Apple's command-line tool front ends.
+INSTRUMENTS = {"otool": "/usr/bin/otool", "nm": "/usr/bin/nm", "lipo": "/usr/bin/lipo"}
+
+
+def instrument_env():
+    """PATH limited to the system folders, plus the variables Apple's tool front ends read to find the toolchain."""
+    env = {"PATH": "/usr/bin:/bin"}
+    for name in ("HOME", "TMPDIR", "DEVELOPER_DIR"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    return env
+
+
 class Broken(Exception):
     pass
 
@@ -83,10 +97,15 @@ class Reader:
         return self.magic(path) in UNIVERSAL
 
     def run(self, command):
-        """Run a tool with its output capped at max_output bytes and its time capped by the run's deadline."""
+        """Run a listed instrument by its absolute path in a minimal environment, with its output capped at
+        max_output bytes and its time capped by the run's deadline. A program of the same name earlier on PATH is
+        never run: the verdict rests on what the instrument prints."""
+        if command[0] not in INSTRUMENTS:
+            raise Broken(f"{command[0]} is not a listed instrument")
+        command = [INSTRUMENTS[command[0]], *command[1:]]
         try:
             child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     stdin=subprocess.DEVNULL)
+                                     stdin=subprocess.DEVNULL, env=instrument_env())
         except OSError as error:
             raise Broken(f"{command[0]} could not run: {error.strerror}")
         chunks, size = [], 0

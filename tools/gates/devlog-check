@@ -15,6 +15,24 @@ import pathlib
 import re
 import sys
 
+def bounded_reader():
+    """The shared bounded reader, loaded from the file beside this one without writing bytecode."""
+    import importlib.machinery
+    import importlib.util
+    sys.dont_write_bytecode = True
+    path = pathlib.Path(__file__).resolve().parent / "bounded-read"
+    try:
+        loader = importlib.machinery.SourceFileLoader("bounded_read", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+    except (OSError, SyntaxError) as error:
+        print(f"devlog-check: broken: cannot load bounded-read: {error}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+BR = bounded_reader()
+
 PLAN_ID = re.compile(r"\b(?:P|PR)\d+\.\d+(?:\.\d+)?\b|\bCHANGE-\d{4}\b|\b[A-Z]{2,4}-\d{2,3}\b")
 NUMBER = re.compile(r"(?<![\w./-])\d{2,}(?:[.,]\d+)?\b|\b\d+(?:\.\d+)?\s?(?:%|ms|s|fps|MB|GB|KB|x)\b")
 LINK = re.compile(r"\]\((?:https?://|/)")
@@ -35,9 +53,12 @@ def prose_paragraphs(body):
     return [p for p in re.split(r"\n\s*\n", body) if p.strip()]
 
 
+MAX_POST = 1024 * 1024
+
+
 def problems(path):
     found = []
-    meta, body = front_matter(path.read_text())
+    meta, body = front_matter(BR.read_text(path, MAX_POST))
     for key in ("title", "description"):
         if not meta.get(key):
             found.append(f"missing {key}")
@@ -55,7 +76,12 @@ def main(argv):
         return 2
     refused = 0
     for path in sorted((pathlib.Path(argv[1]) / "docs" / "_posts").glob("*.md")):
-        for line in problems(path):
+        try:
+            found = problems(path)
+        except BR.Unreadable as error:
+            print(f"devlog-check: broken: {error}", file=sys.stderr)
+            return 2
+        for line in found:
             print(f"devlog-check: {path.name}: {line}")
             refused += 1
     return 1 if refused else 0
