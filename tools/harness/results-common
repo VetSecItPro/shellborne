@@ -21,6 +21,10 @@ MAX_LEDGER = 64 * 1024 * 1024
 MAX_LOG = 1024 * 1024 * 1024
 SHA256 = frozenset("0123456789abcdef")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+# What the plan's steps require of every row, pinned here so a weakened schema file cannot drop it (P0.15.1).
+REQUIRED = frozenset({"machine", "build", "commit", "test", "result", "refresh_rate_hz", "concurrent_load", "log_path",
+                      "log_sha256", "recorded_at", "recorder"})
+RESULTS = frozenset({"pass", "fail"})
 
 
 class Unusable(Exception):
@@ -88,6 +92,11 @@ def load_schema():
     if (not isinstance(schema, dict) or not isinstance(schema.get("recorder"), str)
             or not isinstance(schema.get("required"), list) or not isinstance(schema.get("result_values"), list)):
         raise Unusable("results-schema.json lacks recorder, required or result_values")
+    missing = REQUIRED - set(schema["required"])
+    if missing or not schema["recorder"].strip() or set(schema["result_values"]) != RESULTS:
+        raise Unusable("results-schema.json drops a field every row needs or changes the result values: "
+                       + ", ".join(sorted(missing)) if missing else "results-schema.json changes the recorder or "
+                       "the result values")
     return schema
 
 

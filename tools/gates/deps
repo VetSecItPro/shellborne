@@ -27,8 +27,8 @@ Usage: deps [--tables-from <ref>] <repo>
         third_party/ must sit in one too, except a PIN.toml, which is a pin record.
       * every [[surface-package]] (a package the Stage 1 surface library links, for development builds only) must
         have an allowed license, or an [[exception]] naming it by exact name and license, with its duty; an
-        exception covers that one package in that library and nothing else, and one naming no listed surface
-        package is refused.
+        exception covers that one package in that library and nothing else, one naming no listed surface
+        package is refused, and none may name AGPL or a GPL without a WITH exception.
     Every LGPL fails, whatever its kind and however it would be linked, except a surface package an exception names.
   - unpinned-package: a Package.resolved pin without an exact 40-hex revision, or pinned to a branch.
 
@@ -168,11 +168,25 @@ def load_tables(repo, ref):
     return allow, deny_text, pins, vendored, surface, exceptions
 
 
+def exception_admissible(license):
+    """No exception may name AGPL, or a GPL term without a WITH exception: GPL and AGPL stay refused, and only a
+    GPL whose own exception lets its output be used under other terms (the Bison case) can be named."""
+    for term in re.split(r"\s+(?:OR|AND)\s+", license.strip()):
+        term = term.strip("() ").upper()
+        if "AGPL" in term or (term.startswith("GPL-") and " WITH " not in term):
+            return False
+    return True
+
+
 def check_surface(surface, exceptions, allow, findings):
     """A package the Stage 1 surface library links passes when its license is on the allow-list, or when an
     [[exception]] names it with exactly that license; an exception names one package in that library only and never
     widens the allow-list. An exception that names no listed surface package is refused, so the list cannot go stale."""
-    named = {(entry["name"], entry["license"]) for entry in exceptions}
+    for entry in exceptions:
+        if not exception_admissible(entry["license"]):
+            findings.append(("license", f"licenses.toml exception {entry['name']} ({entry['license']}: no exception "
+                                        "may admit AGPL, or a GPL without a WITH exception)"))
+    named = {(entry["name"], entry["license"]) for entry in exceptions if exception_admissible(entry["license"])}
     listed = {(entry["name"], entry["license"]) for entry in surface}
     for entry in surface:
         if not allowed(entry["license"], allow) and (entry["name"], entry["license"]) not in named:

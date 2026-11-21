@@ -9,7 +9,7 @@ machine (model from /usr/sbin/sysctl and macOS version from /usr/bin/sw_vers), t
 recorder name the schema names. The commit must exist in --repo (default: the current folder's repository). The
 ledger and the log are opened without following a link and without blocking, and must be regular files. Refuses
 (exit 1) a row it cannot fill truthfully, a refresh rate that is not a finite positive number among them; exit 0
-written, 2 broken (a schema that cannot load).
+written, 2 broken (a schema that cannot load, or a row the ledger did not take whole).
 """
 import argparse
 import datetime
@@ -101,11 +101,20 @@ def main(argv):
     except rc.Unusable as error:
         print(f"record-result: refused: the ledger cannot be used: {error}")
         return 1
+    line = (json.dumps(row, sort_keys=True) + "\n").encode()
     try:
-        if os.fstat(fd).st_size > rc.MAX_LEDGER:
-            print(f"record-result: refused: the ledger is past {rc.MAX_LEDGER} bytes; start a new one")
+        if os.fstat(fd).st_size + len(line) > rc.MAX_LEDGER:
+            print(f"record-result: refused: this row would take the ledger past {rc.MAX_LEDGER} bytes; start a new one")
             return 1
-        os.write(fd, (json.dumps(row, sort_keys=True) + "\n").encode())
+        view = memoryview(line)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(0, "the ledger accepted no bytes")
+            view = view[written:]
+    except OSError as error:
+        print(f"record-result: broken: the row could not be written whole: {error.strerror or error}", file=sys.stderr)
+        return 2
     finally:
         os.close(fd)
     print(f"record-result: wrote {args.test} ({args.result}) to {ledger.name}")

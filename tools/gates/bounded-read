@@ -48,7 +48,11 @@ def read_bytes(path, cap):
 
 
 def read_text(path, cap):
-    return read_bytes(path, cap).decode("utf-8", errors="replace")
+    """The file as UTF-8, strictly: an invalid byte is never replaced and judged, it is Unreadable."""
+    try:
+        return read_bytes(path, cap).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Unreadable(f"{path} is not UTF-8 (byte {error.start})") from None
 
 
 def run_capped(argv, cap, timeout):
