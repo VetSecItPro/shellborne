@@ -16,12 +16,16 @@ member. --dscl and --dseditgroup name stand-ins for tests.
 Without --guard this answers whether the account is ready, from any account, as setting it up needs. --guard, which
 every destructive, soak or exhaustion suite calls before it starts, also refuses (exit 1) unless the process runs as
 that account: the real and the effective uid must both be that account's, found in the user database.
+
+An interrupt, a termination request or a hangup while a lookup runs ends that lookup's whole group, as its 30-second
+limit does, and the check exits 2 naming the signal: a check that did not finish never answers 0 or 1.
 """
 import argparse
 import os
 import pathlib
 import pwd
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -60,19 +64,87 @@ def account_name(path):
     return lines[0]
 
 
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+class Interrupted(Exception):
+    """A stop signal arrived; the check did not finish."""
+
+
+def on_stop(signum, _frame):
+    raise Interrupted(signal.Signals(signum).name)
+
+
+def leader_held(process):
+    """True while the lookup's leader is still this process's to collect, running or exited; only then is its group
+    id still its own. Asked without collecting it."""
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return False
+    return True
+
+
+def end(process):
+    """Ends the lookup's whole group while its leader is held, then collects the leader, waiting at most 5 seconds."""
+    if leader_held(process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.kill()  # the group could not be signalled; the leader alone is better than nothing
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass  # the check is already broken; the caller says so
+
+
 def run(argv):
-    """The exit status of a lookup; only the status is read, so its output goes to /dev/null."""
-    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          timeout=30).returncode
+    """The exit status of a lookup; only the status is read, so its output goes to /dev/null. The lookup runs in a
+    session of its own. The stop signals are held from before it starts until the cleanup below is in place, and
+    held again during that cleanup, so when it passes its 30 seconds or a stop signal arrives the whole group is
+    ended, children it started included, while its leader is still uncollected; then it is collected."""
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
+        raise
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
+        return process.wait(timeout=30)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+        try:
+            end(process)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, before)
+        raise
 
 
 def main(argv):
+    """Every stop signal, wherever it lands, ends as a broken run (exit 2): an escaping exception would exit 1, which
+    reads as a refusal."""
+    try:
+        return check(argv)
+    except Interrupted as stop:
+        say(f"broken: interrupted by {stop} before the check finished")
+        return 2
+
+
+def check(argv):
     parser = argparse.ArgumentParser(prog="whoami-check")
     parser.add_argument("--guard", action="store_true")
     parser.add_argument("--name-file", default=str(DEFAULT_NAMES))
     parser.add_argument("--dscl", default="/usr/bin/dscl")
     parser.add_argument("--dseditgroup", default="/usr/sbin/dseditgroup")
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # an ignored SIGCHLD would let the kernel collect lookups early
+    for signum in STOPS:
+        signal.signal(signum, on_stop)
     try:
         name = account_name(pathlib.Path(args.name_file))
     except ValueError as error:

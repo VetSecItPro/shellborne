@@ -1,0 +1,88 @@
+# Hosted macOS arm64 checks on every pull request and every push to main: the toolchain gate against the pinned
+# Xcode (its version read from tools/gates/toolchain.toml and chosen by path), Rust (as rust-toolchain.toml names it) and Zig (as tools/gates/toolchain.toml records it);
+# the dependency gate with the base commit's tables; and a locked build and test of the Rust workspace. Every tool
+# downloaded here comes through tools/fetch-pinned and its checksum.
+# Plan-Step: P0.13.3
+name: macos
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select the Xcode the toolchain record names
+        run: |
+          set -euo pipefail
+          version="$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["xcode"]["version"])' "$GITHUB_WORKSPACE/tools/gates/toolchain.toml")"
+          case "$version" in
+            ""|*[!0-9.]*) echo "the toolchain record's Xcode version is not plain digits and dots" >&2; exit 1 ;;
+          esac
+          developer="/Applications/Xcode_${version}.app/Contents/Developer"
+          test -d "$developer"
+          echo "DEVELOPER_DIR=$developer" >> "$GITHUB_ENV"
+
+      - name: Install Zig from the toolchain record, and pinned cargo-audit and cargo-deny
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          zig_url="$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["zig"]["url"]["aarch64-macos"])' "$GITHUB_WORKSPACE/tools/gates/toolchain.toml")"
+          zig_sum="$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["zig"]["sha256"]["aarch64-macos"])' "$GITHUB_WORKSPACE/tools/gates/toolchain.toml")"
+          "$GITHUB_WORKSPACE"/tools/fetch-pinned "$zig_url" "$zig_sum" zig.tar.xz
+          zig_dir="$(basename "$zig_url" .tar.xz)"
+          tar -xJf zig.tar.xz
+          echo "ZIG=$RUNNER_TEMP/$zig_dir/zig" >> "$GITHUB_ENV"
+          "$GITHUB_WORKSPACE"/tools/fetch-pinned https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-apple-darwin.tar.gz fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3 cargo-deny.tgz
+          tar -xzf cargo-deny.tgz --strip-components 1 -C "$bin" cargo-deny-0.20.2-aarch64-apple-darwin/cargo-deny
+          "$GITHUB_WORKSPACE"/tools/fetch-pinned https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-aarch64-apple-darwin-v0.22.2.tgz ec7ca4263769593df4d909be85b94a6b79efa2897be5d2bb8ebd516e823175af cargo-audit.tgz
+          tar -xzf cargo-audit.tgz --strip-components 1 -C "$bin" cargo-audit-aarch64-apple-darwin-v0.22.2/cargo-audit
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Use rustup's own proxies, not Homebrew's wrapper scripts
+        run: |
+          set -euo pipefail
+          proxies="$(brew --prefix rustup)/libexec/bin"
+          test -L "$proxies/rustc"
+          echo "$proxies" >> "$GITHUB_PATH"
+
+      - name: Install Rust exactly as rust-toolchain.toml names it
+        run: |
+          rustup toolchain install
+
+      - name: Toolchain gate
+        run: tools/gates/toolchain --zig "$ZIG" .
+
+      - name: Dependency gate, with the base commit's tables
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE" ] && git cat-file -e "$BASE:tools/gates/deps" 2>/dev/null; then
+            tools/gates/deps --tables-from "$BASE" .
+          else
+            tools/gates/deps .
+          fi
+
+      - name: Build and test the Rust workspace, locked
+        run: |
+          cargo build --locked --workspace
+          cargo test --locked --workspace

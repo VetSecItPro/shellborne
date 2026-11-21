@@ -77,8 +77,8 @@ LICENSE_ABSENT = {
 # The first bytes of a font container: TrueType, OpenType, a collection, WOFF and WOFF2.
 FONT_SIGNATURES = (b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf", b"wOFF", b"wOF2")
 # Text that marks a license file as one of the GPL family, whatever it was declared as.
-COPYLEFT_TEXT = ("gnu general public license", "gnu lesser general public license", "gnu library general public license",
-                 "gnu affero general public license")
+COPYLEFT_TEXT = ("gnu general public license", "gnu lesser general public license",
+                 "gnu library general public license", "gnu affero general public license")
 
 
 class Broken(Exception):
@@ -273,7 +273,8 @@ def check_swift(rr, repo, names, pins, allow, findings):
             raise Broken(f"{rr.shown(name)} is not valid JSON")
         if not isinstance(data, dict):
             raise Broken(f"{rr.shown(name)} is not a Package.resolved")
-        listing = data.get("pins", data.get("object", {}).get("pins", []) if isinstance(data.get("object"), dict) else [])
+        nested = data.get("object")
+        listing = data.get("pins", nested.get("pins", []) if isinstance(nested, dict) else [])
         if not isinstance(listing, list):
             raise Broken(f"{rr.shown(name)} has no list of pins")
         for pin in listing:
@@ -466,7 +467,12 @@ def main(argv):
         print(f"deps: refused {kind} {where}", file=sys.stderr)
     if len(findings) > 1000:
         print(f"deps: refused: {len(findings) - 1000} more refusals not listed", file=sys.stderr)
-    return 1 if findings else 0
+    if findings:
+        return 1
+    locks = sum(1 for name in names if name == "Cargo.lock" or name.endswith("/Cargo.lock"))
+    print(f"deps: clean: {locks} Cargo.lock audited and license-checked, {len(pins)} pins and {len(vendored)} "
+          "vendored folders in the license table")  # so a clean run never reads like one that checked nothing
+    return 0
 
 
 if __name__ == "__main__":

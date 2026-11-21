@@ -17,7 +17,13 @@ Steps, in order, and the run stops at the first step that does not hold:
    gate that reads a pull request body also needs pr-body.md in each folder.
    The workflow text is read whole: wherever it says tools/gates, that spot has to be a gate path, a table file
    (.toml, .txt or .json), or "tools/gates/$name" inside a `for pair in` loop this reader understood. A spot that is
-   none of these stops the run, because a gate called that way would get no controls.
+   none of these stops the run, because a gate called that way would get no controls. Every other tracked workflow
+   under .github/workflows is read the same way, and each gate it names, comments included (a # inside a quoted
+   string is no comment), must be a manifest gate or an [others] entry whose runs_in is that workflow. Every
+   executable in tools/gates is a manifest gate or an [others] entry, and an [others] entry either names the
+   workflow that runs it, which must name the gate on a line outside a comment, or says not_run with a reason, so no
+   gate is left run by nothing. ci-local does not read local actions, so a tracked one (anything under
+   .github/actions, or any action.yml or action.yaml) stops the run until it does.
 2. Controls. Each folder becomes a throwaway repository: an empty first commit, then the folder's files in a second
    commit whose message is commit-message.txt if present (that file, pr-body.md and expect.txt are not committed). A
    file named
@@ -77,6 +83,10 @@ import time
 import tomllib
 
 WORKFLOW = pathlib.Path(".github/workflows/gates.yml")
+WORKFLOWS = pathlib.Path(".github/workflows")
+WORKFLOW_SUFFIXES = (".yml", ".yaml")
+MAX_WORKFLOWS = 64
+OTHER_KINDS = ("runs_in", "not_run")
 MANIFEST = pathlib.Path("tools/ci-local.toml")
 CONTROLS = pathlib.Path("tools/ci-controls")
 FIXTURES = CONTROLS / "fixtures"
@@ -308,18 +318,53 @@ def manifest_data(repo):
     return data
 
 
-def load_others(repo):
-    """[others]: each executable under tools/gates that ci-local does not run, with the reason, such as the
-    workflow that runs it instead. A name without a reason, or one also listed as a gate, is broken."""
+def load_others(repo, workflows):
+    """[others]: each executable under tools/gates that ci-local does not run. Its entry is either
+    { runs_in = "<workflow>" }, a tracked workflow that names tools/gates/<name> on a line outside a comment, or
+    { not_run = "<reason>" } for a gate with nothing to judge yet. Any other form, a name also listed as a gate,
+    or a runs_in the workflow does not back up is broken, so no gate can sit here run by nothing."""
     data = manifest_data(repo)
     others = {}
-    for name, reason in data.get("others", {}).items():
-        if not NAME.fullmatch(name) or not isinstance(reason, str) or not reason.strip():
-            raise Broken(f"{MANIFEST} [others] entry {name!r} needs a name and a reason")
+    for name, entry in data.get("others", {}).items():
+        shape = f"{{ runs_in = \"{WORKFLOWS.as_posix()}/<file>\" }} or {{ not_run = \"<reason>\" }}"
+        if not NAME.fullmatch(name) or not isinstance(entry, dict) or len(entry) != 1 or \
+                next(iter(entry)) not in OTHER_KINDS or not isinstance(next(iter(entry.values())), str):
+            raise Broken(f"{MANIFEST} [others] entry {name!r} must be {shape}")
         if name in data["gates"]:
             raise Broken(f"{MANIFEST} lists {name} both as a gate and under [others]")
-        others[name] = reason
+        kind, value = next(iter(entry.items()))
+        if kind == "not_run" and not value.strip():
+            raise Broken(f"{MANIFEST} [others] entry {name} says not_run with no reason")
+        if kind == "runs_in":
+            if value not in workflows:
+                raise Broken(f"{MANIFEST} [others] entry {name} says it runs in {value[:200]}, which is not a tracked "
+                             f"workflow directly under {WORKFLOWS}")
+            if value == WORKFLOW.as_posix():
+                raise Broken(f"{MANIFEST} [others] entry {name} names the gates workflow, whose gates ci-local runs "
+                             "with their controls; list it under [gates] instead")
+            if name not in called_gates(live_text(workflows[value])):
+                raise Broken(f"{MANIFEST} [others] entry {name} says it runs in {value}, but no line of it outside "
+                             f"a comment names {GATES.as_posix()}/{name}")
+        others[name] = (kind, value)
     return others
+
+
+def live_text(text):
+    """What a workflow line says before its first #, line by line. Only this part can back a runs_in entry, so
+    nothing written after a # (a comment, or a quoted # that only looks like one) is ever taken for a real run.
+    The cost is on the safe side: a step whose command has a # ahead of the gate's name is refused, never accepted;
+    write the gate first or move the # to its own line."""
+    return "\n".join(line.split("#", 1)[0] for line in text.split("\n"))
+
+
+def tracked_workflows(repo, tracked):
+    """Every tracked workflow file directly under .github/workflows, as {path: text}, each read with its cap."""
+    prefix = f"{WORKFLOWS.as_posix()}/"
+    paths = sorted(p for p in tracked if p.startswith(prefix) and "/" not in p[len(prefix):]
+                   and p.endswith(WORKFLOW_SUFFIXES))
+    if len(paths) > MAX_WORKFLOWS:
+        raise Broken(f"the repository tracks {len(paths)} workflows, more than the {MAX_WORKFLOWS} ci-local will read")
+    return {path: read_capped(repo / path, MAX_WORKFLOW, path) for path in paths}
 
 
 def load_manifest(repo):
@@ -357,19 +402,36 @@ def load_manifest(repo):
 
 
 def check_coverage(repo, entries):
-    workflow = read_capped(repo / WORKFLOW, MAX_WORKFLOW, str(WORKFLOW))
-    odd = unaccounted_mentions(workflow)
-    if odd:
-        number, line = odd[0]
-        raise Broken(f"{WORKFLOW} line {number} mentions tools/gates in a form ci-local cannot account for, so a "
-                     f"gate there could escape its controls: {line[:200]}")
-    for name in sorted(called_gates(workflow)):
-        if name not in entries:
-            raise Broken(f"the gates workflow runs {name}, which {MANIFEST} does not list")
     tracked = set(tracked_paths(repo).split("\0")) - {""}
     if len(tracked) > MAX_TRACKED:
         raise Broken(f"the repository has {len(tracked)} tracked paths, more than the {MAX_TRACKED} ci-local will list")
-    accounted_executables(repo, entries, load_others(repo), tracked)
+    actions = sorted(p for p in tracked if p.startswith(".github/actions/")
+                     or pathlib.PurePosixPath(p).name in ("action.yml", "action.yaml"))
+    if actions:
+        raise Broken(f"{actions[0][:200]} is a local action, which ci-local does not read, so a gate it runs would go "
+                     "uncounted")
+    workflows = tracked_workflows(repo, tracked)
+    if WORKFLOW.as_posix() not in workflows:
+        raise Broken(f"{WORKFLOW} is not a tracked file")
+    for path, text in workflows.items():
+        odd = unaccounted_mentions(text)
+        if odd:
+            number, line = odd[0]
+            raise Broken(f"{path} line {number} mentions tools/gates in a form ci-local cannot account for, so a "
+                         f"gate there could escape its controls: {line[:200]}")
+    for name in sorted(called_gates(workflows[WORKFLOW.as_posix()])):
+        if name not in entries:
+            raise Broken(f"the gates workflow runs {name}, which {MANIFEST} does not list")
+    others = load_others(repo, workflows)
+    for path, text in workflows.items():
+        if path == WORKFLOW.as_posix():
+            continue
+        for name in sorted(called_gates(text)):  # comments too: a quoted # is no comment, so count every mention
+            if name in entries or others.get(name) == ("runs_in", path):
+                continue
+            raise Broken(f"{path} runs {GATES.as_posix()}/{name}, which {MANIFEST} neither lists as a gate nor "
+                         f"declares under [others] as runs_in {path}")
+    accounted_executables(repo, entries, others, tracked)
     for name, entry in entries.items():
         entry["files"] = copied_files(repo, name, entry["copy"], tracked)
         entry["fixture_files"] = fixture_files(repo, name, entry["fixture"])
