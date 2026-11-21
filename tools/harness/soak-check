@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""soak-check: does a command's memory stay flat while it runs? (plan step P0.13.4)
+
+Usage: soak-check --seconds <s> --interval <s> --max-growth-mb <mb> -- <command> [args...]
+
+Starts the command in a session of its own with no input and its output discarded, samples its resident memory
+(ps -o rss) every interval for the given seconds, then ends its whole process group. Growth is the highest sample in
+the last quarter of the run minus the lowest in the first quarter. Exit 0 flat (growth within the limit), 1 refused
+(growth past it, with the figures), 2 broken: bad arguments, a command that cannot start or exits before the time is
+up, or a sample that cannot be read. Stated limit: only the command's own process is measured, not its children.
+"""
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+
+MAX_SECONDS = 86400
+MIN_INTERVAL = 0.05
+MAX_SAMPLES = 100000
+
+
+def say(line):
+    print(f"soak-check: {line}", flush=True)
+
+
+class Broken(Exception):
+    pass
+
+
+def rss_kb(pid):
+    """The process's resident memory in kilobytes, from one bounded ps call."""
+    try:
+        done = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Broken(f"could not read memory: {error}") from None
+    text = done.stdout.strip()
+    if done.returncode != 0 or not text.isdigit():
+        raise Broken("could not read the command's memory")
+    return int(text)
+
+
+def end(process):
+    """Kills the command's whole group while its leader is still this process's to collect, then collects it."""
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        held = True
+    except ChildProcessError:
+        held = False
+    if held:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def arguments(argv):
+    parser = argparse.ArgumentParser(prog="soak-check")
+    parser.add_argument("--seconds", type=float, required=True)
+    parser.add_argument("--interval", type=float, required=True)
+    parser.add_argument("--max-growth-mb", type=float, required=True)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        raise Broken("no command after --")
+    if not 0 < args.seconds <= MAX_SECONDS or not MIN_INTERVAL <= args.interval <= args.seconds:
+        raise Broken(f"--seconds must be above 0 and at most {MAX_SECONDS}, --interval from {MIN_INTERVAL} to it")
+    if args.seconds / args.interval > MAX_SAMPLES:
+        raise Broken(f"that run would take more than {MAX_SAMPLES} samples")
+    if not args.max_growth_mb > 0:
+        raise Broken("--max-growth-mb must be above 0")
+    return args, command
+
+
+def soak(args, command):
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as error:
+        raise Broken(f"the command could not start: {error.strerror}") from None
+    samples, started = [], time.monotonic()
+    try:
+        while time.monotonic() - started < args.seconds:
+            if process.poll() is not None:
+                raise Broken(f"the command exited (status {process.returncode}) after "
+                             f"{time.monotonic() - started:.1f} s, before the soak ended")
+            samples.append(rss_kb(process.pid))
+            time.sleep(args.interval)
+    finally:
+        end(process)
+    if len(samples) < 4:
+        raise Broken("too few samples to judge; lengthen --seconds or shorten --interval")
+    quarter = max(1, len(samples) // 4)
+    growth_mb = (max(samples[-quarter:]) - min(samples[:quarter])) / 1024
+    return growth_mb, len(samples)
+
+
+def main(argv):
+    try:
+        args, command = arguments(argv)
+        growth_mb, count = soak(args, command)
+    except Broken as error:
+        say(f"broken: {error}")
+        return 2
+    if growth_mb > args.max_growth_mb:
+        say(f"refused: resident memory grew {growth_mb:.1f} MB over {args.seconds:g} s ({count} samples), "
+            f"past the {args.max_growth_mb:g} MB limit")
+        return 1
+    say(f"flat: resident memory grew {growth_mb:.1f} MB over {args.seconds:g} s ({count} samples), "
+        f"within the {args.max_growth_mb:g} MB limit")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
