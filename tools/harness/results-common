@@ -4,7 +4,12 @@ beside it.
 The ledger and every log are opened without following a symbolic link and without blocking, must be regular files,
 and are read through a cap, so a FIFO cannot hang a tool, a link cannot point it at another file, and a huge file
 cannot make it read without limit. Anything else raises Unusable, which each tool reports by its own rule.
+
+row_problems is the one definition of a row both tools judge: the recorder runs it on every row already in the
+ledger and on the row it is about to write, and ledger-check runs it on every row.
 """
+import datetime
+import functools
 import hashlib
 import json
 import math
@@ -19,25 +24,34 @@ CHUNK = 1024 * 1024
 MAX_SCHEMA = 64 * 1024
 MAX_LEDGER = 64 * 1024 * 1024
 MAX_LOG = 1024 * 1024 * 1024
+MAX_TEXT = 512
 SHA256 = frozenset("0123456789abcdef")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
-# What the plan's steps require of every row, pinned here so a weakened schema file cannot drop it (P0.15.1).
+# What the plan's steps require of every row, pinned here so a schema file can neither drop nor add one (P0.15.1).
 REQUIRED = frozenset({"machine", "build", "commit", "test", "result", "refresh_rate_hz", "concurrent_load", "log_path",
                       "log_sha256", "recorded_at", "recorder"})
 RESULTS = frozenset({"pass", "fail"})
+# The fields that hold text: each a non-blank string of at most MAX_TEXT characters with no control character.
+TEXT_FIELDS = ("machine", "build", "test", "concurrent_load", "log_path", "recorded_at", "recorder")
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+RECORDED_AT = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} CT", re.ASCII)
+RECORDED_AT_FORMAT = "%Y-%m-%d %H:%M CT"
+# The folder beside the ledger where the recorder keeps its own copy of each log, named by the copy's SHA-256.
+LOGS = "logs"
 # The commit check decides a verdict, so it runs the system git in a minimal environment, never one first on PATH.
 GIT = "/usr/bin/git"
 GIT_ENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+MAX_COMMITS_REMEMBERED = 4096
 
 
 class Unusable(Exception):
     """A file the results tools cannot read within the rules above."""
 
 
-def open_plain(path, flags=os.O_RDONLY, mode=0o644):
+def open_plain(path, flags=os.O_RDONLY, mode=0o644, dir_fd=None):
     """A descriptor for path, opened no-follow and non-blocking, that names a regular file."""
     try:
-        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode, dir_fd=dir_fd)
     except OSError as error:
         raise Unusable(f"{path} cannot be opened: {error.strerror}") from None
     try:
@@ -49,27 +63,32 @@ def open_plain(path, flags=os.O_RDONLY, mode=0o644):
     return fd
 
 
-def read_bytes(path, cap):
-    """The whole of a regular file of at most cap bytes."""
-    fd = open_plain(path)
+def read_open(fd, label, cap):
+    """The whole of an open regular file, from its first byte, of at most cap bytes."""
     try:
         data = bytearray()
         while True:
-            chunk = os.read(fd, min(CHUNK, cap + 1 - len(data)))
+            chunk = os.pread(fd, min(CHUNK, cap + 1 - len(data)), len(data))
             if not chunk:
                 return bytes(data)
             data += chunk
             if len(data) > cap:
-                raise Unusable(f"{path} is larger than {cap} bytes")
+                raise Unusable(f"{label} is larger than {cap} bytes")
     except OSError as error:
-        raise Unusable(f"{path} cannot be read: {error.strerror}") from None
+        raise Unusable(f"{label} cannot be read: {error.strerror}") from None
+
+
+def read_bytes(path, cap):
+    """The whole of a regular file of at most cap bytes."""
+    fd = open_plain(path)
+    try:
+        return read_open(fd, path, cap)
     finally:
         os.close(fd)
 
 
-def sha256_of(path, cap=MAX_LOG):
-    """The SHA-256 of a regular file of at most cap bytes, read in chunks."""
-    fd = open_plain(path)
+def hash_open(fd, label, cap=MAX_LOG):
+    """The SHA-256 of an open regular file of at most cap bytes, read in chunks from where the descriptor stands."""
     digest, size = hashlib.sha256(), 0
     try:
         while True:
@@ -78,28 +97,67 @@ def sha256_of(path, cap=MAX_LOG):
                 return digest.hexdigest()
             size += len(chunk)
             if size > cap:
-                raise Unusable(f"{path} is larger than {cap} bytes")
+                raise Unusable(f"{label} is larger than {cap} bytes")
             digest.update(chunk)
     except OSError as error:
-        raise Unusable(f"{path} cannot be read: {error.strerror}") from None
+        raise Unusable(f"{label} cannot be read: {error.strerror}") from None
+
+
+def sha256_of(path, cap=MAX_LOG):
+    """The SHA-256 of a regular file of at most cap bytes, read in chunks."""
+    fd = open_plain(path)
+    try:
+        return hash_open(fd, path, cap)
     finally:
         os.close(fd)
 
 
+def unique_keys(pairs):
+    """A JSON object whose every key appears once; a repeated key would let one value hide behind another."""
+    row = {}
+    for key, value in pairs:
+        if key in row:
+            raise ValueError(f"the key {key[:64]!r} appears twice in one object")
+        row[key] = value
+    return row
+
+
+def ledger_rows(data, label):
+    """[(line number, row)] for every line of a ledger that is not blank, read strictly: UTF-8, lines split on the
+    newline alone, and one JSON value per line with no repeated key. Anything else raises Unusable."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Unusable(f"{label} is not UTF-8 (byte {error.start})") from None
+    rows = []
+    for number, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            rows.append((number, json.loads(line, object_pairs_hook=unique_keys)))
+        except ValueError as error:
+            raise Unusable(f"{label} line {number} is not JSON: {error}") from None
+    return rows
+
+
 def load_schema():
-    """The results schema beside this file, checked for the fields both tools rely on."""
+    """The results schema beside this file, checked for the fields both tools rely on: its required list must be
+    exactly the pinned REQUIRED set, so a schema can neither drop a field every row needs nor add one."""
     try:
         schema = json.loads(read_bytes(HERE / "results-schema.json", MAX_SCHEMA))
     except ValueError as error:
         raise Unusable(f"results-schema.json is not JSON: {error}") from None
     if (not isinstance(schema, dict) or not isinstance(schema.get("recorder"), str)
-            or not isinstance(schema.get("required"), list) or not isinstance(schema.get("result_values"), list)):
+            or not isinstance(schema.get("required"), list) or not isinstance(schema.get("result_values"), list)
+            or not all(isinstance(item, str) for item in schema["required"] + schema["result_values"])):
         raise Unusable("results-schema.json lacks recorder, required or result_values")
-    missing = REQUIRED - set(schema["required"])
-    if missing or not schema["recorder"].strip() or set(schema["result_values"]) != RESULTS:
-        raise Unusable("results-schema.json drops a field every row needs or changes the result values: "
-                       + ", ".join(sorted(missing)) if missing else "results-schema.json changes the recorder or "
-                       "the result values")
+    required = set(schema["required"])
+    if required != REQUIRED:
+        changed = sorted(REQUIRED - required) + sorted(required - REQUIRED)
+        raise Unusable("results-schema.json's required fields are not the ones every row needs: "
+                       + ", ".join(repr(name[:64]) for name in changed))
+    if not schema["recorder"].strip() or set(schema["result_values"]) != RESULTS:
+        raise Unusable("results-schema.json changes the recorder or the result values")
     return schema
 
 
@@ -119,22 +177,118 @@ def inside(folder, relative):
 
 def finite_rate(value):
     """A refresh rate: a real number (never a bool or a string), finite and above zero."""
-    return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-            and value > 0)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value > 0
+    except OverflowError:  # an integer too large for a float is no refresh rate
+        return False
 
 
 def is_sha256(value):
     return isinstance(value, str) and len(value) == 64 and set(value) <= SHA256
 
 
-def commit_problem(repo, commit):
-    """None when commit is a 40-hex id of a commit in repo; otherwise why not. A git that cannot run or does not
-    answer in time is a problem too, so a row is never accepted on a check that did not happen."""
-    if not isinstance(commit, str) or not COMMIT.match(commit):
-        return f"commit {commit} is not a 40-hex commit id"
+@functools.lru_cache(maxsize=MAX_COMMITS_REMEMBERED)
+def commit_found(repo, commit):
+    """(found, answered) for one well-formed commit id, asked of the system git once per run, so a ledger whose rows
+    share a commit runs git once for it, not once per row. Remembers at most MAX_COMMITS_REMEMBERED answers."""
     try:
-        done = subprocess.run([GIT, "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"], capture_output=True,
+        done = subprocess.run([GIT, "-C", repo, "cat-file", "-e", f"{commit}^{{commit}}"], capture_output=True,
                               stdin=subprocess.DEVNULL, timeout=30, env=GIT_ENV)
     except (OSError, subprocess.TimeoutExpired):
+        return False, False
+    return done.returncode == 0, True
+
+
+def commit_problem(repo, commit):
+    """None when commit is a 40-hex id of a commit in repo; otherwise why not. A git that cannot run or does not
+    answer in time is a problem too, so a row is never accepted on a check that did not happen. A value that is not
+    a commit id is never printed."""
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        return "commit is not a 40-hex commit id"
+    found, answered = commit_found(str(repo), commit)
+    if not answered:
         return f"commit {commit} could not be checked: git did not answer"
-    return None if done.returncode == 0 else f"commit {commit} does not exist in {repo}"
+    return None if found else f"commit {commit} does not exist in {repo}"
+
+
+def real_time(value):
+    """True when value is a date and time that exist, written exactly as the recorder writes it."""
+    try:
+        return datetime.datetime.strptime(value, RECORDED_AT_FORMAT).strftime(RECORDED_AT_FORMAT) == value
+    except ValueError:
+        return False
+
+
+def text_problem(value):
+    """Why a text field's value is not a non-blank string of at most MAX_TEXT characters with no control
+    character, or None."""
+    if not isinstance(value, str):
+        return "is not a string"
+    if not value.strip():
+        return "is blank"
+    if len(value) > MAX_TEXT:
+        return f"is longer than {MAX_TEXT} characters"
+    if CONTROL.search(value):
+        return "holds a control character"
+    return None
+
+
+def log_problem(folder, row):
+    """Why the row's log is not the recorder's own copy, logs/<log_sha256>.log in the ledger's folder, a regular
+    file reached without a link whose SHA-256 is log_sha256; or None. The row's log_sha256 is already a SHA-256."""
+    expected = f"{LOGS}/{row['log_sha256']}.log"
+    if row["log_path"] != expected:
+        return f"log_path is not {expected}, the recorder's own copy of the log"
+    log = inside(folder, expected)
+    if log is None:
+        return "log_path leaves the ledger's folder"
+    try:
+        if sha256_of(log) != row["log_sha256"]:
+            return f"log {expected} no longer matches its hash"
+    except Unusable as error:
+        return f"log {expected} cannot be used: {error}"
+    return None
+
+
+def row_problems(schema, row, folder, repo):
+    """Every reason row is not one the recorder wrote, each a short line, or [] when it holds. folder is the
+    ledger's folder, resolved; repo is the repository the commit must exist in.
+
+    The row's fields are exactly REQUIRED. machine, build, test, concurrent_load, log_path, recorded_at and recorder
+    are non-blank strings of at most MAX_TEXT characters with no control character; commit is a 40-hex id the system
+    git finds in repo; result is one of RESULTS; recorder is the schema's; refresh_rate_hz is a finite positive
+    number; log_sha256 is a SHA-256; recorded_at is a real date and time written YYYY-MM-DD HH:MM CT; and log_path is exactly
+    logs/<log_sha256>.log inside folder, a regular file reached without a link whose SHA-256 is log_sha256. A value
+    from the row is never printed raw, so a row cannot write control characters to the terminal reading the
+    verdict."""
+    if not isinstance(row, dict):
+        return ["not an object"]
+    problems = [f"no {field}" for field in sorted(REQUIRED - set(row))]
+    problems += [f"unknown field {field[:64]!r}" for field in sorted(set(row) - REQUIRED)]
+    for field in TEXT_FIELDS:
+        if field in row:
+            problem = text_problem(row[field])
+            if problem:
+                problems.append(f"{field} {problem}")
+    if "commit" in row:
+        missing = commit_problem(repo, row["commit"])
+        if missing:
+            problems.append(missing)
+    if "result" in row and not (isinstance(row["result"], str) and row["result"] in RESULTS):
+        problems.append(f"result is not one of {', '.join(sorted(RESULTS))}")
+    if "recorder" in row and row["recorder"] != schema["recorder"]:
+        problems.append(f"not written by {schema['recorder']}")
+    if "refresh_rate_hz" in row and not finite_rate(row["refresh_rate_hz"]):
+        problems.append("refresh_rate_hz is not a finite positive number")
+    if isinstance(row.get("recorded_at"), str) and not (RECORDED_AT.fullmatch(row["recorded_at"])
+                                                         and real_time(row["recorded_at"])):
+        problems.append("recorded_at is not YYYY-MM-DD HH:MM CT")
+    if "log_sha256" in row and not is_sha256(row["log_sha256"]):
+        problems.append("log_sha256 is not a SHA-256")
+    elif "log_sha256" in row and "log_path" in row:
+        problem = log_problem(folder, row)
+        if problem:
+            problems.append(problem)
+    return problems

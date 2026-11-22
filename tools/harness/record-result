@@ -4,17 +4,39 @@
 Usage: record-result --ledger <ledger.jsonl> --log <raw log> --test <name> --result pass|fail --build <build>
                      --commit <40-hex> --refresh-rate-hz <number> --concurrent-load <description> [--repo <repo>]
 
-The log must sit inside the ledger's folder; the row stores its path relative to that folder and its SHA-256, the
-machine (model from /usr/sbin/sysctl and macOS version from /usr/bin/sw_vers), the time in Central time, and the
-recorder name the schema names. The size check and the append run under an exclusive lock on the ledger.
-The commit must exist in --repo (default: the current folder's repository). The
-ledger and the log are opened without following a link and without blocking, and must be regular files. Refuses
-(exit 1) a row it cannot fill truthfully, a refresh rate that is not a finite positive number among them; exit 0
-written, 2 broken (a schema that cannot load, or a row the ledger did not take whole).
+The log may be any regular file anywhere; it is opened without following a link and without blocking, and a link,
+a FIFO or a file past the 1 GiB log cap is refused. The ledger too is opened without following a link and without
+blocking, and must be a regular file. The row records the machine (model from /usr/sbin/sysctl and macOS version
+from /usr/bin/sw_vers), the time in Central time, and the recorder name the schema names. The commit must exist in
+--repo (default: the current folder's repository).
+
+Everything that touches the ledger's folder runs under an exclusive lock on the ledger, tried for 5 seconds and
+then refused as busy:
+  1. the existing ledger is read strictly (UTF-8, one JSON value per line, within its size cap) and every row in it
+     is judged by results-common's row_problems, the rule ledger-check applies; if any row fails, the recorder
+     refuses, naming the first failing line and its reason, and writes nothing;
+  2. <ledger folder>/logs is made sure to be a real folder, never a link, and created with mode 0755 if missing;
+  3. the log is copied into a new file in logs/ (created exclusively, never through a link, mode 0644), hashed as
+     it is copied, refused past the log cap, flushed to disk, and renamed to logs/<sha256>.log; if that name is
+     already there, its hash must be the same, and the new copy is removed instead;
+  4. the row is built with log_path logs/<sha256>.log, the recorder's own copy, so later edits to the source log
+     never touch the evidence, and is judged by row_problems; any problem refuses it;
+  5. the row is appended whole, if the ledger stays within its size cap counting the new line, and the ledger is
+     flushed to disk. If the write or the flush fails, the ledger is cut back to its size before the append and
+     flushed again, so no torn row stays, and the copy this run placed is removed with it; the run is then broken
+     (exit 2) and says the ledger was restored. If the cut itself fails, it says so plainly and keeps the copy, since
+     the row may be there.
+A copy this run placed in logs/ is removed again when steps 4 or 5 refuse the row.
+
+Refuses (exit 1) a row it cannot fill truthfully: a refresh rate that is not a finite positive number, a machine
+the fixed instruments cannot name, a commit git cannot find, a log or ledger it cannot use, a ledger whose existing
+row fails, a busy ledger, or a row past the ledger's cap. Exit 0 written, 2 broken (a schema that cannot load, a
+copy of the log that could not be written, or a row the ledger did not take whole, which is cut back out first).
 """
 import argparse
 import datetime
 import fcntl
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -38,8 +60,9 @@ def common():
 
 
 def locked(fd):
-    """An exclusive lock on the ledger, held until the descriptor closes, so the size check and the append happen
-    with no other recorder between them. Tries for LOCK_SECONDS, then gives up rather than wait without limit."""
+    """An exclusive lock on the ledger, held until the descriptor closes, so the checks, the copy and the append
+    happen with no other recorder between them. Tries for LOCK_SECONDS, then gives up rather than wait without
+    limit."""
     deadline = time.monotonic() + LOCK_SECONDS
     while True:
         try:
@@ -61,6 +84,148 @@ def instrument(argv):
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
+class Refused(Exception):
+    """A row the recorder will not write; nothing was appended."""
+
+
+class AppendFailed(Exception):
+    """The ledger did not take the row whole; the message says whether its size before the append was restored."""
+
+
+def write_all(fd, data, what):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(0, f"{what} accepted no bytes")
+        view = view[written:]
+
+
+def append_row(fd, line):
+    """Appends line to the ledger and flushes it. If the write or the flush fails after some bytes may have landed,
+    the ledger is cut back to its size before the append and flushed, and AppendFailed says whether that worked."""
+    size = os.fstat(fd).st_size
+    try:
+        write_all(fd, line, "the ledger")
+        os.fsync(fd)
+    except OSError as error:
+        reason = error.strerror or str(error)
+        try:
+            os.ftruncate(fd, size)
+            os.fsync(fd)
+        except OSError as cut:
+            raise AppendFailed(f"the row could not be written whole ({reason}) and the ledger could not be restored "
+                               f"to its {size} bytes before the append ({cut.strerror or cut}); check the ledger "
+                               "before recording again") from None
+        raise AppendFailed(f"the row could not be written whole ({reason}); the ledger was restored to its size "
+                           f"before the append, {size} bytes") from None
+
+
+def logs_folder(rc, folder):
+    """A descriptor for <folder>/logs, a real folder and never a link, created with mode 0755 when missing."""
+    path = folder / rc.LOGS
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise Refused(f"{path} cannot be created: {error.strerror}") from None
+    try:
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise Refused(f"{path} is not a real folder: {error.strerror}") from None
+
+
+def store_copy(rc, source_fd, logs_fd):
+    """Copies the source log into logs/<sha256>.log and returns (sha256, whether this run placed the file). The
+    copy goes to a new file opened exclusively and never through a link, hashed as it is written and flushed before
+    it takes its name; a name already there must hold the same bytes, and the new copy is removed instead."""
+    temp = f".incoming-{os.getpid()}-{os.urandom(8).hex()}.tmp"
+    try:
+        out = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o644, dir_fd=logs_fd)
+    except OSError as error:
+        raise OSError(error.errno, f"a copy of the log cannot be created in logs/: {error.strerror}") from None
+    placed = False
+    try:
+        digest, size = hashlib.sha256(), 0
+        try:
+            while True:
+                chunk = os.pread(source_fd, rc.CHUNK, size)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > rc.MAX_LOG:
+                    raise Refused(f"the log is larger than {rc.MAX_LOG} bytes")
+                digest.update(chunk)
+                write_all(out, chunk, "the copy of the log")
+            os.fsync(out)
+        finally:
+            os.close(out)
+        sha = digest.hexdigest()
+        name = f"{sha}.log"
+        try:
+            os.stat(name, dir_fd=logs_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.rename(temp, name, src_dir_fd=logs_fd, dst_dir_fd=logs_fd)
+            placed = True
+            return sha, True
+        try:
+            held = rc.open_plain(name, dir_fd=logs_fd)
+        except rc.Unusable as error:
+            raise Refused(f"logs/{name} is already there and cannot be used: {error}") from None
+        try:
+            same = rc.hash_open(held, f"logs/{name}") == sha
+        except rc.Unusable as error:
+            raise Refused(f"logs/{name} is already there and cannot be used: {error}") from None
+        finally:
+            os.close(held)
+        if not same:
+            raise Refused(f"logs/{name} is already there with other bytes")
+        return sha, False
+    finally:
+        if not placed:
+            try:
+                os.unlink(temp, dir_fd=logs_fd)
+            except FileNotFoundError:
+                pass
+
+
+def record(rc, schema, args, folder, fd, source_fd, fields):
+    """Steps 1 to 5 of the docstring, run while the ledger's lock is held. Returns the line written."""
+    try:
+        rows = rc.ledger_rows(rc.read_open(fd, "the ledger", rc.MAX_LEDGER), "the ledger")
+    except rc.Unusable as error:
+        raise Refused(f"the ledger cannot be appended to: {error}; nothing was written") from None
+    for number, existing in rows:
+        problems = rc.row_problems(schema, existing, folder, args.repo)
+        if problems:
+            raise Refused(f"line {number} of the ledger does not hold ({problems[0]}); nothing was written")
+    logs_fd = logs_folder(rc, folder)
+    try:
+        sha, placed = store_copy(rc, source_fd, logs_fd)
+        try:
+            row = dict(fields, log_path=f"{rc.LOGS}/{sha}.log", log_sha256=sha)
+            problems = rc.row_problems(schema, row, folder, args.repo)
+            if problems:
+                raise Refused("; ".join(problems))
+            line = (json.dumps(row, sort_keys=True) + "\n").encode()
+            if os.fstat(fd).st_size + len(line) > rc.MAX_LEDGER:
+                raise Refused(f"this row would take the ledger past {rc.MAX_LEDGER} bytes; start a new one")
+            try:
+                append_row(fd, line)
+            except AppendFailed as error:
+                if placed and "was restored" in str(error):  # a ledger left unrestored may name the copy: keep it
+                    os.unlink(f"{sha}.log", dir_fd=logs_fd)
+                raise
+        except Refused:
+            if placed:  # no row names a copy this run placed, so it goes with the refused row
+                os.unlink(f"{sha}.log", dir_fd=logs_fd)
+            raise
+    finally:
+        os.close(logs_fd)
+    return line
+
+
 def main(argv):
     try:
         rc = common()
@@ -77,22 +242,19 @@ def main(argv):
     ledger = pathlib.Path(os.path.abspath(args.ledger))
     folder = ledger.parent.resolve()
     ledger = folder / ledger.name
-    log_abs = pathlib.Path(os.path.abspath(args.log))
-    log = log_abs.parent.resolve() / log_abs.name
     problems = []
     if args.result not in schema["result_values"]:
         problems.append(f"result must be one of {schema['result_values']}")
     missing = rc.commit_problem(args.repo, args.commit)
     if missing:
         problems.append(missing)
-    digest = None
-    if not log.is_relative_to(folder):
-        problems.append("the log must be a file inside the ledger's folder")
-    else:
-        try:
-            digest = rc.sha256_of(log)
-        except rc.Unusable as error:
-            problems.append(f"the log cannot be used: {error}")
+    source_fd = None
+    try:
+        source_fd = rc.open_plain(os.path.abspath(args.log))
+        if os.fstat(source_fd).st_size > rc.MAX_LOG:
+            problems.append(f"the log is larger than {rc.MAX_LOG} bytes")
+    except rc.Unusable as error:
+        problems.append(f"the log cannot be used: {error}")
     if not args.concurrent_load.strip():
         problems.append("concurrent-load must say what else was running")
     try:
@@ -106,38 +268,41 @@ def main(argv):
     if not model or not version:
         problems.append("the machine model or macOS version could not be read")
     if problems:
+        if source_fd is not None:
+            os.close(source_fd)
         for line in problems:
             print(f"record-result: refused: {line}")
         return 1
-    row = {"machine": f"{model} macOS {version}", "build": args.build, "commit": args.commit, "test": args.test,
-           "result": args.result, "refresh_rate_hz": rate, "concurrent_load": args.concurrent_load.strip(),
-           "log_path": log.relative_to(folder).as_posix(), "log_sha256": digest,
-           "recorded_at": datetime.datetime.now(zoneinfo.ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M CT"),
-           "recorder": schema["recorder"]}
+    fields = {"machine": f"{model} macOS {version}", "build": args.build, "commit": args.commit, "test": args.test,
+              "result": args.result, "refresh_rate_hz": rate, "concurrent_load": args.concurrent_load.strip(),
+              "recorded_at": datetime.datetime.now(zoneinfo.ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M CT"),
+              "recorder": schema["recorder"]}
     try:
-        fd = rc.open_plain(ledger, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    except rc.Unusable as error:
-        print(f"record-result: refused: the ledger cannot be used: {error}")
-        return 1
-    line = (json.dumps(row, sort_keys=True) + "\n").encode()
-    try:
-        if not locked(fd):
-            print(f"record-result: refused: the ledger is busy; another recorder held it for {LOCK_SECONDS} seconds")
+        try:
+            fd = rc.open_plain(ledger, os.O_RDWR | os.O_APPEND | os.O_CREAT)
+        except rc.Unusable as error:
+            print(f"record-result: refused: the ledger cannot be used: {error}")
             return 1
-        if os.fstat(fd).st_size + len(line) > rc.MAX_LEDGER:
-            print(f"record-result: refused: this row would take the ledger past {rc.MAX_LEDGER} bytes; start a new one")
+        try:
+            if not locked(fd):
+                print(f"record-result: refused: the ledger is busy; another recorder held it for {LOCK_SECONDS} "
+                      "seconds")
+                return 1
+            record(rc, schema, args, folder, fd, source_fd, fields)
+        except Refused as error:
+            print(f"record-result: refused: {error}")
             return 1
-        view = memoryview(line)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError(0, "the ledger accepted no bytes")
-            view = view[written:]
-    except OSError as error:
-        print(f"record-result: broken: the row could not be written whole: {error.strerror or error}", file=sys.stderr)
-        return 2
+        except AppendFailed as error:
+            print(f"record-result: broken: {error}", file=sys.stderr)
+            return 2
+        except OSError as error:
+            print(f"record-result: broken: the log's copy or the row could not be written whole: "
+                  f"{error.strerror or error}", file=sys.stderr)
+            return 2
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(source_fd)
     print(f"record-result: wrote {args.test} ({args.result}) to {ledger.name}")
     return 0
 

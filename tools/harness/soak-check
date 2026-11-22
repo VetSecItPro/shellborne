@@ -11,6 +11,9 @@ allocates as it starts is not a leak. Growth is the highest sample in
 the last quarter of the run minus the lowest in the first quarter. Exit 0 flat (growth within the limit), 1 refused
 (growth past it, with the figures), 2 broken: bad arguments, a command that cannot start or exits before the time is
 up, or a sample that cannot be read. Stated limit: only the command's own process is measured, not its children.
+
+It does not check which account runs it, because hosted CI runs it with no test account. A destructive soak starts
+through tools/harness/run-suite, which runs it only as the dedicated test account.
 """
 import argparse
 import math
