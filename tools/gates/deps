@@ -26,10 +26,18 @@ Usage: deps [--tables-from <ref>] <repo>
       * every tracked font file must sit in a vendored folder from the table, and every tracked file under
         third_party/ must sit in one too, except a PIN.toml, which is a pin record.
       * every [[surface-package]] (a package the Stage 1 surface library links, for development builds only) must
-        have an allowed license, or an [[exception]] naming it by exact name and license, with its duty; an
+        have an allowed license, or an [[exception]] naming it by exact name and license, with its duties; an
         exception covers that one package in that library and nothing else, one naming no listed surface
         package is refused, and none may name AGPL, or a GPL other than one
         carrying the Bison parser exception.
+      * an exception's duties are a non-empty list of codes from DUTIES: ship-license-text,
+        link-unchanged-source, publish-relink-steps and publish-file-changes. A list that is not one of strings,
+        is empty or holds an unknown code, or the old free-text duty key, is broken like any malformed entry. Each
+        exception must list every code its license family needs, or it is refused, naming the codes it lacks:
+        any LGPL term needs ship-license-text, link-unchanged-source and publish-relink-steps; any MPL term needs
+        ship-license-text and publish-file-changes; a GPL term (only with the Bison exception) needs
+        ship-license-text and link-unchanged-source; anything else needs ship-license-text. The codes of every
+        term of an OR or AND expression are all needed.
     Every LGPL fails, whatever its kind and however it would be linked, except a surface package an exception names.
   - unpinned-package: a Package.resolved pin without an exact 40-hex revision, or pinned to a branch.
 
@@ -59,6 +67,9 @@ MAX_TABLE_BYTES = 256 * 1024
 FONT_SUFFIXES = (".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2")  # .ttc and .otc are collections
 OFL = "OFL-1.1"
 PIN_KINDS = {"swiftpm", "zig", "ghostty"}
+# What an [[exception]] may promise, one code per duty: ship the license text with the build, link the package from
+# its unchanged source, publish the steps to relink against a changed copy, and publish any change to its files.
+DUTIES = frozenset({"ship-license-text", "link-unchanged-source", "publish-relink-steps", "publish-file-changes"})
 
 # What a license file must say for each declared license, matched without case and with runs of white space
 # folded to one space. A file must hold every phrase of its declared license.
@@ -159,13 +170,17 @@ def load_tables(repo, ref):
                 or not all(isinstance(value, str) and value for value in entry.values())):
             raise Broken("licenses.toml: each [[vendored]] needs exactly path, license and license-file")
     surface, exceptions = table.get("surface-package", []), table.get("exception", [])
-    for entries, keys, label in ((surface, {"name", "license"}, "[[surface-package]] needs exactly name and license"),
-                                 (exceptions, {"name", "license", "duty"},
-                                  "[[exception]] needs exactly name, license and duty")):
-        if not isinstance(entries, list) or not all(
-                isinstance(entry, dict) and set(entry) == keys
-                and all(isinstance(value, str) and value.strip() for value in entry.values()) for entry in entries):
-            raise Broken(f"licenses.toml: each {label}")
+    if not isinstance(surface, list) or not all(
+            isinstance(entry, dict) and set(entry) == {"name", "license"}
+            and all(isinstance(value, str) and value.strip() for value in entry.values()) for entry in surface):
+        raise Broken("licenses.toml: each [[surface-package]] needs exactly name and license")
+    if not isinstance(exceptions, list) or not all(
+            isinstance(entry, dict) and set(entry) == {"name", "license", "duties"}
+            and all(isinstance(entry[key], str) and entry[key].strip() for key in ("name", "license"))
+            and isinstance(entry["duties"], list) and entry["duties"]
+            and all(isinstance(code, str) and code in DUTIES for code in entry["duties"]) for entry in exceptions):
+        raise Broken("licenses.toml: each [[exception]] needs exactly name, license and duties, a non-empty list of "
+                     f"codes from: {', '.join(sorted(DUTIES))}")
     return allow, deny_text, pins, vendored, surface, exceptions
 
 
@@ -187,14 +202,36 @@ def exception_admissible(license):
     return True
 
 
+def required_duties(license):
+    """The duty codes an exception for license must list, by license family, for every term of the expression: an
+    LGPL term needs the license text, the unchanged source and the relink steps; an MPL term the license text and the
+    file changes; a GPL term (admissible only with the Bison exception) the license text and the unchanged source;
+    any other term the license text."""
+    needed = {"ship-license-text"}
+    for term in re.split(r"\s+(?:OR|AND)\s+", license.strip()):
+        term = term.strip("() ").upper()
+        if term.startswith("LGPL"):
+            needed |= {"link-unchanged-source", "publish-relink-steps"}
+        elif term.startswith("MPL-"):
+            needed |= {"publish-file-changes"}
+        elif term.startswith("GPL-"):
+            needed |= {"link-unchanged-source"}
+    return needed
+
+
 def check_surface(surface, exceptions, allow, findings):
     """A package the Stage 1 surface library links passes when its license is on the allow-list, or when an
     [[exception]] names it with exactly that license; an exception names one package in that library only and never
-    widens the allow-list. An exception that names no listed surface package is refused, so the list cannot go stale."""
+    widens the allow-list. An exception that names no listed surface package is refused, so the list cannot go stale,
+    and so is one that does not list every duty its license family needs."""
     for entry in exceptions:
         if not exception_admissible(entry["license"]):
             findings.append(("license", f"licenses.toml exception {entry['name']} ({entry['license']}: no exception "
                                         "may admit AGPL, or a GPL other than one with the Bison exception)"))
+        lacking = required_duties(entry["license"]) - set(entry["duties"])
+        if lacking:
+            findings.append(("license", f"licenses.toml exception {entry['name']} ({entry['license']} needs the "
+                                        f"duties {', '.join(sorted(lacking))}, which it does not list)"))
     named = {(entry["name"], entry["license"]) for entry in exceptions if exception_admissible(entry["license"])}
     listed = {(entry["name"], entry["license"]) for entry in surface}
     for entry in surface:

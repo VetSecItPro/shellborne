@@ -12,6 +12,21 @@
 #   license = an SPDX id
 #
 # [[vendored]]: one per vendored folder, fonts included. The gate reads the license file itself.
+#
+# [[surface-package]]: one per package the Stage 1 surface library links, for development builds only.
+#   name = the package name
+#   license = an SPDX expression
+#
+# [[exception]]: names one surface package whose license is not on the allow list; it covers that package in that
+# library only. No exception may name AGPL, or a GPL without the Bison exception.
+#   name = the surface package's name
+#   license = exactly the surface package's license
+#   duties = a non-empty list of duty codes: "ship-license-text", "link-unchanged-source", "publish-relink-steps",
+#            "publish-file-changes". Each license family needs its codes, or the exception is refused:
+#            any LGPL term: ship-license-text, link-unchanged-source, publish-relink-steps;
+#            any MPL term: ship-license-text, publish-file-changes;
+#            a GPL term with the Bison exception: ship-license-text, link-unchanged-source;
+#            anything else: ship-license-text.
 
 # The Silkscreen font and its license.
 [[vendored]]
