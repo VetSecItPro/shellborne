@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""survival: the instruments the kill suites run on (Plan-Step: P2.1.1).
+
+Usage:
+  survival snapshot --out <file> <name>=<pid> ...   record each named process's PID, whether it lives, and its start
+  survival compare <before> <after>                 the same processes, unchanged: same PID and same start time
+  survival tick --every <seconds> [--count <n>]      print "tick <n> <epoch ms>" lines inside a pane
+  survival gaps <log> --max-gap <seconds>            every tick present, in order, and no pause over the limit
+  survival shim --log <file> -- <command> ...        append one JSON line for this spawn, then run the command
+  survival guard                                     refuse unless running as the test account (whoami-check --guard)
+
+compare reports, one line each:
+  pid-changed: <name> <old> -> <new>     the name now points at another process
+  gone: <name> <pid>                     the process is no longer alive
+  reused: <name> <pid>                   the same PID with another start time, so a different process
+gaps reports missing tick numbers as ranges, numbers out of order, and pauses longer than --max-gap; lines that are
+not ticks (a prompt, other output) are skipped and counted. A log with no ticks is broken, never clean.
+
+Every read is bounded (MAX_LOG bytes of log, MAX_PAIRS names). Exit 0 holds, 1 a finding, 2 broken, so a broken
+instrument never reads as a pass.
+"""
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+MAX_LOG = 256 * 1024 * 1024
+MAX_PAIRS = 256
+MAX_FINDINGS = 200
+PS = "/bin/ps"
+PS_SECONDS = 10
+NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+TICK = re.compile(r"^tick (\d{1,18}) (\d{1,18})$")
+HERE = pathlib.Path(__file__).resolve().parent
+WHOAMI = HERE.parent / "harness" / "whoami-check"
+
+
+class Broken(Exception):
+    pass
+
+
+def started(pid):
+    """The process's start time as ps prints it, or None when no such process lives."""
+    try:
+        done = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                              timeout=PS_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Broken(f"cannot run ps: {error}") from None
+    text = done.stdout.strip()
+    if done.returncode != 0 or not text:
+        return None
+    return " ".join(text.split())
+
+
+def snapshot(args):
+    if len(args) < 3 or args[0] != "--out":
+        raise Broken("usage: survival snapshot --out <file> <name>=<pid> ...")
+    out, pairs = pathlib.Path(args[1]), args[2:]
+    if len(pairs) > MAX_PAIRS:
+        raise Broken(f"more than {MAX_PAIRS} names")
+    data = {}
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        if not sep or not NAME.match(name) or not value.isdigit() or int(value) <= 0 or name in data:
+            raise Broken(f"not a name=pid pair: {pair!r}")
+        pid = int(value)
+        when = started(pid)
+        data[name] = {"pid": pid, "alive": when is not None, "started": when or ""}
+    out.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
+    print(f"survival: {len(data)} process(es) recorded in {out}")
+    return 0
+
+
+def load(path):
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_LOG + 1)
+        if len(raw) > MAX_LOG:
+            raise Broken(f"{path} is larger than {MAX_LOG} bytes")
+        data = json.loads(raw)
+    except (OSError, ValueError) as error:
+        raise Broken(f"cannot read {path}: {error}") from None
+    if not isinstance(data, dict) or not all(
+            isinstance(v, dict) and isinstance(v.get("pid"), int) and isinstance(v.get("alive"), bool)
+            and isinstance(v.get("started"), str) for v in data.values()):
+        raise Broken(f"{path} is not a survival snapshot")
+    return data
+
+
+def compare(args):
+    if len(args) != 2:
+        raise Broken("usage: survival compare <before> <after>")
+    before, after = load(args[0]), load(args[1])
+    if set(before) != set(after):
+        raise Broken("the two snapshots name different processes: " + ", ".join(sorted(set(before) ^ set(after))))
+    findings = []
+    for name in sorted(before):
+        old, new = before[name], after[name]
+        if not new["alive"]:
+            findings.append(f"gone: {name} {old['pid']}")
+        elif new["pid"] != old["pid"]:
+            findings.append(f"pid-changed: {name} {old['pid']} -> {new['pid']}")
+        elif new["started"] != old["started"]:
+            findings.append(f"reused: {name} {old['pid']} (started {old['started']!r}, now {new['started']!r})")
+    for line in findings[:MAX_FINDINGS]:
+        print(f"survival: {line}")
+    if findings:
+        return 1
+    word = "process" if len(before) == 1 else "processes"
+    print(f"survival: {len(before)} {word} held")
+    return 0
+
+
+def tick(args):
+    every, count = None, None
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag in ("--every", "--count") and rest:
+            value = rest.pop(0)
+            try:
+                if flag == "--every":
+                    every = float(value)
+                else:
+                    count = int(value)
+            except ValueError:
+                raise Broken(f"{flag} needs a number") from None
+        else:
+            raise Broken("usage: survival tick --every <seconds> [--count <n>]")
+    if every is None or not 0 < every <= 60 or (count is not None and count < 1):
+        raise Broken("usage: survival tick --every <seconds> [--count <n>]")
+    n = 0
+    while count is None or n < count:
+        sys.stdout.write(f"tick {n} {time.time_ns() // 1_000_000}\n")
+        sys.stdout.flush()
+        n += 1
+        if count is None or n < count:
+            time.sleep(every)
+    return 0
+
+
+def ranges(numbers):
+    out, start, prev = [], None, None
+    for n in numbers:
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append(f"{start}-{prev}" if prev != start else str(start))
+            start = prev = n
+    if start is not None:
+        out.append(f"{start}-{prev}" if prev != start else str(start))
+    return out
+
+
+def gaps(args):
+    if len(args) != 3 or args[1] != "--max-gap":
+        raise Broken("usage: survival gaps <log> --max-gap <seconds>")
+    try:
+        limit_ms = float(args[2]) * 1000
+    except ValueError:
+        raise Broken("--max-gap needs a number") from None
+    if not limit_ms > 0:
+        raise Broken("--max-gap must be above zero")
+    try:
+        with open(args[0], "rb") as handle:
+            raw = handle.read(MAX_LOG + 1)
+    except OSError as error:
+        raise Broken(f"cannot read {args[0]}: {error}") from None
+    if len(raw) > MAX_LOG:
+        raise Broken(f"{args[0]} is larger than {MAX_LOG} bytes")
+    ticks, other = [], 0
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        match = TICK.match(line.strip())
+        if match:
+            ticks.append((int(match.group(1)), int(match.group(2))))
+        elif line.strip():
+            other += 1
+    if not ticks:
+        raise Broken(f"{args[0]} holds no tick lines")
+    findings = []
+    for (prev_n, prev_ms), (n, ms) in zip(ticks, ticks[1:]):
+        if n <= prev_n:
+            findings.append(f"out of order: tick {n} after tick {prev_n}")
+        elif ms - prev_ms > limit_ms:
+            findings.append(f"pause: {(ms - prev_ms) / 1000:.1f} s after tick {prev_n}")
+    numbers = sorted({n for n, _ in ticks})
+    present = set(numbers)
+    missing = [n for n in range(numbers[0], numbers[-1] + 1) if n not in present]
+    if missing:
+        findings.insert(0, "missing: " + ", ".join(ranges(missing)[:MAX_FINDINGS]))
+    for line in findings[:MAX_FINDINGS]:
+        print(f"survival: {line}")
+    if findings:
+        return 1
+    print(f"survival: {len(ticks)} ticks in order with no pause over {args[2]} s ({other} other lines skipped)")
+    return 0
+
+
+def shim(args):
+    if len(args) < 4 or args[0] != "--log" or args[2] != "--":
+        raise Broken("usage: survival shim --log <file> -- <command> ...")
+    log, argv = args[1], args[3:]
+    row = {"t_ms": time.time_ns() // 1_000_000, "pid": os.getpid(), "ppid": os.getppid(), "argv": argv}
+    try:
+        fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "a") as handle:
+            handle.write(json.dumps(row) + "\n")
+    except OSError as error:
+        raise Broken(f"cannot append to {log}: {error}") from None
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as error:
+        raise Broken(f"cannot run {argv[0]}: {error}") from None
+    return 2
+
+
+def guard(args):
+    if args:
+        raise Broken("usage: survival guard")
+    if not WHOAMI.is_file():
+        raise Broken(f"{WHOAMI} is missing")
+    done = subprocess.run([sys.executable, "-I", str(WHOAMI), "--guard"], check=False)
+    return done.returncode if done.returncode in (0, 1) else 2
+
+
+VERBS = {"snapshot": snapshot, "compare": compare, "tick": tick, "gaps": gaps, "shim": shim, "guard": guard}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in VERBS:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    try:
+        return VERBS[argv[1]](argv[2:])
+    except Broken as error:
+        print(f"survival: broken: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

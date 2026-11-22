@@ -29,3 +29,4 @@ xcuserdata/
 
 # Browser tool output from local previews.
 .playwright-mcp/
+/third_party/ghostty/.vendor/

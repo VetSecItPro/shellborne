@@ -33,3 +33,40 @@
 path = "docs/assets/fonts"
 license = "OFL-1.1"
 license-file = "docs/assets/fonts/OFL-Silkscreen.txt"
+
+# The three packages the Stage 1 surface library (GhosttyKit) links that are outside the allow-list, each license read
+# from the package's own license file at the candidate Ghostty commit, and the owner's exceptions for them, inside
+# that library only (Plan-Step: P0.25.3). No public release links the surface library.
+[[surface-package]]
+name = "libintl"
+license = "LGPL-2.1-or-later"
+
+[[exception]]
+name = "libintl"
+license = "LGPL-2.1-or-later"
+duties = ["ship-license-text", "link-unchanged-source", "publish-relink-steps"]
+
+[[surface-package]]
+name = "z2d"
+license = "MPL-2.0"
+
+[[exception]]
+name = "z2d"
+license = "MPL-2.0"
+duties = ["ship-license-text", "link-unchanged-source", "publish-file-changes"]
+
+[[surface-package]]
+name = "glslang"
+license = "GPL-3.0-or-later WITH Bison-exception-2.2"
+
+[[exception]]
+name = "glslang"
+license = "GPL-3.0-or-later WITH Bison-exception-2.2"
+duties = ["ship-license-text", "link-unchanged-source"]
+
+# The Ghostty engine, pinned in third_party/ghostty/PIN.toml (Plan-Step: P0.25.5).
+[[pin]]
+kind = "ghostty"
+name = "ghostty"
+revision = "108cacb17ed8990840cd14abfce43d8ed8503ca1"
+license = "MIT"

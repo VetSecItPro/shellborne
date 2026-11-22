@@ -1,0 +1,25 @@
+--- a/src/font/SharedGridSet.zig
++++ b/src/font/SharedGridSet.zig
+@@ -315,22 +315,6 @@
+     ))).setVariations(
+         &.{.{ .id = .init("wght"), .value = 700 }},
+         load_options.faceOptions(),
+-    );
+-
+-    // Nerd-font symbols fallback.
+-    _ = try c.add(
+-        self.alloc,
+-        try .init(
+-            self.font_lib,
+-            font.embedded.symbols_nerd_font,
+-            load_options.faceOptions(),
+-        ),
+-        .{
+-            .style = .regular,
+-            .fallback = true,
+-            // No size adjustment for the symbols font.
+-            .size_adjustment = .none,
+-        },
+     );
+ 
+     // On macOS, always search for and add the Apple Emoji font

@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Scan a built engine library for crash-reporter symbols and for embedded font data.
+
+Usage:
+  scan-artifact crash <library>                         no symbol from a crash-reporting component
+  scan-artifact font <library> <font file>              does the library hold the font's bytes
+
+Architecture slices are judged by tools/gates/lipo, not here. A finding prints one line and exits 1; a clean
+result prints what it checked and exits 0; a scan that cannot read its input exits 2, so a missing tool never
+reads as clean. The font check takes 8 windows of 64 bytes from across
+the font file and calls the font present when any window appears in the library; a library holding the font
+whole holds every window.
+"""
+import pathlib
+import re
+import subprocess
+import sys
+
+NM = "/usr/bin/nm"
+TIMEOUT = 600
+MAX_SYMBOL_BYTES = 512 * 1024 * 1024
+MAX_LIBRARY_BYTES = 2 * 1024 * 1024 * 1024
+WINDOW = 64
+WINDOWS = 8
+# Crash-reporting components the engine must never carry: Sentry, Breakpad, Crashpad, KSCrash, PLCrashReporter.
+CRASH = re.compile(r"(?i)(sentry_|_sentry|breakpad|crashpad|kscrash|plcrash|google_breakpad)")
+
+
+def fail(code, message):
+    print(f"scan-artifact: {message}")
+    sys.exit(code)
+
+
+def run(argv):
+    try:
+        done = subprocess.run(argv, capture_output=True, timeout=TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        fail(2, f"cannot run {argv[0]}: {err}")
+    if done.returncode != 0:
+        fail(2, f"{argv[0]} exited {done.returncode}: {done.stderr.decode(errors='replace')[-300:]}")
+    if len(done.stdout) > MAX_SYMBOL_BYTES:
+        fail(2, f"{argv[0]} output is over {MAX_SYMBOL_BYTES} bytes")
+    return done.stdout.decode(errors="replace")
+
+
+def regular(path):
+    p = pathlib.Path(path)
+    if not p.is_file() or p.is_symlink():
+        fail(2, f"{path} is not a regular file")
+    if p.stat().st_size > MAX_LIBRARY_BYTES:
+        fail(2, f"{path} is over {MAX_LIBRARY_BYTES} bytes")
+    return p
+
+
+def crash(lib):
+    regular(lib)
+    out = run([NM, "-a", "-A", lib])
+    lines = out.splitlines()
+    if not lines:
+        fail(2, f"nm printed no symbols for {lib}")
+    hits = [l for l in lines if CRASH.search(l)]
+    if hits:
+        fail(1, f"{lib} carries {len(hits)} crash-reporting symbols, first: {hits[0].strip()[:200]}")
+    print(f"scan-artifact: {lib}: {len(lines)} symbol lines read, none from a crash-reporting component")
+
+
+def font(lib, font_file):
+    data = regular(lib).read_bytes()
+    face = regular(font_file).read_bytes()
+    if len(face) < WINDOW * WINDOWS * 2:
+        fail(2, f"{font_file} is too small to sample")
+    step = (len(face) - WINDOW) // (WINDOWS + 1)
+    found = sum(1 for i in range(1, WINDOWS + 1) if face[i * step:i * step + WINDOW] in data)
+    if found:
+        fail(1, f"{lib} holds the font {pathlib.Path(font_file).name}: {found} of {WINDOWS} windows present")
+    print(f"scan-artifact: {lib} holds none of {WINDOWS} windows of {pathlib.Path(font_file).name}")
+
+
+def main(argv):
+    if len(argv) == 3 and argv[1] == "crash":
+        crash(argv[2])
+    elif len(argv) == 4 and argv[1] == "font":
+        font(argv[2], argv[3])
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

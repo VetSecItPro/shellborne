@@ -2,7 +2,8 @@
 """record-result: append one results row, written the way tools/harness/ledger-check expects (plan step P0.15.6).
 
 Usage: record-result --ledger <ledger.jsonl> --log <raw log> --test <name> --result pass|fail --build <build>
-                     --commit <40-hex> --refresh-rate-hz <number> --concurrent-load <description> [--repo <repo>]
+                     --commit <40-hex> --refresh-rate-hz <number> --concurrent-load <description>
+                     --session <32 lowercase hex> [--repo <repo>]
 
 The log may be any regular file anywhere; it is opened without following a link and without blocking, and a link,
 a FIFO or a file past the 1 GiB log cap is refused. The ledger too is opened without following a link and without
@@ -28,7 +29,10 @@ then refused as busy:
      the row may be there.
 A copy this run placed in logs/ is removed again when steps 4 or 5 refuse the row.
 
-Refuses (exit 1) a row it cannot fill truthfully: a refresh rate that is not a finite positive number, a machine
+The session names the run: run-suite draws one for each run and hands it to the suite as SHELLBORNE_SESSION, and
+every row that run records carries it, so a second run can be told from a second row of the same run.
+
+Refuses (exit 1) a row it cannot fill truthfully: a session that is missing or not 32 lowercase hex, a refresh rate that is not a finite positive number, a machine
 the fixed instruments cannot name, a commit git cannot find, a log or ledger it cannot use, a ledger whose existing
 row fails, a busy ledger, or a row past the ledger's cap. Exit 0 written, 2 broken (a schema that cannot load, a
 copy of the log that could not be written, or a row the ledger did not take whole, which is cut back out first).
@@ -238,11 +242,15 @@ def main(argv):
                  "--concurrent-load"):
         parser.add_argument(flag, required=True)
     parser.add_argument("--repo", default=".")
+    parser.add_argument("--session")
     args = parser.parse_args(argv)
     ledger = pathlib.Path(os.path.abspath(args.ledger))
     folder = ledger.parent.resolve()
     ledger = folder / ledger.name
     problems = []
+    if args.session is None or rc.session_problem(args.session):
+        problems.append("--session must be the run's session, 32 lowercase hex characters (run-suite hands each "
+                        "run one as SHELLBORNE_SESSION)")
     if args.result not in schema["result_values"]:
         problems.append(f"result must be one of {schema['result_values']}")
     missing = rc.commit_problem(args.repo, args.commit)
@@ -276,7 +284,7 @@ def main(argv):
     fields = {"machine": f"{model} macOS {version}", "build": args.build, "commit": args.commit, "test": args.test,
               "result": args.result, "refresh_rate_hz": rate, "concurrent_load": args.concurrent_load.strip(),
               "recorded_at": datetime.datetime.now(zoneinfo.ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M CT"),
-              "recorder": schema["recorder"]}
+              "recorder": schema["recorder"], "session": args.session}
     try:
         try:
             fd = rc.open_plain(ledger, os.O_RDWR | os.O_APPEND | os.O_CREAT)

@@ -10,6 +10,10 @@ account (exit 0) does it replace itself with the command; otherwise it relays wh
 account it runs as, and exits 1. A guard whose answer cannot be read (too much output, no answer in time, or a
 guard that cannot run) or that answers anything but 0 or 1 is broken, exit 2, and the suite does not start.
 
+Each run gets a session of its own: 16 bytes from the system's random source, written as 32 lowercase hex characters
+and handed to the command as SHELLBORNE_SESSION, replacing any value run-suite inherited, so two runs never share
+one. The suite passes it to record-result with --session for every row it records.
+
 The instruments a suite runs, soak-check among them, do not check the account themselves: hosted CI runs soak-check
 with no test account. The account check lives here, at the start of a destructive suite.
 """
@@ -17,6 +21,7 @@ import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import secrets
 import sys
 
 KINDS = ("kill", "soak", "exhaustion")
@@ -61,6 +66,7 @@ def main(argv):
     if code != 0:
         print(f"run-suite: broken: the account guard answered {code}: {said}", file=sys.stderr)
         return 2
+    os.environ["SHELLBORNE_SESSION"] = secrets.token_hex(16)
     try:
         os.execvp(command[0], command)
     except OSError as error:

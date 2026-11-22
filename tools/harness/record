@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""record: run one measured command and record it with the machine state the instruments read (plan step P1.3.2).
+
+Usage: record --ledger <ledger.jsonl> --test <name> --build <build> --commit <40-hex> --refresh-rate-hz <number>
+              [--repo <repo>] [--seconds <limit>] -- <command> [args...]
+
+Before the command runs, record reads, each from a fixed instrument by absolute path with a time limit and a minimal
+environment: the host model (/usr/sbin/sysctl), the macOS version (/usr/bin/sw_vers), the thermal state
+(/usr/bin/pmset -g therm), the load averages, the five busiest processes (/bin/ps), and every display with the
+refresh rate it reports (/usr/sbin/system_profiler). If any of the host, macOS version, thermal state or load cannot
+be read, or the --refresh-rate-hz given is not a rate a connected display reports, it refuses (exit 1) and runs
+nothing.
+
+It then runs the command, with its output and errors going to the raw log after a header that holds what the
+instruments read, and records the run through record-result beside this file: the result is pass when the command
+exits 0, fail otherwise (a command still running after --seconds, 21600 by default, has its group ended and is
+recorded as fail); concurrent_load is built from the measured load, thermal state and busiest processes, never
+typed; and the session is SHELLBORNE_SESSION when run-suite started the run, else one record draws for this run.
+record-result stores its own copy of the log and writes its SHA-256 into the row. Exit: record-result's.
+"""
+import argparse
+import math
+import os
+import pathlib
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+RECORDER = HERE / "record-result"
+INSTRUMENT_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+SESSION = re.compile(r"[0-9a-f]{32}", re.ASCII)
+RATE_MATCH = 0.5  # Hz: a given rate matches a reported one within half a hertz
+BUSIEST = 5
+MAX_LOAD_TEXT = 512
+DEFAULT_SECONDS = 21600
+
+
+def instrument(argv, seconds=30):
+    """The output of one fixed instrument, or "" when it fails."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=seconds, env=INSTRUMENT_ENV,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def thermal_state(text):
+    """nominal when pmset has recorded no thermal or performance warning, 'warning level N' when it has, else None."""
+    level = re.search(r"Thermal Warning Level\s*=\s*(\d+)", text)
+    if level:
+        return f"warning level {level.group(1)}"
+    if "No thermal warning level has been recorded" in text:
+        return "nominal"
+    return None
+
+
+def busiest(text):
+    """[(name, cpu percent)] for the BUSIEST processes in /bin/ps -A -o pcpu=,comm= output."""
+    found = []
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            try:
+                found.append((os.path.basename(parts[1])[:64], float(parts[0])))
+            except ValueError:
+                continue
+    return sorted(found, key=lambda p: -p[1])[:BUSIEST]
+
+
+def displays(text):
+    """[{name, refresh_rate_hz}] from system_profiler's JSON; a display that reports no rate has None."""
+    import json
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    found = []
+    for gpu in data.get("SPDisplaysDataType", []) if isinstance(data, dict) else []:
+        for screen in gpu.get("spdisplays_ndrvs", []) if isinstance(gpu, dict) else []:
+            if not isinstance(screen, dict):
+                continue
+            rate = re.search(r"@\s*([0-9.]+)\s*Hz", str(screen.get("_spdisplays_resolution", "")))
+            found.append({"name": str(screen.get("_name", "display"))[:64],
+                          "refresh_rate_hz": float(rate.group(1)) if rate else None})
+    return found
+
+
+def machine_state():
+    """What the instruments read before the run; a value that cannot be read is None."""
+    try:
+        load = os.getloadavg()
+    except OSError:
+        load = None
+    return {"host": instrument(["/usr/sbin/sysctl", "-n", "hw.model"]) or None,
+            "macos": instrument(["/usr/bin/sw_vers", "-productVersion"]) or None,
+            "thermal": thermal_state(instrument(["/usr/bin/pmset", "-g", "therm"])),
+            "load": load,
+            "processes": busiest(instrument(["/bin/ps", "-A", "-o", "pcpu=,comm="])),
+            "displays": displays(instrument(["/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"], 120))}
+
+
+def header(state):
+    lines = [f"host: {state['host']}", f"macos: {state['macos']}", f"thermal: {state['thermal']}",
+             "load: " + " ".join(f"{v:.2f}" for v in state["load"])]
+    lines += [f"process: {name} {cpu:.1f}%" for name, cpu in state["processes"]]
+    for screen in state["displays"]:
+        rate = screen["refresh_rate_hz"]
+        lines.append(f"display: {screen['name']} " + (f"{rate:.1f} Hz" if rate else "not reported"))
+    return "\n".join(lines) + "\n--- output ---\n"
+
+
+def load_text(state):
+    one, five, fifteen = state["load"]
+    text = f"load {one:.2f}/{five:.2f}/{fifteen:.2f}; thermal {state['thermal']}"
+    if state["processes"]:
+        text += "; busiest " + ", ".join(f"{name} {cpu:.1f}%" for name, cpu in state["processes"])
+    return text[:MAX_LOAD_TEXT]
+
+
+def run_command(command, log, seconds):
+    """0 when the command exits 0, else 1; its output and errors are appended to log. Past `seconds` its whole group
+    is ended and the run counts as failed."""
+    with open(log, "ab") as out:
+        try:
+            proc = subprocess.Popen(command, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+        except OSError as error:
+            out.write(f"record: the command could not start: {error.strerror}\n".encode())
+            return 1
+        try:
+            return 0 if proc.wait(timeout=seconds) == 0 else 1
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            out.write(f"record: still running after {seconds} seconds; its group was ended\n".encode())
+            return 1
+
+
+def main(argv):
+    split = argv.index("--") if "--" in argv else len(argv)
+    options, command = argv[:split], argv[split + 1:]  # an unknown option such as --concurrent-load stops argparse
+    parser = argparse.ArgumentParser(prog="record")
+    for flag in ("--ledger", "--test", "--build", "--commit", "--refresh-rate-hz"):
+        parser.add_argument(flag, required=True)
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--seconds", type=float, default=DEFAULT_SECONDS)
+    args = parser.parse_args(options)
+    problems = []
+    if not command:
+        problems.append("no command to run")
+    if not (math.isfinite(args.seconds) and args.seconds > 0):
+        problems.append("--seconds must be a finite positive number")
+    session = os.environ.get("SHELLBORNE_SESSION")
+    if session is not None and not SESSION.fullmatch(session):
+        problems.append("SHELLBORNE_SESSION is set but is not 32 lowercase hex characters")
+    state = machine_state()
+    for key, name in (("host", "host model"), ("macos", "macOS version"), ("thermal", "thermal state"),
+                      ("load", "load average")):
+        if not state.get(key):
+            problems.append(f"the {name} could not be read")
+    try:
+        rate = float(args.refresh_rate_hz)
+    except ValueError:
+        rate = float("nan")
+    reported = [s["refresh_rate_hz"] for s in state.get("displays") or [] if s.get("refresh_rate_hz")]
+    if not (math.isfinite(rate) and any(abs(rate - r) <= RATE_MATCH for r in reported)):
+        shown = ", ".join(f"{r:.1f}" for r in reported) or "none"
+        problems.append(f"--refresh-rate-hz {args.refresh_rate_hz[:16]!r} is not a refresh rate a connected display "
+                        f"reports (reported: {shown})")
+    if problems:
+        for line in problems:
+            print(f"record: refused: {line}")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="record-") as scratch:
+        log = pathlib.Path(scratch) / "run.log"
+        log.write_text(header(state))
+        result = "pass" if run_command(command, log, args.seconds) == 0 else "fail"
+        done = subprocess.run([sys.executable, "-I", str(RECORDER), f"--ledger={args.ledger}", f"--log={log}",
+                               f"--test={args.test}", f"--result={result}", f"--build={args.build}",
+                               f"--commit={args.commit}", f"--refresh-rate-hz={rate}",
+                               f"--concurrent-load={load_text(state)}",
+                               f"--session={session or secrets.token_hex(16)}", f"--repo={args.repo}"],
+                              capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr)
+    return done.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

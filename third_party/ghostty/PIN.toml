@@ -1,0 +1,11 @@
+# The one Ghostty pin (Plan-Step: P0.25.5). libghostty-vt and the Stage 1 surface library are built from this
+# commit and nothing else; moving it is a new dependency, listed again in tools/gates/licenses.toml first.
+commit = "108cacb17ed8990840cd14abfce43d8ed8503ca1"
+vt_tag = "vt-1.0.1"
+zig = "0.17.0"
+build_flags = ["-Dsentry=false", "-Dcpu=baseline", "-Doptimize=ReleaseSafe"]
+targets = ["aarch64-macos", "x86_64-macos"]
+reason = "The vt-1.0.1 release of libghostty-vt, the stable C ABI the session workers link; its license tree was read package by package at this commit, and the surface library's three outside packages are the owner's named exceptions (CHANGE-0028)."
+# The one recorded patch, applied to the pinned tree before every surface build, leaves the Nerd Fonts Symbols face
+# out of the surface library; it is named below with its hash (Plan-Step: P0.25.10).
+patches = [{ path = "engine/ghostty/patches/0001-drop-symbols-nerd-font.patch", sha256 = "2b03fd75c01663af32fbe6dda379b3ba9fb8a78659d2ffa480703140c8359073", leaves_out = "the Symbols Nerd Font fallback face in the surface library" }]

@@ -29,8 +29,10 @@ SHA256 = frozenset("0123456789abcdef")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 # What the plan's steps require of every row, pinned here so a schema file can neither drop nor add one (P0.15.1).
 REQUIRED = frozenset({"machine", "build", "commit", "test", "result", "refresh_rate_hz", "concurrent_load", "log_path",
-                      "log_sha256", "recorded_at", "recorder"})
+                      "log_sha256", "recorded_at", "recorder", "session"})
 RESULTS = frozenset({"pass", "fail"})
+# The run that recorded a row: drawn once per run by run-suite, the same for every row that run records (P1.3).
+SESSION = re.compile(r"[0-9a-f]{32}", re.ASCII)
 # The fields that hold text: each a non-blank string of at most MAX_TEXT characters with no control character.
 TEXT_FIELDS = ("machine", "build", "test", "concurrent_load", "log_path", "recorded_at", "recorder")
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -252,6 +254,13 @@ def log_problem(folder, row):
     return None
 
 
+def session_problem(value):
+    """None when value is a harness session, 32 lowercase hex characters, else the reason it is not."""
+    if isinstance(value, str) and SESSION.fullmatch(value):
+        return None
+    return "session is not 32 lowercase hex characters"
+
+
 def row_problems(schema, row, folder, repo):
     """Every reason row is not one the recorder wrote, each a short line, or [] when it holds. folder is the
     ledger's folder, resolved; repo is the repository the commit must exist in.
@@ -260,7 +269,8 @@ def row_problems(schema, row, folder, repo):
     are non-blank strings of at most MAX_TEXT characters with no control character; commit is a 40-hex id the system
     git finds in repo; result is one of RESULTS; recorder is the schema's; refresh_rate_hz is a finite positive
     number; log_sha256 is a SHA-256; recorded_at is a real date and time written YYYY-MM-DD HH:MM CT; and log_path is exactly
-    logs/<log_sha256>.log inside folder, a regular file reached without a link whose SHA-256 is log_sha256. A value
+    logs/<log_sha256>.log inside folder, a regular file reached without a link whose SHA-256 is log_sha256; and
+    session is 32 lowercase hex characters, the run that recorded the row (session_problem). A value
     from the row is never printed raw, so a row cannot write control characters to the terminal reading the
     verdict."""
     if not isinstance(row, dict):
@@ -285,6 +295,8 @@ def row_problems(schema, row, folder, repo):
     if isinstance(row.get("recorded_at"), str) and not (RECORDED_AT.fullmatch(row["recorded_at"])
                                                          and real_time(row["recorded_at"])):
         problems.append("recorded_at is not YYYY-MM-DD HH:MM CT")
+    if "session" in row and session_problem(row["session"]):
+        problems.append(session_problem(row["session"]))
     if "log_sha256" in row and not is_sha256(row["log_sha256"]):
         problems.append("log_sha256 is not a SHA-256")
     elif "log_sha256" in row and "log_path" in row:

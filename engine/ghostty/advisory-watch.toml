@@ -1,0 +1,40 @@
+# Security advisory watch for the pinned engine: Ghostty, libghostty-vt and Zig.
+# Each source is checked against the commit and Zig version in PIN.toml. A check records what it read and what it
+# found; "none affect the pin" is written only after the fix commit was proven to be an ancestor of the pin.
+
+[[source]]
+name = "Ghostty repository security advisories"
+covers = ["ghostty", "libghostty-vt"]
+read = "GET https://api.github.com/repos/ghostty-org/ghostty/security-advisories"
+how = "for every advisory naming libghostty-vt or ghostty, compare its fix commit or fixed tag with the pin; the pin must be ahead of it"
+
+[[source]]
+name = "Ghostty releases and tags"
+covers = ["ghostty", "libghostty-vt"]
+read = "https://github.com/ghostty-org/ghostty/tags"
+how = "a new vt-* or v* tag is read for security notes and compared with the pin"
+
+[[source]]
+name = "Zig release index"
+covers = ["zig"]
+read = "https://ziglang.org/download/index.json"
+how = "a release newer than the pinned Zig is read for security fixes before the pin moves"
+
+[[source]]
+name = "GitHub advisory database and distribution trackers for Zig"
+covers = ["zig"]
+read = "https://github.com/advisories?query=zig and the Red Hat and Fedora trackers that file Zig CVEs"
+how = "an advisory against the Zig compiler or its bundled libc copies is checked for the pinned version"
+
+[[check]]
+date = "2026-11-22 11:11 CT"
+pin = "108cacb17ed8990840cd14abfce43d8ed8503ca1"
+zig = "0.17.0"
+result = "none affect the pin"
+notes = [
+  "Ghostty: 18 advisories read. The four that name libghostty-vt (GHSA-jqr7-69mm-v35h, GHSA-w9q4-5jvv-mcv4, GHSA-qjfx-r533-6vx3, GHSA-3r5j-c6rj-xq2v) list fix commits 0af5c9e55, e257bb45e, 65ff54c67 and 44c4c8f55; the pin is ahead of each by 384, 385, 623 and 635 commits and behind none.",
+  "Ghostty: every app advisory names a fixed release no later than 1.4.0, and the pin sits 357 commits after the v1.4.0 tag.",
+  "Control: the pin compared with its own parent reads behind by 1, so the comparison tells ahead from behind.",
+  "Zig: 0.17.1 (2026-11-02) is a patch release with no separate notes; no advisory names Zig 0.17.0. The glibc CVEs filed against the Fedora zig package were closed as not affecting Zig, which links the system libc.",
+  "Not usable as a source: Codeberg's issue search ignored its label filter and returned ordinary bugs.",
+]
